@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Local experiment state
+outputs/
+data/
+scratch/
+*.log
+
+# Model / checkpoint artifacts
+*.pt
+*.pth
+*.ckpt
+
+# Array / dataset artifacts
+*.npy
+*.npz
+*.h5
+*.hdf5
+*.pkl
+*.pickle
+
+# OS / editor noise
+.DS_Store
+.ipynb_checkpoints/
+.ruff_cache/
+*.swp
