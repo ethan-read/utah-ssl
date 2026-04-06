@@ -157,6 +157,54 @@ def _validate_canonical_probe_assets(cache_root: Path) -> tuple[Path, Path, Path
     return canonical_root, manifest_path, metadata_path
 
 
+def _load_canonical_inventory_from_manifest(
+    *,
+    data_module: Any,
+    canonical_root: Path,
+    cache_root: Path,
+) -> list[Any]:
+    manifest_path = canonical_root / "manifest.jsonl"
+    grouped: dict[str, dict[str, Any]] = {}
+    with manifest_path.open() as handle:
+        for line in handle:
+            payload = json.loads(line)
+            session_id = str(payload["session_id"])
+            row = grouped.setdefault(
+                session_id,
+                {
+                    "date_key": str(payload["session_date"]) if payload.get("session_date") is not None else None,
+                    "total_examples": 0,
+                    "has_tx": False,
+                    "has_sbp": False,
+                },
+            )
+            row["total_examples"] += 1
+            row["has_tx"] = row["has_tx"] or bool(payload.get("has_tx", False))
+            row["has_sbp"] = row["has_sbp"] or bool(payload.get("has_sbp", False))
+
+    dataset_relpath = str(canonical_root.relative_to(cache_root))
+    entries = []
+    for session_id in sorted(grouped):
+        meta = grouped[session_id]
+        entries.append(
+            data_module.SessionInventoryEntry(
+                session_key=session_id,
+                session_base=session_id,
+                date_key=meta["date_key"],
+                tx_root_key="canonical_cache_root" if meta["has_tx"] else None,
+                tx_relpath=dataset_relpath if meta["has_tx"] else None,
+                sbp_root_key="canonical_cache_root" if meta["has_sbp"] else None,
+                sbp_relpath=dataset_relpath if meta["has_sbp"] else None,
+                tx_windows=int(meta["total_examples"]) if meta["has_tx"] else None,
+                sbp_windows=int(meta["total_examples"]) if meta["has_sbp"] else None,
+                n_channels=512 if (meta["has_tx"] and meta["has_sbp"]) else 256,
+                has_tx=bool(meta["has_tx"]),
+                has_sbp=bool(meta["has_sbp"]),
+            )
+        )
+    return entries
+
+
 def _default_checkpoint_config(default_checkpoint_config: dict[str, Any] | None) -> dict[str, Any]:
     if default_checkpoint_config is None:
         raise ValueError("default_checkpoint_config is required for downstream probe recovery.")
@@ -394,7 +442,14 @@ def build_downstream_probe_problem(
     _, data_module = _load_benchmark_modules()
     canonical_root, manifest_path, metadata_path = _validate_canonical_probe_assets(cache_root)
 
-    inventory = data_module.load_b2t25_canonical_inventory(canonical_root)
+    if hasattr(data_module, "load_b2t25_canonical_inventory"):
+        inventory = data_module.load_b2t25_canonical_inventory(canonical_root)
+    else:
+        inventory = _load_canonical_inventory_from_manifest(
+            data_module=data_module,
+            canonical_root=canonical_root,
+            cache_root=Path(cache_root),
+        )
     eligible_entries = [entry for entry in inventory if entry.has_tx and entry.has_sbp]
     split = data_module.split_latest_sessions(
         eligible_entries,
