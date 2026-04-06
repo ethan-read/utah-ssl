@@ -14,6 +14,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -203,6 +204,288 @@ def _load_canonical_inventory_from_manifest(
             )
         )
     return entries
+
+
+@dataclass(frozen=True)
+class CanonicalProbeManifestRow:
+    example_id: str
+    session_id: str
+    source_split: str
+    has_labels: bool
+    shard_relpath: str
+    example_index: int
+    n_tx_features: int
+    n_sbp_features: int
+    target_length: int | None
+    transcript: str
+
+
+@dataclass(frozen=True)
+class CanonicalProbePartitions:
+    source_pretrain: tuple[CanonicalProbeManifestRow, ...]
+    target_train_by_session: dict[str, tuple[CanonicalProbeManifestRow, ...]]
+    target_val_by_session: dict[str, tuple[CanonicalProbeManifestRow, ...]]
+
+
+class CanonicalShardAccessor:
+    def __init__(self, cache_root: Path) -> None:
+        self.cache_root = Path(cache_root)
+        self._shards: dict[str, dict[str, np.ndarray | None]] = {}
+
+    def _get_shard(self, row: CanonicalProbeManifestRow) -> dict[str, np.ndarray | None]:
+        shard_path = self.cache_root / row.shard_relpath
+        key = str(shard_path)
+        cached = self._shards.get(key)
+        if cached is None:
+            tx_path = shard_path / "tx.npy"
+            sbp_path = shard_path / "sbp.npy"
+            phoneme_ids_path = shard_path / "phoneme_ids.npy"
+            cached = {
+                "time_offsets": np.load(shard_path / "time_offsets.npy", mmap_mode="r"),
+                "tx": np.load(tx_path, mmap_mode="r") if tx_path.exists() else None,
+                "sbp": np.load(sbp_path, mmap_mode="r") if sbp_path.exists() else None,
+                "phoneme_offsets": np.load(shard_path / "phoneme_offsets.npy", mmap_mode="r"),
+                "phoneme_ids": np.load(phoneme_ids_path, mmap_mode="r") if phoneme_ids_path.exists() else None,
+            }
+            self._shards[key] = cached
+        return cached
+
+    def load_features(self, row: CanonicalProbeManifestRow) -> np.ndarray:
+        shard = self._get_shard(row)
+        time_offsets = shard["time_offsets"]
+        assert time_offsets is not None
+        start = int(time_offsets[row.example_index])
+        stop = int(time_offsets[row.example_index + 1])
+
+        parts: list[np.ndarray] = []
+        tx = shard["tx"]
+        sbp = shard["sbp"]
+        if tx is not None:
+            parts.append(np.asarray(tx[start:stop], dtype=np.float32))
+        if sbp is not None:
+            parts.append(np.asarray(sbp[start:stop], dtype=np.float32))
+        if not parts:
+            raise ValueError(f"Shard {row.shard_relpath} has neither tx.npy nor sbp.npy")
+        if len(parts) == 1:
+            return parts[0]
+        return np.concatenate(parts, axis=1)
+
+    def load_labels(self, row: CanonicalProbeManifestRow) -> np.ndarray | None:
+        if not row.has_labels:
+            return None
+        shard = self._get_shard(row)
+        phoneme_offsets = shard["phoneme_offsets"]
+        phoneme_ids = shard["phoneme_ids"]
+        assert phoneme_offsets is not None
+        if phoneme_ids is None:
+            return np.zeros((0,), dtype=np.int64)
+        start = int(phoneme_offsets[row.example_index])
+        stop = int(phoneme_offsets[row.example_index + 1])
+        return np.asarray(phoneme_ids[start:stop], dtype=np.int64)
+
+    def close(self) -> None:
+        self._shards.clear()
+
+    def __del__(self) -> None:
+        self.close()
+
+
+def _load_probe_metadata_json(metadata_path: Path) -> dict[str, Any]:
+    if not metadata_path.exists():
+        raise FileNotFoundError(f"Probe metadata not found: {metadata_path}")
+    payload = json.loads(metadata_path.read_text())
+    if not isinstance(payload, dict):
+        raise ValueError(f"Expected dict probe metadata at {metadata_path}, got {type(payload).__name__}")
+    return payload
+
+
+def _load_canonical_probe_manifest(manifest_path: Path) -> list[CanonicalProbeManifestRow]:
+    rows: list[CanonicalProbeManifestRow] = []
+    with manifest_path.open() as handle:
+        for line in handle:
+            payload = json.loads(line)
+            rows.append(
+                CanonicalProbeManifestRow(
+                    example_id=str(payload["example_id"]),
+                    session_id=str(payload["session_id"]),
+                    source_split=str(payload["source_split"]),
+                    has_labels=bool(payload["has_labels"]),
+                    shard_relpath=str(payload["shard_relpath"]),
+                    example_index=int(payload["example_index"]),
+                    n_tx_features=int(payload.get("n_tx_features", 0) or 0),
+                    n_sbp_features=int(payload.get("n_sbp_features", 0) or 0),
+                    target_length=int(payload["target_length"]) if payload.get("target_length") is not None else None,
+                    transcript=str(payload.get("transcript", payload.get("transcription", ""))),
+                )
+            )
+    return rows
+
+
+def _session_ids_from_split(split: Any) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    def to_session_id(session_base: str) -> str:
+        return session_base.split("_", 1)[0]
+
+    source_session_ids = tuple(to_session_id(entry.session_base) for entry in split.train)
+    target_session_ids = tuple(to_session_id(entry.session_base) for entry in split.val)
+    return source_session_ids, target_session_ids
+
+
+def _partition_probe_records(
+    rows: list[CanonicalProbeManifestRow],
+    *,
+    source_session_ids: tuple[str, ...],
+    target_session_ids: tuple[str, ...],
+    pretrain_source_splits: tuple[str, ...] = ("train",),
+    probe_train_split: str = "train",
+    probe_val_split: str = "val",
+) -> CanonicalProbePartitions:
+    source_set = set(source_session_ids)
+    target_set = set(target_session_ids)
+
+    source_pretrain = tuple(
+        row for row in rows if row.session_id in source_set and row.source_split in pretrain_source_splits
+    )
+    target_train_by_session: dict[str, list[CanonicalProbeManifestRow]] = {sid: [] for sid in target_session_ids}
+    target_val_by_session: dict[str, list[CanonicalProbeManifestRow]] = {sid: [] for sid in target_session_ids}
+    for row in rows:
+        if row.session_id not in target_set or not row.has_labels:
+            continue
+        if row.source_split == probe_train_split:
+            target_train_by_session[row.session_id].append(row)
+        elif row.source_split == probe_val_split:
+            target_val_by_session[row.session_id].append(row)
+
+    return CanonicalProbePartitions(
+        source_pretrain=source_pretrain,
+        target_train_by_session={sid: tuple(records) for sid, records in target_train_by_session.items()},
+        target_val_by_session={sid: tuple(records) for sid, records in target_val_by_session.items()},
+    )
+
+
+def compute_feature_stats(
+    rows: tuple[CanonicalProbeManifestRow, ...] | list[CanonicalProbeManifestRow],
+    *,
+    cache_root: Path,
+    mode: str,
+) -> dict[str, tuple[np.ndarray, np.ndarray]] | tuple[np.ndarray, np.ndarray]:
+    accessor = CanonicalShardAccessor(cache_root)
+    try:
+        if mode == "global":
+            total_count = 0
+            sum_x = None
+            sum_x2 = None
+            for row in rows:
+                x = accessor.load_features(row)
+                x64 = x.astype(np.float64, copy=False)
+                if sum_x is None:
+                    sum_x = x64.sum(axis=0)
+                    sum_x2 = np.square(x64).sum(axis=0)
+                else:
+                    sum_x += x64.sum(axis=0)
+                    sum_x2 += np.square(x64).sum(axis=0)
+                total_count += x.shape[0]
+            if sum_x is None or sum_x2 is None or total_count == 0:
+                raise ValueError("Cannot compute global feature stats on an empty record set.")
+            mean = sum_x / total_count
+            var = np.maximum(sum_x2 / total_count - np.square(mean), 1e-6)
+            std = np.sqrt(var)
+            return mean.astype(np.float32), std.astype(np.float32)
+
+        if mode == "per_session":
+            grouped: dict[str, list[CanonicalProbeManifestRow]] = {}
+            for row in rows:
+                grouped.setdefault(row.session_id, []).append(row)
+            return {
+                session_id: compute_feature_stats(tuple(session_rows), cache_root=cache_root, mode="global")  # type: ignore[arg-type]
+                for session_id, session_rows in grouped.items()
+            }
+
+        raise ValueError("mode must be either 'global' or 'per_session'")
+    finally:
+        accessor.close()
+
+
+def apply_feature_stats(
+    x: np.ndarray,
+    *,
+    row: CanonicalProbeManifestRow,
+    stats: dict[str, tuple[np.ndarray, np.ndarray]] | tuple[np.ndarray, np.ndarray],
+) -> np.ndarray:
+    if isinstance(stats, dict):
+        mean, std = stats[row.session_id]
+    else:
+        mean, std = stats
+    return ((x - mean) / std).astype(np.float32, copy=False)
+
+
+class CanonicalSequenceDataset(torch.utils.data.Dataset):
+    def __init__(
+        self,
+        rows: tuple[CanonicalProbeManifestRow, ...] | list[CanonicalProbeManifestRow],
+        *,
+        cache_root: Path,
+        stats: dict[str, tuple[np.ndarray, np.ndarray]] | tuple[np.ndarray, np.ndarray] | None = None,
+    ) -> None:
+        self.rows = list(rows)
+        self.stats = stats
+        self._accessor = CanonicalShardAccessor(cache_root)
+
+    def __len__(self) -> int:
+        return len(self.rows)
+
+    def __getitem__(self, idx: int) -> dict[str, Any]:
+        row = self.rows[idx]
+        x = self._accessor.load_features(row)
+        if self.stats is not None:
+            x = apply_feature_stats(x, row=row, stats=self.stats)
+        labels = self._accessor.load_labels(row)
+        if labels is None:
+            labels = np.zeros((0,), dtype=np.int64)
+        return {
+            "x": torch.from_numpy(x),
+            "input_length": int(x.shape[0]),
+            "labels": torch.from_numpy(labels),
+            "label_length": int(labels.shape[0]),
+            "session_id": row.session_id,
+            "example_id": row.example_id,
+        }
+
+    def __del__(self) -> None:
+        self._accessor.close()
+
+
+def collate_sequence_batch(batch: list[dict[str, Any]]) -> dict[str, Any]:
+    batch_size = len(batch)
+    max_time = max(item["input_length"] for item in batch)
+    max_label = max(item["label_length"] for item in batch)
+    input_dim = int(batch[0]["x"].shape[1])
+
+    x = torch.zeros((batch_size, max_time, input_dim), dtype=torch.float32)
+    labels = torch.zeros((batch_size, max_label), dtype=torch.int64)
+    input_lengths = torch.empty((batch_size,), dtype=torch.long)
+    label_lengths = torch.empty((batch_size,), dtype=torch.long)
+    session_ids: list[str] = []
+    example_ids: list[str] = []
+
+    for idx, item in enumerate(batch):
+        t = item["input_length"]
+        l = item["label_length"]
+        x[idx, :t] = item["x"]
+        if l > 0:
+            labels[idx, :l] = item["labels"]
+        input_lengths[idx] = t
+        label_lengths[idx] = l
+        session_ids.append(item["session_id"])
+        example_ids.append(item["example_id"])
+
+    return {
+        "x": x,
+        "labels": labels,
+        "input_lengths": input_lengths,
+        "label_lengths": label_lengths,
+        "session_ids": session_ids,
+        "example_ids": example_ids,
+    }
 
 
 def _default_checkpoint_config(default_checkpoint_config: dict[str, Any] | None) -> dict[str, Any]:
@@ -442,30 +725,30 @@ def build_downstream_probe_problem(
     _, data_module = _load_benchmark_modules()
     canonical_root, manifest_path, metadata_path = _validate_canonical_probe_assets(cache_root)
 
-    if hasattr(data_module, "load_b2t25_canonical_inventory"):
-        inventory = data_module.load_b2t25_canonical_inventory(canonical_root)
-    else:
-        inventory = _load_canonical_inventory_from_manifest(
-            data_module=data_module,
-            canonical_root=canonical_root,
-            cache_root=Path(cache_root),
-        )
+    inventory = _load_canonical_inventory_from_manifest(
+        data_module=data_module,
+        canonical_root=canonical_root,
+        cache_root=Path(cache_root),
+    )
     eligible_entries = [entry for entry in inventory if entry.has_tx and entry.has_sbp]
     split = data_module.split_latest_sessions(
         eligible_entries,
         session_limit=int(probe_config.session_limit),
         val_session_count=int(probe_config.target_session_count),
     )
-    source_session_ids, target_session_ids = data_module.session_ids_from_cache_split(split)
+    if hasattr(data_module, "session_ids_from_cache_split"):
+        source_session_ids, target_session_ids = data_module.session_ids_from_cache_split(split)
+    else:
+        source_session_ids, target_session_ids = _session_ids_from_split(split)
     if len(target_session_ids) != 1:
         raise ValueError(
             "The benchmark-lite notebook probe expects exactly one held-out target session. "
             f"Found {len(target_session_ids)} target sessions."
         )
 
-    manifest_rows = data_module.load_probe_manifest(manifest_path)
-    metadata = data_module.load_probe_metadata(metadata_path)
-    partitions = data_module.partition_probe_records(
+    manifest_rows = _load_canonical_probe_manifest(manifest_path)
+    metadata = _load_probe_metadata_json(metadata_path)
+    partitions = _partition_probe_records(
         manifest_rows,
         source_session_ids=source_session_ids,
         target_session_ids=target_session_ids,
@@ -496,7 +779,7 @@ def build_downstream_probe_problem(
         "target_train_rows": target_train_rows,
         "target_val_rows": target_val_rows,
         "vocab": metadata["phoneme_vocabulary"],
-        "data_module": data_module,
+        "cache_root": Path(cache_root),
     }
 
 
@@ -837,25 +1120,36 @@ def train_probe_with_metrics(
     progress_log_path: Path | None,
     train_encoder: bool,
 ) -> tuple[dict[str, Any], int]:
-    data_module = problem["data_module"]
-    target_stats = data_module.compute_feature_stats(problem["target_train_rows"], mode="global")
+    target_stats = compute_feature_stats(
+        problem["target_train_rows"],
+        cache_root=Path(problem["cache_root"]),
+        mode="global",
+    )
     train_loader = DataLoader(
-        data_module.CanonicalSequenceDataset(problem["target_train_rows"], stats=target_stats),
+        CanonicalSequenceDataset(
+            problem["target_train_rows"],
+            cache_root=Path(problem["cache_root"]),
+            stats=target_stats,
+        ),
         **_loader_kwargs(
             device,
             int(probe_config.probe_batch_size),
             shuffle=True,
-            collate_fn=data_module.collate_sequence_batch,
+            collate_fn=collate_sequence_batch,
         ),
         generator=_make_loader_generator(int(probe_config.seed)),
     )
     val_loader = DataLoader(
-        data_module.CanonicalSequenceDataset(problem["target_val_rows"], stats=target_stats),
+        CanonicalSequenceDataset(
+            problem["target_val_rows"],
+            cache_root=Path(problem["cache_root"]),
+            stats=target_stats,
+        ),
         **_loader_kwargs(
             device,
             int(probe_config.probe_batch_size),
             shuffle=False,
-            collate_fn=data_module.collate_sequence_batch,
+            collate_fn=collate_sequence_batch,
         ),
         generator=_make_loader_generator(int(probe_config.seed) + 1),
     )
