@@ -51,8 +51,10 @@ class DownstreamProbeConfig:
             raise ValueError("comparison_mode must currently be 'ssl_only'")
         if self.adaptation_regime != "A":
             raise ValueError("adaptation_regime must currently be 'A'")
-        if self.target_session_count != 1:
-            raise ValueError("target_session_count must currently be 1")
+        if self.target_session_count <= 0:
+            raise ValueError("target_session_count must be positive")
+        if self.target_session_count >= self.session_limit:
+            raise ValueError("target_session_count must be smaller than session_limit")
         if self.probe_head_type not in {"linear", "lstm", "conv1d"}:
             raise ValueError("probe_head_type must be one of {'linear', 'lstm', 'conv1d'}")
         if self.checkpoint_source not in {
@@ -740,11 +742,8 @@ def build_downstream_probe_problem(
         source_session_ids, target_session_ids = data_module.session_ids_from_cache_split(split)
     else:
         source_session_ids, target_session_ids = _session_ids_from_split(split)
-    if len(target_session_ids) != 1:
-        raise ValueError(
-            "The benchmark-lite notebook probe expects exactly one held-out target session. "
-            f"Found {len(target_session_ids)} target sessions."
-        )
+    if len(target_session_ids) <= 0:
+        raise ValueError("No held-out target sessions were selected for the downstream probe.")
 
     manifest_rows = _load_canonical_probe_manifest(manifest_path)
     metadata = _load_probe_metadata_json(metadata_path)
@@ -754,14 +753,39 @@ def build_downstream_probe_problem(
         target_session_ids=target_session_ids,
     )
 
-    target_session_id = target_session_ids[0]
-    target_train_rows = partitions.target_train_by_session[target_session_id]
-    target_val_rows = partitions.target_val_by_session[target_session_id]
-    if len(target_train_rows) == 0 or len(target_val_rows) == 0:
+    target_train_examples_by_session = {
+        session_id: len(partitions.target_train_by_session[session_id])
+        for session_id in target_session_ids
+    }
+    target_val_examples_by_session = {
+        session_id: len(partitions.target_val_by_session[session_id])
+        for session_id in target_session_ids
+    }
+    missing_sessions = [
+        session_id
+        for session_id in target_session_ids
+        if target_train_examples_by_session[session_id] == 0 or target_val_examples_by_session[session_id] == 0
+    ]
+    if missing_sessions:
         raise ValueError(
-            "The held-out target session does not have both train and val examples with phoneme labels. "
-            f"train={len(target_train_rows)} val={len(target_val_rows)}"
+            "At least one held-out target session does not have both train and val examples with phoneme labels. "
+            f"Missing sessions: {missing_sessions}"
         )
+    target_train_rows = tuple(
+        row
+        for session_id in target_session_ids
+        for row in partitions.target_train_by_session[session_id]
+    )
+    target_val_rows = tuple(
+        row
+        for session_id in target_session_ids
+        for row in partitions.target_val_by_session[session_id]
+    )
+    target_session_label = (
+        target_session_ids[0]
+        if len(target_session_ids) == 1
+        else f"pooled_{len(target_session_ids)}_sessions"
+    )
 
     return {
         "canonical_root": canonical_root,
@@ -775,7 +799,9 @@ def build_downstream_probe_problem(
         "partitions": partitions,
         "source_session_ids": source_session_ids,
         "target_session_ids": target_session_ids,
-        "target_session_id": target_session_id,
+        "target_session_label": target_session_label,
+        "target_train_examples_by_session": target_train_examples_by_session,
+        "target_val_examples_by_session": target_val_examples_by_session,
         "target_train_rows": target_train_rows,
         "target_val_rows": target_val_rows,
         "vocab": metadata["phoneme_vocabulary"],
@@ -1120,10 +1146,11 @@ def train_probe_with_metrics(
     progress_log_path: Path | None,
     train_encoder: bool,
 ) -> tuple[dict[str, Any], int]:
+    target_stats_mode = "global" if len(problem["target_session_ids"]) == 1 else "per_session"
     target_stats = compute_feature_stats(
         problem["target_train_rows"],
         cache_root=Path(problem["cache_root"]),
-        mode="global",
+        mode=target_stats_mode,
     )
     train_loader = DataLoader(
         CanonicalSequenceDataset(
@@ -1259,7 +1286,7 @@ def train_probe_with_metrics(
                     progress_log_path,
                     event="probe_train_report",
                     stage="probe_train",
-                    session_id=problem["target_session_id"],
+                    session_id=problem["target_session_label"],
                     step=steps,
                     elapsed_seconds=round(elapsed, 3),
                     train_ctc_bpphone=float(loss.item()) / math.log(2.0),
@@ -1283,7 +1310,7 @@ def train_probe_with_metrics(
         progress_log_path,
         event="probe_session_complete",
         stage="probe_train",
-        session_id=problem["target_session_id"],
+        session_id=problem["target_session_label"],
         step=steps,
         elapsed_seconds=round(time.time() - start_time, 3),
         train_encoder=bool(train_encoder),
@@ -1432,12 +1459,17 @@ def run_downstream_probe(
         "adaptation_regime": str(effective_probe_config.adaptation_regime),
         "session_limit": int(effective_probe_config.session_limit),
         "target_session_count": int(effective_probe_config.target_session_count),
-        "heldout_target_session_id": problem["target_session_id"],
+        "heldout_target_session_id": (
+            problem["target_session_ids"][0] if len(problem["target_session_ids"]) == 1 else None
+        ),
         "source_session_ids": list(problem["source_session_ids"]),
         "target_session_ids": list(problem["target_session_ids"]),
+        "pooled_target_sessions": len(problem["target_session_ids"]) > 1,
         "selected_session_bases": [
             entry.session_base for entry in problem["split"].train + problem["split"].val
         ],
+        "target_train_examples_by_session": dict(problem["target_train_examples_by_session"]),
+        "target_val_examples_by_session": dict(problem["target_val_examples_by_session"]),
         "target_train_examples": len(problem["target_train_rows"]),
         "target_val_examples": len(problem["target_val_rows"]),
         "val_bpphone": float(metrics["val_ctc_bpphone"]),
