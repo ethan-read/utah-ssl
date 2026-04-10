@@ -143,10 +143,34 @@ def _path_signature(path: Path) -> dict[str, int] | None:
 
 
 def _compute_cache_source_signature(src_root: Path) -> str:
+    def list_dir_with_retries(path: Path, *, max_retries: int = 5) -> list[Path]:
+        last_error: OSError | None = None
+        for attempt in range(1, max_retries + 1):
+            try:
+                return sorted(path.iterdir(), key=lambda child: child.name)
+            except OSError as exc:  # pragma: no cover - exercised in Colab when Drive stalls
+                last_error = exc
+                if attempt == max_retries:
+                    break
+                print(f"directory scan retry {attempt}/{max_retries} failed for {path}: {exc}")
+                time.sleep(min(10.0, float(attempt)))
+        assert last_error is not None
+        raise last_error
+
     datasets = []
-    for dataset_root in sorted(path for path in src_root.iterdir() if path.is_dir()):
+    for dataset_root in (path for path in list_dir_with_retries(src_root) if path.is_dir()):
         shard_root = dataset_root / "shards"
-        shard_names = sorted(path.name for path in shard_root.iterdir() if path.is_dir()) if shard_root.exists() else []
+        shard_names: list[str] = []
+        shard_scan_error: str | None = None
+        if shard_root.exists():
+            try:
+                shard_names = [path.name for path in list_dir_with_retries(shard_root) if path.is_dir()]
+            except OSError as exc:  # pragma: no cover - exercised in Colab when Drive stalls
+                shard_scan_error = str(exc)
+                print(
+                    f"warning: failed to enumerate shards for signature under {shard_root}; "
+                    f"falling back to metadata-only signature fields: {exc}"
+                )
         datasets.append(
             {
                 "dataset": dataset_root.name,
@@ -155,6 +179,7 @@ def _compute_cache_source_signature(src_root: Path) -> str:
                 "shard_count": len(shard_names),
                 "first_shard": shard_names[0] if shard_names else None,
                 "last_shard": shard_names[-1] if shard_names else None,
+                "shard_scan_error": shard_scan_error,
             }
         )
     payload = {
