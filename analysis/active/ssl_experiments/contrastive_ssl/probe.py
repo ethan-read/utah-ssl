@@ -529,6 +529,13 @@ def _resolve_candidate_checkpoint_path(
             )
         return candidate
 
+    # In notebook workflows, the currently selected/recovered checkpoint should win
+    # over older completed runs discovered under OUTPUT_ROOT.
+    if current_checkpoint_path is not None:
+        candidate = Path(current_checkpoint_path)
+        if candidate.exists():
+            return candidate
+
     valid_candidates = sorted(
         [
             candidate
@@ -539,11 +546,6 @@ def _resolve_candidate_checkpoint_path(
     )
     if valid_candidates:
         return valid_candidates[-1]
-
-    if current_checkpoint_path is not None:
-        candidate = Path(current_checkpoint_path)
-        if candidate.exists():
-            return candidate
 
     return None
 
