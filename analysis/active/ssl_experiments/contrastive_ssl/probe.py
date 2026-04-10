@@ -39,11 +39,15 @@ class DownstreamProbeConfig:
     max_probe_steps: int = 400
     progress_every_steps: int = 25
     progress_every_seconds: float = 15.0
+    probe_head_learning_rate: float = 1e-3
+    encoder_learning_rate: float | None = None
+    weight_decay: float = 1e-2
     probe_head_type: str = "linear"
     probe_lstm_hidden_size: int = 64
     probe_conv_hidden_size: int = 128
     probe_conv_kernel_size: int = 3
     checkpoint_source: str = "most_recent_valid_then_in_memory"
+    explicit_checkpoint_path: str | None = None
     summary_basename: str = DEFAULT_PROBE_SUMMARY_BASENAME
 
     def __post_init__(self) -> None:
@@ -55,6 +59,12 @@ class DownstreamProbeConfig:
             raise ValueError("target_session_count must be positive")
         if self.target_session_count >= self.session_limit:
             raise ValueError("target_session_count must be smaller than session_limit")
+        if float(self.probe_head_learning_rate) <= 0.0:
+            raise ValueError("probe_head_learning_rate must be positive")
+        if self.encoder_learning_rate is not None and float(self.encoder_learning_rate) <= 0.0:
+            raise ValueError("encoder_learning_rate must be positive when provided")
+        if float(self.weight_decay) < 0.0:
+            raise ValueError("weight_decay must be non-negative")
         if self.probe_head_type not in {"linear", "lstm", "conv1d"}:
             raise ValueError("probe_head_type must be one of {'linear', 'lstm', 'conv1d'}")
         if self.checkpoint_source not in {
@@ -510,7 +520,14 @@ def _resolve_candidate_checkpoint_path(
     probe_config: DownstreamProbeConfig,
     current_checkpoint_path: Path | None,
 ) -> Path | None:
-    del probe_config
+    explicit_checkpoint_path = probe_config.explicit_checkpoint_path
+    if explicit_checkpoint_path is not None:
+        candidate = Path(explicit_checkpoint_path)
+        if not candidate.exists():
+            raise FileNotFoundError(
+                f"Explicit checkpoint path does not exist: {candidate}"
+            )
+        return candidate
 
     valid_candidates = sorted(
         [
@@ -586,6 +603,8 @@ def _resolve_downstream_probe_base_run_dir(
     if checkpoint_candidate is not None:
         candidate = Path(checkpoint_candidate)
         if candidate.exists():
+            if candidate.parent.name == "checkpoints":
+                return candidate.parent.parent
             return candidate.parent
     if current_run_dir is not None:
         candidate = Path(current_run_dir)
@@ -673,19 +692,22 @@ def recover_downstream_probe_state(
             ),
         )
 
-    state_loaders = (
-        (load_in_memory_state, load_checkpoint_state)
-        if probe_config.checkpoint_source == "in_memory_then_most_recent_valid"
-        else (load_checkpoint_state, load_in_memory_state)
-    )
+    if probe_config.explicit_checkpoint_path is not None:
+        state_loaders = (load_checkpoint_state,)
+    else:
+        state_loaders = (
+            (load_in_memory_state, load_checkpoint_state)
+            if probe_config.checkpoint_source == "in_memory_then_most_recent_valid"
+            else (load_checkpoint_state, load_in_memory_state)
+        )
     for loader in state_loaders:
         state = loader()
         if state is not None:
             return state
 
     raise RuntimeError(
-        "No in-memory encoder is available and no checkpoint_final.pt was found under OUTPUT_ROOT. "
-        "Run the training cell first or make the checkpoint available under the notebook output root."
+        "No in-memory encoder is available and no usable checkpoint was found. "
+        "Run the training cell first, select an explicit saved step checkpoint, or make the final checkpoint available under OUTPUT_ROOT."
     )
 
 
@@ -1199,14 +1221,36 @@ def train_probe_with_metrics(
             probe_config=probe_config,
         ).to(device)
     probe_head_num_parameters = count_trainable_parameters(probe_head)
-    trainable_parameters = [param for param in probe_head.parameters()]
+    probe_head_learning_rate = float(probe_config.probe_head_learning_rate)
+    encoder_learning_rate = (
+        float(probe_config.encoder_learning_rate)
+        if probe_config.encoder_learning_rate is not None
+        else probe_head_learning_rate
+    )
+    probe_head_parameters = [param for param in probe_head.parameters() if param.requires_grad]
+    encoder_parameters = [param for param in encoder.parameters() if param.requires_grad]
+    trainable_parameters = list(probe_head_parameters)
     if train_encoder:
-        trainable_parameters.extend(param for param in encoder.parameters() if param.requires_grad)
+        trainable_parameters.extend(encoder_parameters)
+
+    optimizer_param_groups: list[dict[str, Any]] = [
+        {
+            "params": probe_head_parameters,
+            "lr": probe_head_learning_rate,
+        }
+    ]
+    if train_encoder and encoder_parameters:
+        optimizer_param_groups.append(
+            {
+                "params": encoder_parameters,
+                "lr": encoder_learning_rate,
+            }
+        )
 
     optimizer = torch.optim.AdamW(
-        trainable_parameters,
-        lr=1e-3,
-        weight_decay=1e-2,
+        optimizer_param_groups,
+        lr=probe_head_learning_rate,
+        weight_decay=float(probe_config.weight_decay),
     )
 
     start_time = time.time()
@@ -1293,6 +1337,9 @@ def train_probe_with_metrics(
                     train_encoder=bool(train_encoder),
                     seed=int(probe_config.seed),
                     probe_head_type=resolve_probe_head_type(probe_config),
+                    probe_head_learning_rate=probe_head_learning_rate,
+                    encoder_learning_rate=encoder_learning_rate if train_encoder else None,
+                    weight_decay=float(probe_config.weight_decay),
                     budget_seconds=float(probe_config.probe_budget_seconds),
                 )
         if not made_progress:
@@ -1316,6 +1363,9 @@ def train_probe_with_metrics(
         train_encoder=bool(train_encoder),
         seed=int(probe_config.seed),
         probe_head_type=resolve_probe_head_type(probe_config),
+        probe_head_learning_rate=probe_head_learning_rate,
+        encoder_learning_rate=encoder_learning_rate if train_encoder else None,
+        weight_decay=float(probe_config.weight_decay),
         **metrics,
     )
     return metrics, steps
@@ -1455,6 +1505,15 @@ def run_downstream_probe(
         "probe_head_type": resolve_probe_head_type(effective_probe_config),
         "seed": int(effective_probe_config.seed),
         "probe_head_num_parameters": int(metrics.get("probe_head_num_parameters", 0)),
+        "probe_head_learning_rate": float(effective_probe_config.probe_head_learning_rate),
+        "encoder_learning_rate": (
+            float(effective_probe_config.encoder_learning_rate)
+            if effective_probe_config.encoder_learning_rate is not None
+            else float(effective_probe_config.probe_head_learning_rate)
+            if train_encoder
+            else None
+        ),
+        "weight_decay": float(effective_probe_config.weight_decay),
         "train_encoder": bool(train_encoder),
         "adaptation_regime": str(effective_probe_config.adaptation_regime),
         "session_limit": int(effective_probe_config.session_limit),

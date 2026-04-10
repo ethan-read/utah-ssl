@@ -47,6 +47,10 @@ class CacheAccessConfig:
             raise ValueError("examples_per_shard must be positive")
         if self.tx_dim <= 0 or self.sbp_dim <= 0:
             raise ValueError("tx_dim and sbp_dim must be positive")
+        if self.normalize_impl_version not in {"segment_prefix_v1", "session_featurewise_v1"}:
+            raise ValueError(
+                "normalize_impl_version must be one of {'segment_prefix_v1', 'session_featurewise_v1'}"
+            )
         if self.normalize_context_bins is None:
             self.normalize_context_bins = min(16, int(self.segment_bins))
 
@@ -95,6 +99,7 @@ class CacheContext:
     session_split_summary: dict[str, dict[str, Any]]
     shard_store: "ShardStore"
     has_val_datasets: bool
+    session_feature_stats: dict[str, tuple[torch.Tensor, torch.Tensor]] = field(default_factory=dict)
     sampling_plan_cache: dict[tuple[str, int, float], SamplingPlan] = field(default_factory=dict)
 
     @property
@@ -364,6 +369,36 @@ def _normalize_segment(
     feature_mask: torch.Tensor,
     context_bins: int,
     *,
+    normalize_impl_version: str,
+    session_feature_stats: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = None,
+    session_key: str | None = None,
+    min_scale_std: float = 0.1,
+    clip_value: float = 20.0,
+) -> torch.Tensor:
+    if normalize_impl_version == "segment_prefix_v1":
+        return _normalize_segment_prefix(
+            x_seq,
+            feature_mask,
+            context_bins=context_bins,
+            min_scale_std=min_scale_std,
+            clip_value=clip_value,
+        )
+    if normalize_impl_version == "session_featurewise_v1":
+        return _normalize_segment_session_featurewise(
+            x_seq,
+            feature_mask,
+            session_feature_stats=session_feature_stats,
+            session_key=session_key,
+            clip_value=clip_value,
+        )
+    raise ValueError(f"Unsupported normalize_impl_version: {normalize_impl_version}")
+
+
+def _normalize_segment_prefix(
+    x_seq: torch.Tensor,
+    feature_mask: torch.Tensor,
+    context_bins: int,
+    *,
     min_scale_std: float = 0.1,
     clip_value: float = 20.0,
 ) -> torch.Tensor:
@@ -383,12 +418,103 @@ def _normalize_segment(
     return x_norm
 
 
+def _normalize_segment_session_featurewise(
+    x_seq: torch.Tensor,
+    feature_mask: torch.Tensor,
+    *,
+    session_feature_stats: dict[str, tuple[torch.Tensor, torch.Tensor]] | None,
+    session_key: str | None,
+    clip_value: float = 20.0,
+) -> torch.Tensor:
+    if session_feature_stats is None or session_key is None:
+        raise ValueError("Session feature stats are required for session_featurewise_v1 normalization.")
+    if session_key not in session_feature_stats:
+        raise KeyError(f"Missing session feature stats for {session_key}")
+
+    x_norm = x_seq.clone()
+    present_idx = torch.nonzero(feature_mask.bool(), as_tuple=False).squeeze(1)
+    if present_idx.numel() == 0:
+        return x_norm
+
+    mean, std = session_feature_stats[session_key]
+    mean = mean.to(device=x_norm.device, dtype=x_norm.dtype)
+    std = std.to(device=x_norm.device, dtype=x_norm.dtype).clamp_min(1e-6)
+    centered = x_norm[:, present_idx] - mean[present_idx]
+    x_norm[:, present_idx] = (centered / std[present_idx]).clamp(min=-clip_value, max=clip_value)
+    return x_norm
+
+
+def _session_stat_key(dataset: str, session_id: str) -> str:
+    return f"{dataset}:{session_id}"
+
+
+def _compute_session_feature_stats(
+    shard_store: ShardStore,
+    rows_by_dataset: dict[str, list[ExampleRow]],
+    config: CacheAccessConfig,
+) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
+    print("computing SSL session-level featurewise z-scoring stats...")
+    session_rows: dict[str, list[ExampleRow]] = defaultdict(list)
+    for dataset, rows in rows_by_dataset.items():
+        for row in rows:
+            session_rows[_session_stat_key(dataset, row.session_id)].append(row)
+
+    full_dim = int(config.full_dim)
+    session_stats: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+    total_sessions = len(session_rows)
+    for session_idx, session_key in enumerate(sorted(session_rows), start=1):
+        rows = session_rows[session_key]
+        sum_x = np.zeros((full_dim,), dtype=np.float64)
+        sum_x2 = np.zeros((full_dim,), dtype=np.float64)
+        count_x = np.zeros((full_dim,), dtype=np.float64)
+
+        for row in rows:
+            shard = shard_store.get(row.shard_relpath)
+            time_offsets = shard["time_offsets"]
+            assert isinstance(time_offsets, np.ndarray)
+            start = int(time_offsets[row.example_index])
+            stop = int(time_offsets[row.example_index + 1])
+
+            tx = shard["tx"]
+            if isinstance(tx, np.ndarray):
+                tx_window = np.asarray(tx[start:stop], dtype=np.float64)
+                tx_dim = min(tx_window.shape[1], config.tx_dim)
+                sum_x[:tx_dim] += tx_window[:, :tx_dim].sum(axis=0)
+                sum_x2[:tx_dim] += np.square(tx_window[:, :tx_dim]).sum(axis=0)
+                count_x[:tx_dim] += tx_window.shape[0]
+
+            sbp = shard["sbp"]
+            if isinstance(sbp, np.ndarray):
+                sbp_window = np.asarray(sbp[start:stop], dtype=np.float64)
+                sbp_dim = min(sbp_window.shape[1], config.sbp_dim)
+                sbp_slice = slice(config.tx_dim, config.tx_dim + sbp_dim)
+                sum_x[sbp_slice] += sbp_window[:, :sbp_dim].sum(axis=0)
+                sum_x2[sbp_slice] += np.square(sbp_window[:, :sbp_dim]).sum(axis=0)
+                count_x[sbp_slice] += sbp_window.shape[0]
+
+        mean = np.zeros((full_dim,), dtype=np.float32)
+        std = np.ones((full_dim,), dtype=np.float32)
+        present_mask = count_x > 0
+        if present_mask.any():
+            mean64 = sum_x[present_mask] / count_x[present_mask]
+            var64 = np.maximum(sum_x2[present_mask] / count_x[present_mask] - np.square(mean64), 1e-6)
+            mean[present_mask] = mean64.astype(np.float32)
+            std[present_mask] = np.sqrt(var64).astype(np.float32)
+        session_stats[session_key] = (torch.from_numpy(mean), torch.from_numpy(std))
+
+        if session_idx == 1 or session_idx % 25 == 0 or session_idx == total_sessions:
+            print(f" session_stats={session_idx}/{total_sessions} current={session_key}")
+
+    return session_stats
+
+
 def sample_base_segment(
     cache_context: CacheContext,
     example: ExampleRow,
     segment_bins: int,
     py_rng: random.Random,
 ) -> dict[str, Any]:
+    session_key = _session_stat_key(example.dataset, example.session_id)
     shard = cache_context.shard_store.get(example.shard_relpath)
     time_offsets = shard["time_offsets"]
     assert isinstance(time_offsets, np.ndarray)
@@ -429,6 +555,9 @@ def sample_base_segment(
         x_seq_t,
         feature_mask_t,
         context_bins=cache_context.normalize_context_bins,
+        normalize_impl_version=cache_context.normalize_impl_version,
+        session_feature_stats=cache_context.session_feature_stats,
+        session_key=session_key,
     )
 
     return {
@@ -437,7 +566,7 @@ def sample_base_segment(
         "length": int(segment_bins),
         "dataset": example.dataset,
         "session_id": example.session_id,
-        "session_key": f"{example.dataset}:{example.session_id}",
+        "session_key": session_key,
         "shard_relpath": example.shard_relpath,
         "has_tx": example.has_tx,
         "has_sbp": example.has_sbp,
@@ -767,6 +896,13 @@ def prepare_cache_context(
         session_split_summary[dataset]["val_examples"] > 0
         for dataset in pretrain_datasets
     )
+    session_feature_stats: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+    if config.normalize_impl_version == "session_featurewise_v1":
+        session_feature_stats = _compute_session_feature_stats(
+            shard_store=shard_store,
+            rows_by_dataset=rows_by_dataset,
+            config=config,
+        )
 
     return CacheContext(
         config=config,
@@ -781,4 +917,5 @@ def prepare_cache_context(
         session_split_summary=session_split_summary,
         shard_store=shard_store,
         has_val_datasets=has_val_datasets,
+        session_feature_stats=session_feature_stats,
     )

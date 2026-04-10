@@ -37,6 +37,7 @@ class SSLTrainingConfig:
     temperature: float = 0.1
     val_every: int = 50
     val_batches: int = 10
+    checkpoint_every_steps: int | None = None
     dataset_weight_alpha: float = 0.25
     examples_per_shard: int = 8
     log_every: int = 10
@@ -57,6 +58,8 @@ class SSLTrainingConfig:
             raise ValueError("objective_mode must be 'future_infonce' or 'augment_infonce'")
         if self.patch_stride > self.patch_size:
             raise ValueError("patch_stride must be <= patch_size")
+        if self.checkpoint_every_steps is not None and int(self.checkpoint_every_steps) <= 0:
+            raise ValueError("checkpoint_every_steps must be positive when provided")
 
     def checkpoint_config(self) -> dict[str, Any]:
         return {
@@ -162,6 +165,9 @@ def _serialize_ssl_training_config(
         "temperature": float(config.temperature),
         "val_every": int(config.val_every),
         "val_batches": int(config.val_batches),
+        "checkpoint_every_steps": (
+            None if config.checkpoint_every_steps is None else int(config.checkpoint_every_steps)
+        ),
         "dataset_weight_alpha": float(config.dataset_weight_alpha),
         "examples_per_shard": int(config.examples_per_shard),
         "augment_cfg": dict(config.augment_cfg),
@@ -174,6 +180,77 @@ def _serialize_ssl_training_config(
         "output_root": str(output_root),
     }
     return payload
+
+
+def _build_checkpoint_payload(
+    *,
+    model: ContrastiveSSLModel,
+    optimizer: torch.optim.Optimizer | None,
+    config_payload: dict[str, Any],
+    step: int,
+    best_score: float,
+    best_step: int | None,
+    checkpoint_kind: str,
+    train_history: list[dict[str, Any]] | None = None,
+    val_history: list[dict[str, Any]] | None = None,
+    dataset_counter: Counter[str] | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "model_state": model.state_dict(),
+        "config": config_payload,
+        "step": int(step),
+        "best_score": float(best_score),
+        "best_step": None if best_step is None else int(best_step),
+        "checkpoint_kind": str(checkpoint_kind),
+    }
+    if optimizer is not None:
+        payload["optimizer_state"] = optimizer.state_dict()
+    if train_history is not None:
+        payload["train_history"] = train_history
+    if val_history is not None:
+        payload["val_history"] = val_history
+    if dataset_counter is not None:
+        payload["dataset_counts"] = dict(dataset_counter)
+    return payload
+
+
+def list_ssl_checkpoints(run_dir: str | Path) -> list[dict[str, Any]]:
+    run_dir = Path(run_dir)
+    checkpoint_paths: list[Path] = []
+    step_dir = run_dir / "checkpoints"
+    if step_dir.exists():
+        checkpoint_paths.extend(sorted(step_dir.glob("step_*.pt")))
+    final_path = run_dir / "checkpoint_final.pt"
+    if final_path.exists():
+        checkpoint_paths.append(final_path)
+
+    rows: list[dict[str, Any]] = []
+    for path in checkpoint_paths:
+        row: dict[str, Any] = {
+            "path": str(path),
+            "name": path.name,
+            "kind": "final" if path.name == "checkpoint_final.pt" else "step",
+            "mtime_seconds": float(path.stat().st_mtime),
+        }
+        if path.stem.startswith("step_"):
+            try:
+                row["step"] = int(path.stem.split("_", 1)[1])
+            except ValueError:
+                pass
+        try:
+            payload = torch.load(path, map_location="cpu")
+            row["step"] = int(payload.get("step", row.get("step", -1)))
+            if payload.get("best_score") is not None:
+                row["best_score"] = float(payload["best_score"])
+            if payload.get("best_step") is not None:
+                row["best_step"] = int(payload["best_step"])
+            if payload.get("checkpoint_kind") is not None:
+                row["checkpoint_kind"] = str(payload["checkpoint_kind"])
+        except Exception as exc:  # pragma: no cover - diagnostic helper
+            row["load_error"] = str(exc)
+        rows.append(row)
+
+    return sorted(rows, key=lambda row: (int(row.get("step", -1)), row["kind"] != "final"))
 
 
 def run_ssl_training(
@@ -229,13 +306,17 @@ def run_ssl_training(
     run_dir.mkdir(parents=True, exist_ok=True)
     progress_path = run_dir / "progress.jsonl"
     checkpoint_path = run_dir / "checkpoint_final.pt"
+    checkpoints_dir = run_dir / "checkpoints"
     plot_loss_path = run_dir / "loss_curve.png"
     plot_top1_path = run_dir / "retrieval_curve.png"
+    if config.checkpoint_every_steps is not None:
+        checkpoints_dir.mkdir(parents=True, exist_ok=True)
 
     config_payload = _serialize_ssl_training_config(config, cache_context=cache_context, output_root=Path(output_root))
     (run_dir / "config.json").write_text(json.dumps(config_payload, indent=2))
 
     best_score = float("inf")
+    best_step: int | None = None
     best_state = None
     train_history: list[dict[str, Any]] = []
     val_history: list[dict[str, Any]] = []
@@ -290,6 +371,7 @@ def run_ssl_training(
 
         if val_sampler is None and summary["loss"] < best_score:
             best_score = summary["loss"]
+            best_step = step
             best_state = {
                 key: value.detach().cpu().clone() for key, value in model.state_dict().items()
             }
@@ -327,9 +409,27 @@ def run_ssl_training(
             )
             if val_result["loss"] < best_score:
                 best_score = val_result["loss"]
+                best_step = step
                 best_state = {
                     key: value.detach().cpu().clone() for key, value in model.state_dict().items()
                 }
+
+        if config.checkpoint_every_steps is not None and step % int(config.checkpoint_every_steps) == 0:
+            step_checkpoint_path = checkpoints_dir / f"step_{step:06d}.pt"
+            torch.save(
+                _build_checkpoint_payload(
+                    model=model,
+                    optimizer=optimizer,
+                    config_payload=config_payload,
+                    step=step,
+                    best_score=best_score,
+                    best_step=best_step,
+                    checkpoint_kind="step",
+                    dataset_counter=dataset_counter,
+                ),
+                step_checkpoint_path,
+            )
+            print("saved_step_checkpoint:", step_checkpoint_path)
 
     if best_state is not None:
         model.load_state_dict(best_state)
@@ -339,21 +439,28 @@ def run_ssl_training(
         }
 
     torch.save(
-        {
-            "model_state": model.state_dict(),
-            "config": config_payload,
-            "best_score": best_score,
-            "train_history": train_history,
-            "val_history": val_history,
-            "dataset_counts": dict(dataset_counter),
-        },
+        _build_checkpoint_payload(
+            model=model,
+            optimizer=optimizer,
+            config_payload=config_payload,
+            step=int(config.num_steps),
+            best_score=best_score,
+            best_step=best_step,
+            checkpoint_kind="final",
+            train_history=train_history,
+            val_history=val_history,
+            dataset_counter=dataset_counter,
+        ),
         checkpoint_path,
     )
 
     print("run_dir:", run_dir)
     print("progress_path:", progress_path)
     print("checkpoint_path:", checkpoint_path)
+    if config.checkpoint_every_steps is not None:
+        print("checkpoints_dir:", checkpoints_dir)
     print("best_score:", best_score)
+    print("best_step:", best_step)
     print("dataset_counts:", dict(dataset_counter))
 
     return {
@@ -365,10 +472,12 @@ def run_ssl_training(
         "run_dir": run_dir,
         "progress_path": progress_path,
         "checkpoint_path": checkpoint_path,
+        "checkpoints_dir": checkpoints_dir,
         "plot_loss_path": plot_loss_path,
         "plot_top1_path": plot_top1_path,
         "config": config_payload,
         "best_score": best_score,
+        "best_step": best_step,
         "train_history": train_history,
         "val_history": val_history,
         "dataset_counts": dict(dataset_counter),

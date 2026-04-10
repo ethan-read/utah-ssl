@@ -26,7 +26,7 @@ from .probe import (
     run_downstream_probe,
     run_probe_head_sweep,
 )
-from .training import SSLTrainingConfig, plot_ssl_training_history, run_ssl_training
+from .training import SSLTrainingConfig, list_ssl_checkpoints, plot_ssl_training_history, run_ssl_training
 
 
 __all__ = [
@@ -36,6 +36,7 @@ __all__ = [
     "SSLTrainingConfig",
     "build_random_init_probe_state",
     "build_segment_sampler",
+    "list_ssl_checkpoints",
     "plot_ssl_training_history",
     "prepare_cache_context",
     "recover_downstream_probe_state",
