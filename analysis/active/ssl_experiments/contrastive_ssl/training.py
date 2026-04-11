@@ -214,12 +214,46 @@ def _build_checkpoint_payload(
     return payload
 
 
+def _checkpoint_timestamp_utc() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def _step_checkpoint_filename(step: int, *, timestamp_utc: str | None = None) -> str:
+    ts = timestamp_utc or _checkpoint_timestamp_utc()
+    return f"step_{int(step):06d}_{ts}.pt"
+
+
+def _final_checkpoint_filename(step: int, *, timestamp_utc: str | None = None) -> str:
+    ts = timestamp_utc or _checkpoint_timestamp_utc()
+    return f"checkpoint_final_step_{int(step):06d}_{ts}.pt"
+
+
+def _parse_step_from_checkpoint_name(name: str) -> int | None:
+    stem = Path(name).stem
+    if stem.startswith("step_"):
+        parts = stem.split("_")
+        if len(parts) >= 2:
+            try:
+                return int(parts[1])
+            except ValueError:
+                return None
+    if stem.startswith("checkpoint_final_step_"):
+        parts = stem.split("_")
+        if len(parts) >= 4:
+            try:
+                return int(parts[3])
+            except ValueError:
+                return None
+    return None
+
+
 def list_ssl_checkpoints(run_dir: str | Path) -> list[dict[str, Any]]:
     run_dir = Path(run_dir)
     checkpoint_paths: list[Path] = []
     step_dir = run_dir / "checkpoints"
     if step_dir.exists():
         checkpoint_paths.extend(sorted(step_dir.glob("step_*.pt")))
+        checkpoint_paths.extend(sorted(step_dir.glob("checkpoint_final_step_*.pt")))
     final_path = run_dir / "checkpoint_final.pt"
     if final_path.exists():
         checkpoint_paths.append(final_path)
@@ -229,14 +263,12 @@ def list_ssl_checkpoints(run_dir: str | Path) -> list[dict[str, Any]]:
         row: dict[str, Any] = {
             "path": str(path),
             "name": path.name,
-            "kind": "final" if path.name == "checkpoint_final.pt" else "step",
+            "kind": "final" if path.name == "checkpoint_final.pt" or path.name.startswith("checkpoint_final_step_") else "step",
             "mtime_seconds": float(path.stat().st_mtime),
         }
-        if path.stem.startswith("step_"):
-            try:
-                row["step"] = int(path.stem.split("_", 1)[1])
-            except ValueError:
-                pass
+        parsed_step = _parse_step_from_checkpoint_name(path.name)
+        if parsed_step is not None:
+            row["step"] = parsed_step
         try:
             payload = torch.load(path, map_location="cpu")
             row["step"] = int(payload.get("step", row.get("step", -1)))
@@ -599,7 +631,7 @@ def run_ssl_training(
                 }
 
         if config.checkpoint_every_steps is not None and step % int(config.checkpoint_every_steps) == 0:
-            step_checkpoint_path = checkpoints_dir / f"step_{step:06d}.pt"
+            step_checkpoint_path = checkpoints_dir / _step_checkpoint_filename(step)
             torch.save(
                 _build_checkpoint_payload(
                     model=model,
@@ -622,27 +654,29 @@ def run_ssl_training(
             key: value.detach().cpu().clone() for key, value in model.state_dict().items()
         }
 
-    torch.save(
-        _build_checkpoint_payload(
-            model=model,
-            optimizer=optimizer,
-            config_payload=config_payload,
-            step=int(config.num_steps),
-            best_score=best_score,
-            best_step=best_step,
-            checkpoint_kind="final",
-            train_history=train_history,
-            val_history=val_history,
-            dataset_counter=dataset_counter,
-        ),
-        checkpoint_path,
+    final_payload = _build_checkpoint_payload(
+        model=model,
+        optimizer=optimizer,
+        config_payload=config_payload,
+        step=int(config.num_steps),
+        best_score=best_score,
+        best_step=best_step,
+        checkpoint_kind="final",
+        train_history=train_history,
+        val_history=val_history,
+        dataset_counter=dataset_counter,
     )
+    torch.save(final_payload, checkpoint_path)
+    timestamped_final_checkpoint_path = checkpoints_dir / _final_checkpoint_filename(int(config.num_steps))
+    checkpoints_dir.mkdir(parents=True, exist_ok=True)
+    torch.save(final_payload, timestamped_final_checkpoint_path)
 
     print("run_dir:", run_dir)
     print("progress_path:", progress_path)
     print("checkpoint_path:", checkpoint_path)
     if config.checkpoint_every_steps is not None:
         print("checkpoints_dir:", checkpoints_dir)
+    print("timestamped_final_checkpoint_path:", timestamped_final_checkpoint_path)
     print("best_score:", best_score)
     print("best_step:", best_step)
     print("dataset_counts:", dict(dataset_counter))
