@@ -18,7 +18,13 @@ def _ensure_repo_import_paths() -> None:
 
 _ensure_repo_import_paths()
 
-from .cache import CacheAccessConfig, CacheContext, build_segment_sampler, prepare_cache_context
+from .cache import (
+    CacheAccessConfig,
+    CacheContext,
+    build_segment_sampler,
+    load_precomputed_session_feature_stats_into_cache_context,
+    prepare_cache_context,
+)
 from .probe import (
     DownstreamProbeConfig,
     build_random_init_probe_state,
@@ -26,7 +32,14 @@ from .probe import (
     run_downstream_probe,
     run_probe_head_sweep,
 )
-from .training import SSLTrainingConfig, list_ssl_checkpoints, plot_ssl_training_history, run_ssl_training
+from .training import (
+    SSLTrainingConfig,
+    list_ssl_checkpoints,
+    plot_ssl_training_history,
+    recover_ssl_run_state_from_checkpoint,
+    resolve_ssl_checkpoint_path,
+    run_ssl_training,
+)
 
 
 __all__ = [
@@ -37,9 +50,12 @@ __all__ = [
     "build_random_init_probe_state",
     "build_segment_sampler",
     "list_ssl_checkpoints",
+    "load_precomputed_session_feature_stats_into_cache_context",
     "plot_ssl_training_history",
     "prepare_cache_context",
     "recover_downstream_probe_state",
+    "recover_ssl_run_state_from_checkpoint",
+    "resolve_ssl_checkpoint_path",
     "run_downstream_probe",
     "run_probe_head_sweep",
     "run_ssl_training",

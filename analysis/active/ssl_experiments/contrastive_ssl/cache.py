@@ -533,6 +533,45 @@ def _compute_session_feature_stats(
     return session_stats
 
 
+def load_precomputed_session_feature_stats_into_cache_context(
+    *,
+    cache_context: CacheContext,
+    stats_path: str | Path,
+    normalize_impl_version: str = "session_featurewise_v1",
+) -> dict[str, Any]:
+    path = Path(stats_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Precomputed session stats file does not exist: {path}")
+
+    payload = torch.load(path, map_location="cpu")
+    raw_stats = payload.get("session_feature_stats")
+    if not isinstance(raw_stats, dict):
+        raise KeyError("Precomputed session stats payload is missing 'session_feature_stats'.")
+
+    session_feature_stats: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+    for key, value in raw_stats.items():
+        if not isinstance(value, (tuple, list)) or len(value) != 2:
+            raise ValueError(
+                f"Session stats entry for {key!r} must be a 2-item (mean, std) tuple/list."
+            )
+        mean, std = value
+        mean_t = torch.as_tensor(mean).float().cpu()
+        std_t = torch.as_tensor(std).float().cpu()
+        session_feature_stats[str(key)] = (mean_t, std_t)
+
+    cache_context.session_feature_stats = dict(session_feature_stats)
+    cache_context.config.normalize_impl_version = str(normalize_impl_version)
+
+    metadata = dict(payload.get("metadata", {}))
+    return {
+        "stats_path": path,
+        "metadata": metadata,
+        "session_feature_stats": session_feature_stats,
+        "session_count": int(len(session_feature_stats)),
+        "normalize_impl_version": cache_context.normalize_impl_version,
+    }
+
+
 def sample_base_segment(
     cache_context: CacheContext,
     example: ExampleRow,

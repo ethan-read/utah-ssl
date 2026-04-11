@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import time
 from collections import Counter, defaultdict
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -253,6 +253,190 @@ def list_ssl_checkpoints(run_dir: str | Path) -> list[dict[str, Any]]:
     return sorted(rows, key=lambda row: (int(row.get("step", -1)), row["kind"] != "final"))
 
 
+def _ssl_run_dir_from_checkpoint_path(path: str | Path) -> Path:
+    checkpoint_path = Path(path)
+    if checkpoint_path.parent.name == "checkpoints":
+        return checkpoint_path.parent.parent
+    return checkpoint_path.parent
+
+
+def resolve_ssl_checkpoint_path(
+    *,
+    output_root: str | Path,
+    explicit_checkpoint_path: str | Path | None = None,
+    run_dir: str | Path | None = None,
+) -> Path:
+    if explicit_checkpoint_path is not None:
+        candidate = Path(explicit_checkpoint_path)
+        if not candidate.exists():
+            raise FileNotFoundError(f"Explicit SSL checkpoint path does not exist: {candidate}")
+        return candidate
+
+    resolved_run_dir: Path | None = None
+    if run_dir is not None:
+        resolved_run_dir = Path(run_dir)
+        if not resolved_run_dir.exists():
+            raise FileNotFoundError(f"Requested SSL run directory does not exist: {resolved_run_dir}")
+    else:
+        run_candidates = sorted(
+            [path for path in Path(output_root).glob("colab_s5_*") if path.is_dir()],
+            key=lambda path: path.stat().st_mtime,
+        )
+        if run_candidates:
+            resolved_run_dir = run_candidates[-1]
+
+    if resolved_run_dir is None:
+        raise RuntimeError(
+            f"Could not find any SSL run directories under {output_root}. "
+            "Provide an explicit checkpoint path or a run directory."
+        )
+
+    available_checkpoints = [
+        row for row in list_ssl_checkpoints(resolved_run_dir) if not row.get("load_error")
+    ]
+    if not available_checkpoints:
+        raise RuntimeError(
+            f"No readable SSL checkpoints were found in {resolved_run_dir}. "
+            "If training stopped before the first save, there may be nothing to recover yet."
+        )
+
+    selected = sorted(
+        available_checkpoints,
+        key=lambda row: (int(row.get("step", -1)), row.get("kind") == "final"),
+    )[-1]
+    return Path(selected["path"])
+
+
+def recover_ssl_run_state_from_checkpoint(
+    *,
+    checkpoint_path: str | Path,
+    cache_context: CacheContext,
+    device: torch.device,
+    fallback_config: SSLTrainingConfig | None = None,
+) -> dict[str, Any]:
+    resolved_checkpoint_path = Path(checkpoint_path)
+    if not resolved_checkpoint_path.exists():
+        raise FileNotFoundError(f"SSL checkpoint does not exist: {resolved_checkpoint_path}")
+
+    payload = torch.load(resolved_checkpoint_path, map_location="cpu")
+    run_dir = _ssl_run_dir_from_checkpoint_path(resolved_checkpoint_path)
+
+    recovered_config = dict(payload.get("config", {}))
+    config_path = run_dir / "config.json"
+    if not recovered_config and config_path.exists():
+        recovered_config = json.loads(config_path.read_text())
+
+    fallback_payload = asdict(fallback_config) if fallback_config is not None else {}
+    for key, value in fallback_payload.items():
+        recovered_config.setdefault(key, value)
+
+    required_keys = [
+        "segment_bins",
+        "patch_size",
+        "patch_stride",
+        "hidden_size",
+        "s5_state_size",
+        "num_layers",
+        "dropout",
+        "batch_size",
+        "seed",
+        "dataset_weight_alpha",
+        "examples_per_shard",
+        "learning_rate",
+        "weight_decay",
+    ]
+    missing_keys = [key for key in required_keys if key not in recovered_config]
+    if missing_keys:
+        raise KeyError(
+            f"Recovered SSL config is missing keys needed for analysis/probe recovery: {missing_keys}"
+        )
+
+    model = ContrastiveSSLModel(
+        input_dim=cache_context.full_dim,
+        hidden_size=int(recovered_config["hidden_size"]),
+        s5_state_size=int(recovered_config["s5_state_size"]),
+        num_layers=int(recovered_config["num_layers"]),
+        dropout=float(recovered_config["dropout"]),
+        patch_size=int(recovered_config["patch_size"]),
+        patch_stride=int(recovered_config["patch_stride"]),
+        post_proj_norm=str(recovered_config.get("post_proj_norm", "rms")),
+    ).to(device)
+    model_state = payload.get("model_state")
+    if model_state is None:
+        raise KeyError("Recovered SSL checkpoint is missing 'model_state'.")
+    model.load_state_dict(model_state)
+    model.eval()
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=float(recovered_config["learning_rate"]),
+        weight_decay=float(recovered_config["weight_decay"]),
+    )
+    if payload.get("optimizer_state") is not None:
+        optimizer.load_state_dict(payload["optimizer_state"])
+
+    train_sampler = build_segment_sampler(
+        cache_context,
+        "train",
+        batch_size=int(recovered_config["batch_size"]),
+        seed=int(recovered_config["seed"]),
+        segment_bins=int(recovered_config["segment_bins"]),
+        dataset_weight_alpha=float(recovered_config["dataset_weight_alpha"]),
+        examples_per_shard=int(recovered_config["examples_per_shard"]),
+    )
+    try:
+        val_sampler = build_segment_sampler(
+            cache_context,
+            "val",
+            batch_size=int(recovered_config["batch_size"]),
+            seed=int(recovered_config["seed"]) + 101,
+            segment_bins=int(recovered_config["segment_bins"]),
+            dataset_weight_alpha=float(recovered_config["dataset_weight_alpha"]),
+            examples_per_shard=int(recovered_config["examples_per_shard"]),
+        )
+    except RuntimeError:
+        val_sampler = None
+
+    progress_path = run_dir / "progress.jsonl"
+    checkpoint_step = int(payload.get("step", -1))
+    train_history = list(payload.get("train_history", []))
+    val_history = list(payload.get("val_history", []))
+    if progress_path.exists() and (not train_history or not val_history):
+        records = [json.loads(line) for line in progress_path.read_text().splitlines() if line.strip()]
+        train_history = [
+            record
+            for record in records
+            if record.get("event") == "train" and int(record.get("step", -1)) <= checkpoint_step
+        ]
+        val_history = [
+            record
+            for record in records
+            if record.get("event") == "val" and int(record.get("step", -1)) <= checkpoint_step
+        ]
+
+    return {
+        "model": model,
+        "optimizer": optimizer,
+        "train_sampler": train_sampler,
+        "val_sampler": val_sampler,
+        "run_name": run_dir.name,
+        "run_dir": run_dir,
+        "progress_path": progress_path,
+        "checkpoint_path": resolved_checkpoint_path,
+        "checkpoints_dir": run_dir / "checkpoints",
+        "plot_loss_path": run_dir / "loss_curve.png",
+        "plot_top1_path": run_dir / "retrieval_curve.png",
+        "config": recovered_config,
+        "best_score": payload.get("best_score"),
+        "best_step": payload.get("best_step"),
+        "train_history": train_history,
+        "val_history": val_history,
+        "dataset_counts": dict(payload.get("dataset_counts", {})),
+        "checkpoint_step": checkpoint_step,
+        "checkpoint_kind": payload.get("checkpoint_kind"),
+    }
+
+
 def run_ssl_training(
     *,
     cache_context: CacheContext,
@@ -492,9 +676,17 @@ def plot_ssl_training_history(run_state: dict[str, Any]) -> dict[str, Any]:
     plot_top1_path = Path(run_state["plot_top1_path"])
     objective_mode = str(run_state["config"]["objective_mode"])
 
-    records = [json.loads(line) for line in progress_path.read_text().splitlines() if line.strip()]
-    train_records = [record for record in records if record.get("event") == "train"]
-    val_records = [record for record in records if record.get("event") == "val"]
+    train_records = list(run_state.get("train_history", []))
+    val_records = list(run_state.get("val_history", []))
+    if train_records or val_records:
+        records = sorted(
+            [*train_records, *val_records],
+            key=lambda record: (int(record.get("step", -1)), str(record.get("event", ""))),
+        )
+    else:
+        records = [json.loads(line) for line in progress_path.read_text().splitlines() if line.strip()]
+        train_records = [record for record in records if record.get("event") == "train"]
+        val_records = [record for record in records if record.get("event") == "val"]
 
     train_steps = np.array([record["step"] for record in train_records], dtype=np.int64)
     train_losses = np.array([record["loss"] for record in train_records], dtype=np.float32)
