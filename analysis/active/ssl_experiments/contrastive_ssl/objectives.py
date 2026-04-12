@@ -125,16 +125,6 @@ def augment_segment(x_seq: torch.Tensor, feature_mask: torch.Tensor, cfg: dict[s
     return x_aug
 
 
-def _encode_group_ids(values: list[str], *, device: torch.device) -> torch.Tensor:
-    group_ids: dict[str, int] = {}
-    encoded = []
-    for value in values:
-        if value not in group_ids:
-            group_ids[value] = len(group_ids)
-        encoded.append(group_ids[value])
-    return torch.tensor(encoded, device=device, dtype=torch.long)
-
-
 def _sample_crop_starts(
     *,
     seq_len: int,
@@ -236,113 +226,41 @@ def _flatten_valid_patch_embeddings(
     }
 
 
-def _negative_scope_mask(
-    scope: str,
-    *,
-    sample_idx: int,
-    sample_session_id: int,
-    sample_dataset_id: int,
-    key_sample_idx: torch.Tensor,
-    key_session_ids: torch.Tensor,
-    key_dataset_ids: torch.Tensor,
-) -> torch.Tensor:
-    base_mask = key_sample_idx != int(sample_idx)
-    if scope == "same_session":
-        return base_mask & (key_session_ids == int(sample_session_id))
-    if scope == "same_dataset":
-        return base_mask & (key_dataset_ids == int(sample_dataset_id))
-    if scope == "global":
-        return base_mask
-    raise ValueError(f"Unknown negative scope: {scope}")
-
-
-def _compute_local_patch_infonce_direction(
+def _compute_local_band_infonce_direction(
     *,
     query: dict[str, torch.Tensor],
     key: dict[str, torch.Tensor],
-    sample_session_ids: torch.Tensor,
-    sample_dataset_ids: torch.Tensor,
     patch_offset_by_sample: torch.Tensor,
     positive_radius: int,
-    negative_scope: str,
-    fallback_negative_scope: str,
+    candidate_radius: int,
     temperature: float,
 ) -> tuple[torch.Tensor, torch.Tensor, int]:
     logits = query["z"] @ key["z"].T / float(temperature)
-    key_sample_idx = key["sample_idx"]
-    key_patch_idx = key["patch_idx"]
-    key_session_ids = sample_session_ids[key_sample_idx]
-    key_dataset_ids = sample_dataset_ids[key_sample_idx]
+    target_patch_idx = query["patch_idx"] - patch_offset_by_sample[query["sample_idx"]]
+    sample_match = query["sample_idx"].unsqueeze(1) == key["sample_idx"].unsqueeze(0)
+    patch_delta = key["patch_idx"].unsqueeze(0) - target_patch_idx.unsqueeze(1)
 
-    losses = []
-    hits = []
-    used_queries = 0
+    candidate_mask = sample_match & (patch_delta.abs() <= int(candidate_radius))
+    positive_mask = sample_match & (patch_delta.abs() <= int(positive_radius))
 
-    for row_idx in range(logits.shape[0]):
-        sample_idx = int(query["sample_idx"][row_idx].item())
-        sample_session_id = int(sample_session_ids[sample_idx].item())
-        sample_dataset_id = int(sample_dataset_ids[sample_idx].item())
-        target_patch = int(query["patch_idx"][row_idx].item()) - int(patch_offset_by_sample[sample_idx].item())
+    candidate_counts = candidate_mask.sum(dim=1)
+    positive_counts = positive_mask.sum(dim=1)
+    valid_queries = (positive_counts > 0) & (candidate_counts > positive_counts)
+    if not bool(valid_queries.any()):
+        valid_queries = positive_counts > 0
+    if not bool(valid_queries.any()):
+        raise ValueError("No valid local-band positives remain for augment_infonce.")
 
-        positive_mask = (key_sample_idx == sample_idx) & (
-            (key_patch_idx >= target_patch - int(positive_radius))
-            & (key_patch_idx <= target_patch + int(positive_radius))
-        )
-        if not bool(positive_mask.any()):
-            continue
+    logits = logits[valid_queries]
+    candidate_mask = candidate_mask[valid_queries]
+    positive_mask = positive_mask[valid_queries]
 
-        negative_mask = _negative_scope_mask(
-            negative_scope,
-            sample_idx=sample_idx,
-            sample_session_id=sample_session_id,
-            sample_dataset_id=sample_dataset_id,
-            key_sample_idx=key_sample_idx,
-            key_session_ids=key_session_ids,
-            key_dataset_ids=key_dataset_ids,
-        )
-        if not bool(negative_mask.any()):
-            negative_mask = _negative_scope_mask(
-                fallback_negative_scope,
-                sample_idx=sample_idx,
-                sample_session_id=sample_session_id,
-                sample_dataset_id=sample_dataset_id,
-                key_sample_idx=key_sample_idx,
-                key_session_ids=key_session_ids,
-                key_dataset_ids=key_dataset_ids,
-            )
-        if not bool(negative_mask.any()):
-            negative_mask = _negative_scope_mask(
-                "global",
-                sample_idx=sample_idx,
-                sample_session_id=sample_session_id,
-                sample_dataset_id=sample_dataset_id,
-                key_sample_idx=key_sample_idx,
-                key_session_ids=key_session_ids,
-                key_dataset_ids=key_dataset_ids,
-            )
-
-        allowed_mask = positive_mask | negative_mask
-        if not bool(allowed_mask.any()):
-            continue
-
-        row_logits = logits[row_idx]
-        positive_logits = row_logits.masked_fill(~positive_mask, float("-inf"))
-        allowed_logits = row_logits.masked_fill(~allowed_mask, float("-inf"))
-        loss = torch.logsumexp(allowed_logits, dim=0) - torch.logsumexp(positive_logits, dim=0)
-        pred_idx = int(torch.argmax(allowed_logits).item())
-
-        losses.append(loss)
-        hits.append(float(positive_mask[pred_idx].item()))
-        used_queries += 1
-
-    if not losses:
-        raise ValueError("No valid local patch positives remain for augment_infonce.")
-
-    return (
-        torch.stack(losses).mean(),
-        torch.tensor(hits, device=logits.device, dtype=logits.dtype).mean(),
-        int(used_queries),
-    )
+    candidate_logits = logits.masked_fill(~candidate_mask, float("-inf"))
+    positive_logits = logits.masked_fill(~positive_mask, float("-inf"))
+    losses = torch.logsumexp(candidate_logits, dim=1) - torch.logsumexp(positive_logits, dim=1)
+    pred_idx = candidate_logits.argmax(dim=1)
+    top1 = positive_mask.gather(1, pred_idx.unsqueeze(1)).to(logits.dtype).mean()
+    return losses.mean(), top1, int(valid_queries.sum().item())
 
 
 def compute_augment_infonce_metrics(
@@ -371,34 +289,28 @@ def compute_augment_infonce_metrics(
     query12 = _flatten_valid_patch_embeddings(z1, out1["token_lengths"])
     query21 = _flatten_valid_patch_embeddings(z2, out2["token_lengths"])
 
-    sample_session_ids = _encode_group_ids(batch["session_keys"], device=device)
-    sample_dataset_ids = _encode_group_ids(batch["datasets"], device=device)
     patch_offset_12 = view_bundle["view2_start_patches"].to(device) - view_bundle["view1_start_patches"].to(device)
     patch_offset_21 = -patch_offset_12
     positive_radius = max(0, int(augment_cfg.get("positive_radius_patches", 0)))
-    negative_scope = str(augment_cfg.get("negative_scope", "same_session"))
-    fallback_negative_scope = str(augment_cfg.get("fallback_negative_scope", "same_dataset"))
+    candidate_radius = max(
+        positive_radius + 1,
+        int(augment_cfg.get("local_candidate_radius_patches", positive_radius + 1)),
+    )
 
-    loss12, top1_12, pairs12 = _compute_local_patch_infonce_direction(
+    loss12, top1_12, pairs12 = _compute_local_band_infonce_direction(
         query=query12,
         key=query21,
-        sample_session_ids=sample_session_ids,
-        sample_dataset_ids=sample_dataset_ids,
         patch_offset_by_sample=patch_offset_12,
         positive_radius=positive_radius,
-        negative_scope=negative_scope,
-        fallback_negative_scope=fallback_negative_scope,
+        candidate_radius=candidate_radius,
         temperature=temperature,
     )
-    loss21, top1_21, pairs21 = _compute_local_patch_infonce_direction(
+    loss21, top1_21, pairs21 = _compute_local_band_infonce_direction(
         query=query21,
         key=query12,
-        sample_session_ids=sample_session_ids,
-        sample_dataset_ids=sample_dataset_ids,
         patch_offset_by_sample=patch_offset_21,
         positive_radius=positive_radius,
-        negative_scope=negative_scope,
-        fallback_negative_scope=fallback_negative_scope,
+        candidate_radius=candidate_radius,
         temperature=temperature,
     )
 
