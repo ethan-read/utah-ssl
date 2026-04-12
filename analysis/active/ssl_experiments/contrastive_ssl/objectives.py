@@ -94,8 +94,16 @@ def augment_segment(x_seq: torch.Tensor, feature_mask: torch.Tensor, cfg: dict[s
     present = x_aug[:, present_idx]
     present = present + torch.randn_like(present) * float(cfg["noise_std"])
 
-    scale = 1.0 + torch.randn(present.shape[1], dtype=present.dtype) * float(cfg["scale_jitter"])
-    offset = torch.randn(present.shape[1], dtype=present.dtype) * float(cfg["offset_jitter"])
+    scale = 1.0 + torch.randn(
+        present.shape[1],
+        dtype=present.dtype,
+        device=present.device,
+    ) * float(cfg["scale_jitter"])
+    offset = torch.randn(
+        present.shape[1],
+        dtype=present.dtype,
+        device=present.device,
+    ) * float(cfg["offset_jitter"])
     present = present * scale.unsqueeze(0) + offset.unsqueeze(0)
 
     time_mask_frac = float(cfg["time_mask_frac"])
@@ -107,7 +115,7 @@ def augment_segment(x_seq: torch.Tensor, feature_mask: torch.Tensor, cfg: dict[s
 
     dropout_prob = float(cfg["channel_dropout_prob"])
     if dropout_prob > 0.0 and present.shape[1] > 1:
-        keep = torch.rand(present.shape[1]) > dropout_prob
+        keep = torch.rand(present.shape[1], device=present.device) > dropout_prob
         if not bool(keep.any()):
             keep[random.randrange(present.shape[1])] = True
         present = present * keep.to(present.dtype).unsqueeze(0)
@@ -117,13 +125,76 @@ def augment_segment(x_seq: torch.Tensor, feature_mask: torch.Tensor, cfg: dict[s
     return x_aug
 
 
-def build_augmented_views(batch: dict[str, Any], cfg: dict[str, Any]) -> tuple[torch.Tensor, torch.Tensor]:
+def _sample_nonzero_view_shift_bins(max_shift_strides: int, patch_stride: int) -> int:
+    if max_shift_strides <= 0:
+        return 0
+    shift_strides = random.randint(1, max_shift_strides)
+    shift_bins = shift_strides * int(patch_stride)
+    return shift_bins if random.random() < 0.5 else -shift_bins
+
+
+def build_augmented_views(
+    batch: dict[str, Any],
+    cfg: dict[str, Any],
+    *,
+    patch_stride: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    max_shift_strides = max(0, int(cfg.get("view_shift_max_strides", 0)))
+
     view1 = []
     view2 = []
-    for x_seq, feature_mask in zip(batch["x"], batch["feature_mask"]):
-        view1.append(augment_segment(x_seq, feature_mask, cfg))
-        view2.append(augment_segment(x_seq, feature_mask, cfg))
-    return torch.stack(view1, dim=0), torch.stack(view2, dim=0)
+    shifted_lengths = []
+
+    for x_seq, feature_mask, length in zip(batch["x"], batch["feature_mask"], batch["lengths"].tolist()):
+        aug1 = augment_segment(x_seq, feature_mask, cfg)
+        aug2 = augment_segment(x_seq, feature_mask, cfg)
+
+        seq_len = int(length)
+        max_allowed_shift_strides = min(
+            max_shift_strides,
+            max(0, (seq_len - 1) // int(patch_stride)),
+        )
+        shift_bins = _sample_nonzero_view_shift_bins(max_allowed_shift_strides, patch_stride)
+        overlap_len = max(0, seq_len - abs(shift_bins))
+
+        aligned1 = torch.zeros_like(aug1)
+        aligned2 = torch.zeros_like(aug2)
+        if overlap_len > 0:
+            if shift_bins >= 0:
+                src1_start = 0
+                src2_start = shift_bins
+            else:
+                src1_start = -shift_bins
+                src2_start = 0
+            aligned1[:overlap_len] = aug1[src1_start : src1_start + overlap_len]
+            aligned2[:overlap_len] = aug2[src2_start : src2_start + overlap_len]
+
+        view1.append(aligned1)
+        view2.append(aligned2)
+        shifted_lengths.append(overlap_len)
+
+    return (
+        torch.stack(view1, dim=0),
+        torch.stack(view2, dim=0),
+        torch.tensor(shifted_lengths, dtype=batch["lengths"].dtype),
+    )
+
+
+def _flatten_valid_patch_embeddings(
+    z: torch.Tensor,
+    token_lengths: torch.Tensor,
+) -> torch.Tensor:
+    chunks = []
+    for sample_idx, token_length in enumerate(token_lengths.tolist()):
+        valid_length = int(token_length)
+        if valid_length <= 0:
+            continue
+        chunks.append(z[sample_idx, :valid_length])
+
+    if not chunks:
+        raise ValueError("No valid patch embeddings remain for augment_infonce.")
+
+    return torch.cat(chunks, dim=0)
 
 
 def compute_augment_infonce_metrics(
@@ -134,16 +205,25 @@ def compute_augment_infonce_metrics(
     augment_cfg: dict[str, Any],
     device: torch.device,
 ) -> dict[str, Any]:
-    view1, view2 = build_augmented_views(batch, augment_cfg)
-    lengths = batch["lengths"].to(device)
-    out1 = model.encode_pooled(view1.to(device), lengths)
-    out2 = model.encode_pooled(view2.to(device), lengths)
-    z1 = out1["z"]
-    z2 = out2["z"]
+    view1, view2, shifted_lengths = build_augmented_views(
+        batch,
+        augment_cfg,
+        patch_stride=model.encoder.patch_stride,
+    )
+    lengths = shifted_lengths.to(device)
+    out1 = model.encode_sequence(view1.to(device), lengths)
+    out2 = model.encode_sequence(view2.to(device), lengths)
+    if not torch.equal(out1["token_lengths"], out2["token_lengths"]):
+        raise ValueError("Augmented views must preserve patch alignment for patch-level augment_infonce.")
 
-    logits12 = z1 @ z2.T / float(temperature)
-    logits21 = z2 @ z1.T / float(temperature)
-    labels = torch.arange(z1.shape[0], device=z1.device)
+    z1 = model.project_patches(out1["hidden"])
+    z2 = model.project_patches(out2["hidden"])
+    q = _flatten_valid_patch_embeddings(z1, out1["token_lengths"])
+    k = _flatten_valid_patch_embeddings(z2, out2["token_lengths"])
+
+    logits12 = q @ k.T / float(temperature)
+    logits21 = k @ q.T / float(temperature)
+    labels = torch.arange(q.shape[0], device=q.device)
     loss12 = F.cross_entropy(logits12, labels)
     loss21 = F.cross_entropy(logits21, labels)
     top1_12 = (logits12.argmax(dim=1) == labels).float().mean()
@@ -152,7 +232,7 @@ def compute_augment_infonce_metrics(
     return {
         "loss": 0.5 * (loss12 + loss21),
         "top1": 0.5 * (top1_12 + top1_21),
-        "positive_pairs": int(z1.shape[0]),
+        "positive_pairs": int(q.shape[0]),
         "mean_abs_view_delta": float((view1 - view2).abs().mean().item()),
     }
 

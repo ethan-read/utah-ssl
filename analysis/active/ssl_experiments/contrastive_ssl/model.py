@@ -150,8 +150,12 @@ class ContrastiveSSLModel(nn.Module):
     def encode_sequence(self, x: torch.Tensor, lengths: torch.Tensor) -> dict[str, torch.Tensor]:
         return self.encoder(x, lengths)
 
+    def project_patches(self, hidden: torch.Tensor) -> torch.Tensor:
+        # Reuse the existing augment projection head for per-patch objectives.
+        return F.normalize(self.segment_head(hidden), dim=-1)
+
     def encode_pooled(self, x: torch.Tensor, lengths: torch.Tensor) -> dict[str, torch.Tensor]:
         outputs = self.encoder(x, lengths)
         pooled = masked_mean_pool(outputs["hidden"], outputs["token_lengths"])
-        z = F.normalize(self.segment_head(pooled), dim=-1)
+        z = self.project_patches(pooled)
         return {**outputs, "pooled": pooled, "z": z}
