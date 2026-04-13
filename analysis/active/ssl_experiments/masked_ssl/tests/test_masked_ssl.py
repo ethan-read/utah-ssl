@@ -19,7 +19,12 @@ for path in (REPO_ROOT, EXPERIMENTS_DIR):
         sys.path.insert(0, path_str)
 
 from masked_ssl.model import MaskedSSLModel
-from masked_ssl.objectives import build_masked_batch, sample_mask_indices
+from masked_ssl.objectives import (
+    build_masked_batch,
+    compute_masked_reconstruction_metrics,
+    sample_mask_indices,
+    summarize_metrics,
+)
 from masked_ssl.probe import DownstreamProbeConfig, recover_downstream_probe_state
 from masked_ssl.training import recover_ssl_run_state_from_checkpoint
 
@@ -128,6 +133,33 @@ class MaskedSSLTests(unittest.TestCase):
         expected = masked["token_feature_mask"] & masked["token_mask"].unsqueeze(-1)
         self.assertTrue(torch.equal(masked["token_loss_mask"], expected))
         self.assertFalse(masked["token_loss_mask"][~masked["token_feature_mask"]].any())
+
+    def test_masked_reconstruction_summary_includes_prediction_and_target_stats(self) -> None:
+        random.seed(3)
+        model = _make_model()
+        batch = _make_batch()
+        metrics = compute_masked_reconstruction_metrics(
+            model,
+            batch,
+            mask_unit="patch",
+            mask_token_placement="before_projection",
+            mask_ratio=0.4,
+            span_length_min=1,
+            span_length_max=2,
+            num_spans_mode="one",
+            allow_bin_fractional_overlap=True,
+            device=torch.device("cpu"),
+        )
+        summary = summarize_metrics(metrics)
+        for key in (
+            "masked_prediction_mean",
+            "masked_prediction_std",
+            "masked_target_mean",
+            "masked_target_std",
+        ):
+            self.assertIn(key, summary)
+        self.assertGreaterEqual(float(summary["masked_prediction_std"]), 0.0)
+        self.assertGreaterEqual(float(summary["masked_target_std"]), 0.0)
 
     def test_bin_level_masking_generates_partial_patch_overlap(self) -> None:
         random.seed(2)

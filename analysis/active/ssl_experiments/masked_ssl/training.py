@@ -803,6 +803,28 @@ def plot_ssl_training_history(run_state: dict[str, Any]) -> dict[str, Any]:
     print("train_best_loss:", float(train_losses.min()), "at step", int(train_steps[train_losses.argmin()]))
     if val_records:
         print("val_best_loss:", float(val_losses.min()), "at step", int(val_steps[val_losses.argmin()]))
+    latest_train = train_records[-1] if train_records else None
+    latest_val = val_records[-1] if val_records else None
+    if latest_train is not None:
+        print(
+            "latest_train_masked_stats:",
+            {
+                "prediction_mean": float(latest_train["masked_prediction_mean"]),
+                "prediction_std": float(latest_train["masked_prediction_std"]),
+                "target_mean": float(latest_train["masked_target_mean"]),
+                "target_std": float(latest_train["masked_target_std"]),
+            },
+        )
+    if latest_val is not None:
+        print(
+            "latest_val_masked_stats:",
+            {
+                "prediction_mean": float(latest_val["masked_prediction_mean"]),
+                "prediction_std": float(latest_val["masked_prediction_std"]),
+                "target_mean": float(latest_val["masked_target_mean"]),
+                "target_std": float(latest_val["masked_target_std"]),
+            },
+        )
     print("aux_metric_key:", aux_key)
     print("plot_loss_path:", plot_loss_path)
     print("plot_metric_path:", plot_metric_path)

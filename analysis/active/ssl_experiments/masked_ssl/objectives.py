@@ -19,6 +19,10 @@ def summarize_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
         "masked_token_count": int(metrics["masked_token_count"]),
         "masked_element_count": int(metrics["masked_element_count"]),
         "masked_token_full_patch_mse": float(metrics["masked_token_full_patch_mse"]),
+        "masked_prediction_mean": float(metrics["masked_prediction_mean"]),
+        "masked_prediction_std": float(metrics["masked_prediction_std"]),
+        "masked_target_mean": float(metrics["masked_target_mean"]),
+        "masked_target_std": float(metrics["masked_target_std"]),
     }
     if "patch_fraction_weighted_mse" in metrics:
         summary["patch_fraction_weighted_mse"] = float(metrics["patch_fraction_weighted_mse"])
@@ -261,6 +265,8 @@ def compute_masked_reconstruction_metrics(
     element_weights = token_loss_mask.to(sqerr.dtype)
     loss_denom = element_weights.sum().clamp_min(1.0)
     loss = (sqerr * element_weights).sum() / loss_denom
+    masked_predictions = reconstruction[token_loss_mask]
+    masked_targets = tokens[token_loss_mask]
 
     token_feature_weights = token_feature_mask.to(sqerr.dtype)
     per_token_full_patch_mse = (
@@ -286,6 +292,10 @@ def compute_masked_reconstruction_metrics(
         "masked_token_count": int(masked_token_selector.sum().item()),
         "masked_element_count": int(token_loss_mask.sum().item()),
         "masked_token_full_patch_mse": masked_token_full_patch_mse,
+        "masked_prediction_mean": float(masked_predictions.mean().detach().cpu().item()),
+        "masked_prediction_std": float(masked_predictions.std(unbiased=False).detach().cpu().item()),
+        "masked_target_mean": float(masked_targets.mean().detach().cpu().item()),
+        "masked_target_std": float(masked_targets.std(unbiased=False).detach().cpu().item()),
     }
 
     if mask_unit == "bin":
