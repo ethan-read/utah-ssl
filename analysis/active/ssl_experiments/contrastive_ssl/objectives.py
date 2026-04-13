@@ -125,27 +125,57 @@ def augment_segment(x_seq: torch.Tensor, feature_mask: torch.Tensor, cfg: dict[s
     return x_aug
 
 
+_AUGMENT_VIEW_KEYS = (
+    "noise_std",
+    "scale_jitter",
+    "offset_jitter",
+    "time_mask_frac",
+    "channel_dropout_prob",
+    "clip_value",
+)
+
+
+def _resolve_view_cfg(cfg: dict[str, Any], view_key: str) -> dict[str, Any]:
+    view_cfg = cfg.get(view_key)
+    if isinstance(view_cfg, dict):
+        return dict(view_cfg)
+    return {key: cfg[key] for key in _AUGMENT_VIEW_KEYS if key in cfg}
+
+
+def _resolve_shift_choices(cfg: dict[str, Any]) -> tuple[int, ...]:
+    shift_choices = cfg.get("view_shift_choices")
+    if shift_choices is not None:
+        return tuple(int(shift) for shift in shift_choices)
+
+    max_shift_strides = max(0, int(cfg.get("view_shift_max_strides", 0)))
+    if max_shift_strides <= 0:
+        return (0,)
+    return tuple(shift for shift in range(-max_shift_strides, max_shift_strides + 1) if shift != 0)
+
+
 def _sample_crop_starts(
     *,
     seq_len: int,
     crop_bins: int,
     patch_stride: int,
-    max_shift_strides: int,
+    shift_choices: tuple[int, ...],
 ) -> tuple[int, int]:
     crop_bins = max(1, min(int(crop_bins), int(seq_len)))
     max_start_stride = max(0, (int(seq_len) - crop_bins) // int(patch_stride))
     start1_stride = random.randint(0, max_start_stride) if max_start_stride > 0 else 0
 
-    if max_shift_strides <= 0 or max_start_stride <= 0:
+    if max_start_stride <= 0:
         return start1_stride * int(patch_stride), start1_stride * int(patch_stride)
 
-    min_shift = max(-int(max_shift_strides), -start1_stride)
-    max_shift = min(int(max_shift_strides), max_start_stride - start1_stride)
-    shift_choices = [shift for shift in range(min_shift, max_shift + 1) if shift != 0]
-    if not shift_choices:
+    feasible_shift_choices = [
+        int(shift)
+        for shift in shift_choices
+        if -start1_stride <= int(shift) <= max_start_stride - start1_stride
+    ]
+    if not feasible_shift_choices:
         return start1_stride * int(patch_stride), start1_stride * int(patch_stride)
 
-    shift_stride = random.choice(shift_choices)
+    shift_stride = random.choice(feasible_shift_choices)
     start2_stride = start1_stride + shift_stride
     return start1_stride * int(patch_stride), start2_stride * int(patch_stride)
 
@@ -156,8 +186,10 @@ def build_augmented_views(
     *,
     patch_stride: int,
 ) -> dict[str, torch.Tensor]:
-    max_shift_strides = max(0, int(cfg.get("view_shift_max_strides", 0)))
     requested_crop_bins = max(1, int(cfg.get("crop_bins", batch["x"].shape[1])))
+    shift_choices = _resolve_shift_choices(cfg)
+    view1_cfg = _resolve_view_cfg(cfg, "view1_cfg")
+    view2_cfg = _resolve_view_cfg(cfg, "view2_cfg")
 
     view1 = []
     view2 = []
@@ -166,8 +198,8 @@ def build_augmented_views(
     view2_start_patches = []
 
     for x_seq, feature_mask, length in zip(batch["x"], batch["feature_mask"], batch["lengths"].tolist()):
-        aug1 = augment_segment(x_seq, feature_mask, cfg)
-        aug2 = augment_segment(x_seq, feature_mask, cfg)
+        aug1 = augment_segment(x_seq, feature_mask, view1_cfg)
+        aug2 = augment_segment(x_seq, feature_mask, view2_cfg)
 
         seq_len = int(length)
         crop_bins = min(requested_crop_bins, seq_len)
@@ -175,7 +207,7 @@ def build_augmented_views(
             seq_len=seq_len,
             crop_bins=crop_bins,
             patch_stride=patch_stride,
-            max_shift_strides=max_shift_strides,
+            shift_choices=shift_choices,
         )
         crop1 = aug1[view1_start_bin : view1_start_bin + crop_bins]
         crop2 = aug2[view2_start_bin : view2_start_bin + crop_bins]
