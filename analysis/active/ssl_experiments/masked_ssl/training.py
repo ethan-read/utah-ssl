@@ -32,8 +32,8 @@ class SSLTrainingConfig:
     seed: int = 7
     objective_mode: str = "masked_reconstruction"
     segment_bins: int = 80
-    patch_size: int = 5
-    patch_stride: int = 5
+    patch_size: int = 4
+    patch_stride: int = 2
     hidden_size: int = 256
     s5_state_size: int = 128
     num_layers: int = 2
@@ -51,10 +51,10 @@ class SSLTrainingConfig:
     post_proj_norm: str = "rms"
     mask_unit: str = "patch"
     mask_token_placement: str = "before_projection"
-    mask_ratio: float = 0.40
-    span_length_min: int = 2
-    span_length_max: int = 8
-    num_spans_mode: str = "one"
+    mask_ratio: float = 0.15
+    span_length_min: int = 1
+    span_length_max: int = 1
+    num_spans_mode: str = "multiple"
     reconstruct_target: str = "raw_patch"
     loss_mode: str = "masked_only"
     allow_bin_fractional_overlap: bool = True

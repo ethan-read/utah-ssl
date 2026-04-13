@@ -134,6 +134,35 @@ class MaskedSSLTests(unittest.TestCase):
         self.assertTrue(torch.equal(masked["token_loss_mask"], expected))
         self.assertFalse(masked["token_loss_mask"][~masked["token_feature_mask"]].any())
 
+    def test_patch_level_multi_patch_span_only_scores_first_masked_token(self) -> None:
+        random.seed(4)
+        model = _make_model(input_dim=3, patch_size=1, patch_stride=1)
+        batch = {
+            "x": torch.randn(1, 6, 3),
+            "feature_mask": torch.ones(1, 3),
+            "lengths": torch.tensor([6], dtype=torch.long),
+        }
+        masked = build_masked_batch(
+            model,
+            batch,
+            mask_unit="patch",
+            mask_ratio=2.0 / 6.0,
+            span_length_min=2,
+            span_length_max=2,
+            num_spans_mode="one",
+            allow_bin_fractional_overlap=True,
+        )
+        token_mask = masked["token_mask"][0]
+        loss_token_mask = masked["token_loss_token_mask"][0]
+        masked_idx = torch.nonzero(token_mask, as_tuple=False).squeeze(1)
+        loss_idx = torch.nonzero(loss_token_mask, as_tuple=False).squeeze(1)
+        self.assertEqual(masked_idx.numel(), 2)
+        self.assertTrue(torch.equal(masked_idx, torch.arange(int(masked_idx[0]), int(masked_idx[0]) + 2)))
+        self.assertEqual(loss_idx.numel(), 1)
+        self.assertEqual(int(loss_idx[0]), int(masked_idx[0]))
+        expected_loss_mask = masked["token_feature_mask"] & loss_token_mask.view(1, -1, 1)
+        self.assertTrue(torch.equal(masked["token_loss_mask"], expected_loss_mask))
+
     def test_masked_reconstruction_summary_includes_prediction_and_target_stats(self) -> None:
         random.seed(3)
         model = _make_model()

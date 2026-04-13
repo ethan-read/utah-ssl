@@ -118,6 +118,13 @@ def _patch_feature_presence(
     return token_feature_mask > 0.5, token_lengths
 
 
+def _span_start_mask(mask: torch.Tensor) -> torch.Tensor:
+    span_starts = mask.clone()
+    if mask.shape[1] > 1:
+        span_starts[:, 1:] = span_starts[:, 1:] & ~mask[:, :-1]
+    return span_starts
+
+
 def build_masked_batch(
     model: MaskedSSLModel,
     batch: dict[str, Any],
@@ -145,6 +152,7 @@ def build_masked_batch(
     )
     token_mask = torch.zeros_like(valid_token_mask)
     token_loss_mask = torch.zeros_like(tokens, dtype=torch.bool)
+    token_loss_token_mask = torch.zeros_like(valid_token_mask)
 
     if mask_unit == "patch":
         raw_unit_mask = torch.zeros_like(valid_token_mask)
@@ -157,7 +165,8 @@ def build_masked_batch(
                 num_spans_mode=num_spans_mode,
             )
         token_mask = raw_unit_mask & valid_token_mask
-        token_loss_mask = token_feature_mask & token_mask.unsqueeze(-1)
+        token_loss_token_mask = _span_start_mask(token_mask)
+        token_loss_mask = token_feature_mask & token_loss_token_mask.unsqueeze(-1)
         token_overlap_fraction = token_mask.to(tokens.dtype)
         raw_unit_count = int(raw_unit_mask.sum().item())
         total_unit_count = int(token_lengths.sum().item())
@@ -192,6 +201,7 @@ def build_masked_batch(
             full_patch_coverage = token_loss_mask.sum(dim=-1) >= token_feature_mask.sum(dim=-1)
             token_mask = full_patch_coverage & valid_token_mask
 
+        token_loss_token_mask = token_loss_mask.any(dim=-1) & valid_token_mask
         token_overlap_fraction = (
             token_loss_mask.to(tokens.dtype).sum(dim=-1)
             / token_feature_mask.to(tokens.dtype).sum(dim=-1).clamp_min(1.0)
@@ -212,6 +222,7 @@ def build_masked_batch(
         "token_lengths": token_lengths,
         "token_feature_mask": token_feature_mask,
         "token_mask": token_mask,
+        "token_loss_token_mask": token_loss_token_mask,
         "token_loss_mask": token_loss_mask,
         "valid_token_mask": valid_token_mask,
         "token_overlap_fraction": token_overlap_fraction,
@@ -248,6 +259,7 @@ def compute_masked_reconstruction_metrics(
     tokens = masked_batch["tokens"].to(device)
     token_lengths = masked_batch["token_lengths"].to(device)
     token_mask = masked_batch["token_mask"].to(device)
+    token_loss_token_mask = masked_batch["token_loss_token_mask"].to(device)
     token_loss_mask = masked_batch["token_loss_mask"].to(device)
     token_feature_mask = masked_batch["token_feature_mask"].to(device)
     token_overlap_fraction = masked_batch["token_overlap_fraction"].to(device=tokens.device, dtype=tokens.dtype)
@@ -274,8 +286,9 @@ def compute_masked_reconstruction_metrics(
         / token_feature_weights.sum(dim=-1).clamp_min(1.0)
     )
     masked_token_selector = token_mask & valid_token_mask
+    scored_token_selector = token_loss_token_mask & valid_token_mask
     masked_token_full_patch_mse = float(
-        per_token_full_patch_mse[masked_token_selector].mean().detach().cpu().item()
+        per_token_full_patch_mse[scored_token_selector].mean().detach().cpu().item()
     )
 
     metrics = {
