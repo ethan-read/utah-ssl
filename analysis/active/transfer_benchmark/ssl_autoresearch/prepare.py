@@ -27,12 +27,40 @@ OUTPUT_ROOT = _env_path(
     "SSL_AUTORESEARCH_OUTPUT_ROOT",
     ROOT_DIR / "outputs" / "transfer_benchmark" / "ssl_autoresearch",
 )
+CACHE_ROOT = _env_path(
+    "SSL_AUTORESEARCH_CACHE_ROOT",
+    ROOT_DIR / "data" / "cache_v1",
+)
 TX_CACHE_DIR = _env_path("SSL_AUTORESEARCH_TX_CACHE_DIR", ROOT_DIR / "code" / "ssl" / "cache")
 SBP_CACHE_DIR = _env_path("SSL_AUTORESEARCH_SBP_CACHE_DIR", ROOT_DIR / "code" / "ssl" / "cache_b2t25_sbp")
 BRAINTOTEXT25_ROOT = _env_path("SSL_AUTORESEARCH_B2T25_ROOT", ROOT_DIR / "code" / "brain2text25")
+BRAINTOTEXT24_ROOT = _env_path(
+    "SSL_AUTORESEARCH_B2T24_ROOT",
+    BRAINTOTEXT25_ROOT / "2024",
+)
 BRAINTOTEXT25_HDF5_ROOT = _env_path(
     "SSL_AUTORESEARCH_B2T25_HDF5_ROOT",
     BRAINTOTEXT25_ROOT / "hdf5_data_final",
+)
+MOTOR_DATA_ROOT = _env_path(
+    "SSL_AUTORESEARCH_MOTOR_DATA_ROOT",
+    ROOT_DIR / "data" / "public" / "motor_data",
+)
+PLUG_N_PLAY_ROOT = _env_path(
+    "SSL_AUTORESEARCH_PLUG_N_PLAY_ROOT",
+    ROOT_DIR / "data" / "plug_n_play",
+)
+WILLETT_HANDWRITING_ROOT = _env_path(
+    "SSL_AUTORESEARCH_WILLETT_HANDWRITING_ROOT",
+    ROOT_DIR / "data" / "willett_handwriting",
+)
+UNSUPERVISED_CURSOR_RECALIBRATION_ROOT = _env_path(
+    "SSL_AUTORESEARCH_UNSUPERVISED_CURSOR_RECALIBRATION_ROOT",
+    ROOT_DIR / "data" / "unsupervised_cursor_recalibration",
+)
+FALCON_000950_ROOT = _env_path(
+    "SSL_AUTORESEARCH_000950_ROOT",
+    ROOT_DIR / "000950",
 )
 
 RANDOM_SEED = 7
@@ -144,13 +172,41 @@ SOURCE_ROOT_SPECS = {
         "env_var": "SSL_AUTORESEARCH_SBP_CACHE_DIR",
         "path": SBP_CACHE_DIR,
     },
+    "canonical_cache_root": {
+        "env_var": "SSL_AUTORESEARCH_CACHE_ROOT",
+        "path": CACHE_ROOT,
+    },
     "brain2text25_root": {
         "env_var": "SSL_AUTORESEARCH_B2T25_ROOT",
         "path": BRAINTOTEXT25_ROOT,
     },
+    "brain2text24_root": {
+        "env_var": "SSL_AUTORESEARCH_B2T24_ROOT",
+        "path": BRAINTOTEXT24_ROOT,
+    },
     "brain2text25_hdf5": {
         "env_var": "SSL_AUTORESEARCH_B2T25_HDF5_ROOT",
         "path": BRAINTOTEXT25_HDF5_ROOT,
+    },
+    "motor_data_root": {
+        "env_var": "SSL_AUTORESEARCH_MOTOR_DATA_ROOT",
+        "path": MOTOR_DATA_ROOT,
+    },
+    "plug_n_play_root": {
+        "env_var": "SSL_AUTORESEARCH_PLUG_N_PLAY_ROOT",
+        "path": PLUG_N_PLAY_ROOT,
+    },
+    "willett_handwriting_root": {
+        "env_var": "SSL_AUTORESEARCH_WILLETT_HANDWRITING_ROOT",
+        "path": WILLETT_HANDWRITING_ROOT,
+    },
+    "unsupervised_cursor_recalibration_root": {
+        "env_var": "SSL_AUTORESEARCH_UNSUPERVISED_CURSOR_RECALIBRATION_ROOT",
+        "path": UNSUPERVISED_CURSOR_RECALIBRATION_ROOT,
+    },
+    "falcon_000950_root": {
+        "env_var": "SSL_AUTORESEARCH_000950_ROOT",
+        "path": FALCON_000950_ROOT,
     },
 }
 

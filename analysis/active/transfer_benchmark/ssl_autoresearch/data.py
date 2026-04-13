@@ -1,4 +1,4 @@
-"""Dataset inventory and split helpers for the full SSL autoresearch scaffold."""
+"""Dataset inventory, cache, and split helpers for the full SSL autoresearch scaffold."""
 
 from __future__ import annotations
 
@@ -7,12 +7,11 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-import h5py
 import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from prepare import resolve_relative_path
+from prepare import CACHE_ROOT, resolve_relative_path
 
 
 @dataclass(frozen=True)
@@ -45,6 +44,24 @@ class SourceStatus:
     path: str
     exists: bool
     kind: str
+
+
+@dataclass(frozen=True)
+class CacheSessionEntry:
+    session_id: str
+    session_date: str | None
+    subject_id: str
+    source_splits: tuple[str, ...]
+    total_examples: int
+    labeled_examples: int
+    has_train: bool
+    has_val: bool
+    has_test: bool
+    has_tx: bool
+    has_sbp: bool
+
+
+CANONICAL_B2T25_ROOT = CACHE_ROOT / "brain2text25"
 
 
 def _load_manifest(path: Path) -> dict[str, dict[str, Any]]:
@@ -167,17 +184,69 @@ def inventory_to_jsonable(entries: list[SessionInventoryEntry]) -> list[dict[str
     return [asdict(entry) for entry in entries]
 
 
+def load_b2t25_canonical_inventory(cache_dataset_root: Path = CANONICAL_B2T25_ROOT) -> list[SessionInventoryEntry]:
+    manifest_path = cache_dataset_root / "manifest.jsonl"
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"Canonical cache manifest not found: {manifest_path}")
+
+    grouped: dict[str, dict[str, Any]] = {}
+    with manifest_path.open() as handle:
+        for line in handle:
+            payload = json.loads(line)
+            session_id = str(payload["session_id"])
+            row = grouped.setdefault(
+                session_id,
+                {
+                    "date_key": str(payload["session_date"]) if payload["session_date"] is not None else None,
+                    "source_splits": set(),
+                    "total_examples": 0,
+                    "has_tx": False,
+                    "has_sbp": False,
+                },
+            )
+            row["source_splits"].add(str(payload["source_split"]))
+            row["total_examples"] += 1
+            row["has_tx"] = row["has_tx"] or bool(payload.get("has_tx", False))
+            row["has_sbp"] = row["has_sbp"] or bool(payload.get("has_sbp", False))
+
+    entries: list[SessionInventoryEntry] = []
+    for session_id in sorted(grouped):
+        meta = grouped[session_id]
+        entries.append(
+            SessionInventoryEntry(
+                session_key=session_id,
+                session_base=session_id,
+                date_key=meta["date_key"],
+                tx_root_key="canonical_cache_root" if meta["has_tx"] else None,
+                tx_relpath=str(cache_dataset_root.relative_to(CACHE_ROOT)) if meta["has_tx"] else None,
+                sbp_root_key="canonical_cache_root" if meta["has_sbp"] else None,
+                sbp_relpath=str(cache_dataset_root.relative_to(CACHE_ROOT)) if meta["has_sbp"] else None,
+                tx_windows=int(meta["total_examples"]) if meta["has_tx"] else None,
+                sbp_windows=int(meta["total_examples"]) if meta["has_sbp"] else None,
+                n_channels=512 if (meta["has_tx"] and meta["has_sbp"]) else 256,
+                has_tx=bool(meta["has_tx"]),
+                has_sbp=bool(meta["has_sbp"]),
+            )
+        )
+    return entries
+
+
 @dataclass(frozen=True)
 class ProbeManifestRow:
     example_id: str
     dataset_family: str
+    subject_id: str
     has_labels: bool
     session_id: str
     session_date: str | None
     source_split: str
+    cache_root_key: str
+    cache_dataset_relpath: str
+    shard_id: str
+    shard_relpath: str
+    example_index: int
     source_root_key: str
     source_relpath: str
-    resolved_source_path: str
     trial_key: str
     block_num: int
     trial_num: int
@@ -185,8 +254,8 @@ class ProbeManifestRow:
     bin_size_ms: int
     n_time_bins: int
     n_features: int
-    phoneme_ids: tuple[int, ...] | None
-    phoneme_symbols: tuple[str, ...] | None
+    n_tx_features: int
+    n_sbp_features: int
     target_length: int | None
     transcription: str
     sentence_label: str
@@ -205,30 +274,33 @@ def load_probe_manifest(manifest_path: Path) -> list[ProbeManifestRow]:
     with manifest_path.open() as handle:
         for line in handle:
             payload = json.loads(line)
-            source_root_key = str(payload["source_root_key"])
-            source_relpath = str(payload["source_relpath"])
             rows.append(
                 ProbeManifestRow(
                     example_id=str(payload["example_id"]),
                     dataset_family=str(payload["dataset_family"]),
+                    subject_id=str(payload["subject_id"]),
                     has_labels=bool(payload["has_labels"]),
                     session_id=str(payload["session_id"]),
                     session_date=str(payload["session_date"]) if payload["session_date"] is not None else None,
                     source_split=str(payload["source_split"]),
-                    source_root_key=source_root_key,
-                    source_relpath=source_relpath,
-                    resolved_source_path=str(resolve_relative_path(source_root_key, source_relpath)),
+                    cache_root_key=str(payload["cache_root_key"]),
+                    cache_dataset_relpath=str(payload["cache_dataset_relpath"]),
+                    shard_id=str(payload["shard_id"]),
+                    shard_relpath=str(payload["shard_relpath"]),
+                    example_index=int(payload["example_index"]),
+                    source_root_key=str(payload["source_root_key"]),
+                    source_relpath=str(payload["source_relpath"]),
                     trial_key=str(payload["trial_key"]),
                     block_num=int(payload["block_num"]),
                     trial_num=int(payload["trial_num"]),
                     feature_modalities=str(payload["feature_modalities"]),
                     bin_size_ms=int(payload["bin_size_ms"]),
                     n_time_bins=int(payload["n_time_bins"]),
-                    n_features=int(payload["n_features"]),
-                    phoneme_ids=tuple(int(x) for x in payload["phoneme_ids"]) if payload["phoneme_ids"] is not None else None,
-                    phoneme_symbols=tuple(str(x) for x in payload["phoneme_symbols"]) if payload["phoneme_symbols"] is not None else None,
+                    n_features=int(payload["n_tx_features"]) + int(payload["n_sbp_features"]),
+                    n_tx_features=int(payload["n_tx_features"]),
+                    n_sbp_features=int(payload["n_sbp_features"]),
                     target_length=int(payload["target_length"]) if payload["target_length"] is not None else None,
-                    transcription=str(payload["transcription"]),
+                    transcription=str(payload["transcript"]),
                     sentence_label=str(payload["sentence_label"]),
                     normalization_group=str(payload["normalization_group"]),
                 )
@@ -303,35 +375,63 @@ def probe_partition_summary(partitions: ProbeBenchmarkPartitions) -> dict[str, A
     }
 
 
-class HDF5RecordAccessor:
+class CanonicalShardAccessor:
     def __init__(self) -> None:
-        self._files: dict[str, h5py.File] = {}
+        self._shards: dict[str, dict[str, np.ndarray | None]] = {}
 
-    def _get_file(self, path: str) -> h5py.File:
-        handle = self._files.get(path)
-        if handle is None:
-            handle = h5py.File(path, "r")
-            self._files[path] = handle
-        return handle
+    def _get_shard(self, row: ProbeManifestRow) -> dict[str, np.ndarray | None]:
+        shard_path = resolve_relative_path(row.cache_root_key, row.shard_relpath)
+        key = str(shard_path)
+        cached = self._shards.get(key)
+        if cached is None:
+            tx_path = shard_path / "tx.npy"
+            sbp_path = shard_path / "sbp.npy"
+            phoneme_ids_path = shard_path / "phoneme_ids.npy"
+            cached = {
+                "time_offsets": np.load(shard_path / "time_offsets.npy", mmap_mode="r"),
+                "tx": np.load(tx_path, mmap_mode="r") if tx_path.exists() else None,
+                "sbp": np.load(sbp_path, mmap_mode="r") if sbp_path.exists() else None,
+                "phoneme_offsets": np.load(shard_path / "phoneme_offsets.npy", mmap_mode="r"),
+                "phoneme_ids": np.load(phoneme_ids_path, mmap_mode="r") if phoneme_ids_path.exists() else None,
+            }
+            self._shards[key] = cached
+        return cached
 
     def load_features(self, row: ProbeManifestRow) -> np.ndarray:
-        g = self._get_file(row.resolved_source_path)[row.trial_key]
-        return g["input_features"][:].astype(np.float32, copy=False)
+        shard = self._get_shard(row)
+        time_offsets = shard["time_offsets"]
+        assert time_offsets is not None
+        start = int(time_offsets[row.example_index])
+        stop = int(time_offsets[row.example_index + 1])
+
+        parts: list[np.ndarray] = []
+        tx = shard["tx"]
+        sbp = shard["sbp"]
+        if tx is not None:
+            parts.append(np.asarray(tx[start:stop], dtype=np.float32))
+        if sbp is not None:
+            parts.append(np.asarray(sbp[start:stop], dtype=np.float32))
+        if not parts:
+            raise ValueError(f"Shard {row.shard_id} has neither tx.npy nor sbp.npy")
+        if len(parts) == 1:
+            return parts[0]
+        return np.concatenate(parts, axis=1)
 
     def load_labels(self, row: ProbeManifestRow) -> np.ndarray | None:
         if not row.has_labels:
             return None
-        g = self._get_file(row.resolved_source_path)[row.trial_key]
-        target_length = int(row.target_length or 0)
-        return g["seq_class_ids"][:target_length].astype(np.int64, copy=False)
+        shard = self._get_shard(row)
+        phoneme_offsets = shard["phoneme_offsets"]
+        phoneme_ids = shard["phoneme_ids"]
+        assert phoneme_offsets is not None
+        if phoneme_ids is None:
+            return np.zeros((0,), dtype=np.int64)
+        start = int(phoneme_offsets[row.example_index])
+        stop = int(phoneme_offsets[row.example_index + 1])
+        return np.asarray(phoneme_ids[start:stop], dtype=np.int64)
 
     def close(self) -> None:
-        for handle in self._files.values():
-            try:
-                handle.close()
-            except Exception:
-                pass
-        self._files.clear()
+        self._shards.clear()
 
     def __del__(self) -> None:
         self.close()
@@ -342,7 +442,7 @@ def compute_feature_stats(
     *,
     mode: str,
 ) -> dict[str, tuple[np.ndarray, np.ndarray]] | tuple[np.ndarray, np.ndarray]:
-    accessor = HDF5RecordAccessor()
+    accessor = CanonicalShardAccessor()
     try:
         if mode == "global":
             total_count = 0
@@ -392,7 +492,7 @@ def apply_feature_stats(
     return ((x - mean) / std).astype(np.float32, copy=False)
 
 
-class HDF5SequenceDataset(Dataset):
+class CanonicalSequenceDataset(Dataset):
     def __init__(
         self,
         rows: tuple[ProbeManifestRow, ...] | list[ProbeManifestRow],
@@ -401,7 +501,7 @@ class HDF5SequenceDataset(Dataset):
     ) -> None:
         self.rows = list(rows)
         self.stats = stats
-        self._accessor = HDF5RecordAccessor()
+        self._accessor = CanonicalShardAccessor()
 
     def __len__(self) -> int:
         return len(self.rows)

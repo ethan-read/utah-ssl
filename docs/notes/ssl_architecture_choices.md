@@ -31,6 +31,7 @@ It is intentionally incremental. Each section should capture the current state o
   - `S5` is motivated by the structure used in Cortical-SSM
   - `Mamba` is included as a second causal SSM-family baseline
   - the relative strengths of these models for speech decoding remain an open empirical question
+  - for the specific self-supervised future-prediction objective, current evidence says to continue only with `Mamba`
 
 ### 3. Training Regime
 
@@ -42,11 +43,12 @@ It is intentionally incremental. Each section should capture the current state o
 
 ### 4. Self-Supervised Objective
 
-- status: deferred
-- decision: not yet chosen
+- status: partially decided
+- decision: future prediction remains in scope only for `Mamba`; other SSL objectives remain open
 - notes:
-  - masked reconstruction, future prediction, contrastive learning, and hybrid objectives are all still open
-  - objective choice may depend on the causal constraints of the encoder
+  - in current experiments, `S5` did not beat the trivial `predict 0` baseline on future prediction
+  - future-prediction follow-up work should therefore be limited to `Mamba`
+  - masked reconstruction, contrastive learning, and hybrid objectives remain open for later comparison
 
 ### 5. Input Modality
 

@@ -30,13 +30,13 @@ from torch.utils.data import DataLoader
 
 from s5 import S5SequenceBackbone
 from data import (
-    HDF5SequenceDataset,
+    CanonicalSequenceDataset,
     collate_sequence_batch,
     compute_feature_stats,
     discover_b2t25_sources,
     filter_matched_tx_sbp,
     inventory_summary,
-    load_b2t25_cache_inventory,
+    load_b2t25_canonical_inventory,
     load_probe_manifest,
     load_probe_metadata,
     partition_probe_records,
@@ -46,13 +46,12 @@ from data import (
 )
 from prepare import (
     BRAINTOTEXT25_ROOT,
+    CACHE_ROOT,
     DEFAULT_ADAPTATION_REGIME,
     DEFAULT_DATASET_FAMILY,
     DEFAULT_PRIMARY_METRIC_NAME,
     DEFAULT_PROFILE,
     BenchmarkSummary,
-    SBP_CACHE_DIR,
-    TX_CACHE_DIR,
     count_parameters,
     detect_device,
     ensure_artifact_dirs,
@@ -64,8 +63,8 @@ from prepare import (
 )
 
 
-MANIFEST_BASENAME = "brain2text25_probe_manifest.jsonl"
-METADATA_BASENAME = "brain2text25_probe_metadata.json"
+MANIFEST_BASENAME = "manifest.jsonl"
+METADATA_BASENAME = "metadata.json"
 DEFAULT_S5_STATE_SIZE = 64
 
 
@@ -92,8 +91,17 @@ class RunConfig:
     pretrain_batch_size: int = 8
     probe_batch_size: int = 8
     future_horizons: tuple[int, ...] = (1, 3)
+    pretrain_budget_seconds: int | None = None
+    probe_budget_seconds: int | None = None
     max_pretrain_steps: int | None = None
     max_probe_steps: int | None = None
+    progress_every_steps: int = 25
+    progress_every_seconds: float = 15.0
+    pretrain_loss_ema_alpha: float = 0.2
+    pretrain_plateau_min_steps: int = 200
+    pretrain_plateau_patience_reports: int = 12
+    pretrain_plateau_min_delta: float = 1e-4
+    disable_pretrain_plateau_stop: bool = False
     dry_run: bool = False
 
     def __post_init__(self) -> None:
@@ -123,6 +131,22 @@ class RunConfig:
             raise ValueError("future_horizons must contain at least one value")
         if any(horizon <= 0 for horizon in self.future_horizons):
             raise ValueError("future_horizons must contain only positive integers")
+        if self.pretrain_budget_seconds is not None and self.pretrain_budget_seconds <= 0:
+            raise ValueError("pretrain_budget_seconds must be positive when provided")
+        if self.probe_budget_seconds is not None and self.probe_budget_seconds <= 0:
+            raise ValueError("probe_budget_seconds must be positive when provided")
+        if self.progress_every_steps <= 0:
+            raise ValueError("progress_every_steps must be positive")
+        if self.progress_every_seconds <= 0:
+            raise ValueError("progress_every_seconds must be positive")
+        if not (0.0 < self.pretrain_loss_ema_alpha <= 1.0):
+            raise ValueError("pretrain_loss_ema_alpha must be in (0, 1]")
+        if self.pretrain_plateau_min_steps < 0:
+            raise ValueError("pretrain_plateau_min_steps must be non-negative")
+        if self.pretrain_plateau_patience_reports < 0:
+            raise ValueError("pretrain_plateau_patience_reports must be non-negative")
+        if self.pretrain_plateau_min_delta < 0:
+            raise ValueError("pretrain_plateau_min_delta must be non-negative")
 
 
 @dataclass(frozen=True)
@@ -130,6 +154,16 @@ class EncoderOutputs:
     hidden: torch.Tensor
     token_lengths: torch.Tensor
     tokens: torch.Tensor
+
+
+@dataclass(frozen=True)
+class PretrainProgressSummary:
+    stop_reason: str
+    last_loss: float | None
+    last_ema_loss: float | None
+    best_ema_loss: float | None
+    report_count: int
+    plateau_reports_since_improvement: int
 
 
 class RMSNorm(nn.Module):
@@ -420,8 +454,17 @@ def parse_args() -> RunConfig:
         default="1,3",
         help="Comma-separated token horizons for the future-prediction SSL objective.",
     )
+    parser.add_argument("--pretrain-budget-seconds", type=int, default=None)
+    parser.add_argument("--probe-budget-seconds", type=int, default=None)
     parser.add_argument("--max-pretrain-steps", type=int, default=None)
     parser.add_argument("--max-probe-steps", type=int, default=None)
+    parser.add_argument("--progress-every-steps", type=int, default=25)
+    parser.add_argument("--progress-every-seconds", type=float, default=15.0)
+    parser.add_argument("--pretrain-loss-ema-alpha", type=float, default=0.2)
+    parser.add_argument("--pretrain-plateau-min-steps", type=int, default=200)
+    parser.add_argument("--pretrain-plateau-patience-reports", type=int, default=12)
+    parser.add_argument("--pretrain-plateau-min-delta", type=float, default=1e-4)
+    parser.add_argument("--disable-pretrain-plateau-stop", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
@@ -448,8 +491,17 @@ def parse_args() -> RunConfig:
         pretrain_batch_size=args.pretrain_batch_size,
         probe_batch_size=args.probe_batch_size,
         future_horizons=future_horizons,
+        pretrain_budget_seconds=args.pretrain_budget_seconds,
+        probe_budget_seconds=args.probe_budget_seconds,
         max_pretrain_steps=args.max_pretrain_steps,
         max_probe_steps=args.max_probe_steps,
+        progress_every_steps=args.progress_every_steps,
+        progress_every_seconds=args.progress_every_seconds,
+        pretrain_loss_ema_alpha=args.pretrain_loss_ema_alpha,
+        pretrain_plateau_min_steps=args.pretrain_plateau_min_steps,
+        pretrain_plateau_patience_reports=args.pretrain_plateau_patience_reports,
+        pretrain_plateau_min_delta=args.pretrain_plateau_min_delta,
+        disable_pretrain_plateau_stop=args.disable_pretrain_plateau_stop,
         dry_run=args.dry_run,
     )
 
@@ -463,7 +515,8 @@ def _run_record_path(run_dir: Path, run_id: str) -> Path:
 
 
 def _manifest_paths(manifest_dir: Path) -> tuple[Path, Path]:
-    return manifest_dir / MANIFEST_BASENAME, manifest_dir / METADATA_BASENAME
+    cache_dataset_root = CACHE_ROOT / "brain2text25"
+    return cache_dataset_root / MANIFEST_BASENAME, cache_dataset_root / METADATA_BASENAME
 
 
 def _loader_kwargs(device: torch.device, batch_size: int, shuffle: bool) -> dict[str, Any]:
@@ -579,6 +632,20 @@ def _set_requires_grad(module: nn.Module | None, value: bool) -> None:
         param.requires_grad = value
 
 
+def _emit_progress(
+    *,
+    progress_log_path: Path | None,
+    event: str,
+    **fields: Any,
+) -> None:
+    payload = {"event": event, **fields}
+    serialized = json.dumps(payload, sort_keys=True)
+    print(f"progress_json: {serialized}", flush=True)
+    if progress_log_path is not None:
+        with progress_log_path.open("a") as handle:
+            handle.write(serialized + "\n")
+
+
 def train_ssl_pretrain(
     *,
     encoder: ProjectedCausalEncoderBase,
@@ -589,7 +656,15 @@ def train_ssl_pretrain(
     weight_decay: float,
     budget_seconds: int,
     max_steps: int | None,
-) -> tuple[float, int]:
+    progress_log_path: Path | None,
+    progress_every_steps: int,
+    progress_every_seconds: float,
+    pretrain_loss_ema_alpha: float,
+    pretrain_plateau_min_steps: int,
+    pretrain_plateau_patience_reports: int,
+    pretrain_plateau_min_delta: float,
+    disable_pretrain_plateau_stop: bool,
+) -> tuple[float, int, PretrainProgressSummary]:
     optimizer = torch.optim.AdamW(
         list(encoder.parameters()) + list(future_head.parameters()),
         lr=learning_rate,
@@ -599,16 +674,27 @@ def train_ssl_pretrain(
     future_head.train()
     start = now()
     steps = 0
+    last_report_elapsed = 0.0
+    last_loss: float | None = None
+    ema_loss: float | None = None
+    best_ema_loss: float | None = None
+    report_count = 0
+    plateau_reports_since_improvement = 0
+    stop_reason = "budget_seconds"
 
     while True:
         if now() - start >= budget_seconds:
+            stop_reason = "budget_seconds"
             break
         if max_steps is not None and steps >= max_steps:
+            stop_reason = "max_pretrain_steps"
             break
         for batch in loader:
             if now() - start >= budget_seconds:
+                stop_reason = "budget_seconds"
                 break
             if max_steps is not None and steps >= max_steps:
+                stop_reason = "max_pretrain_steps"
                 break
 
             x = batch["x"].to(device)
@@ -631,11 +717,90 @@ def train_ssl_pretrain(
             )
             optimizer.step()
             steps += 1
+
+            loss_value = float(loss.item())
+            last_loss = loss_value
+            ema_loss = (
+                loss_value
+                if ema_loss is None
+                else ((1.0 - pretrain_loss_ema_alpha) * ema_loss) + (pretrain_loss_ema_alpha * loss_value)
+            )
+            elapsed = now() - start
+            should_report = (
+                steps == 1
+                or steps % progress_every_steps == 0
+                or elapsed - last_report_elapsed >= progress_every_seconds
+            )
+            if should_report:
+                improved = False
+                if best_ema_loss is None or (best_ema_loss - ema_loss) >= pretrain_plateau_min_delta:
+                    best_ema_loss = ema_loss
+                    plateau_reports_since_improvement = 0
+                    improved = True
+                elif steps >= pretrain_plateau_min_steps:
+                    plateau_reports_since_improvement += 1
+
+                report_count += 1
+                last_report_elapsed = elapsed
+                _emit_progress(
+                    progress_log_path=progress_log_path,
+                    event="pretrain_report",
+                    stage="pretrain",
+                    step=steps,
+                    elapsed_seconds=round(elapsed, 3),
+                    loss=loss_value,
+                    ema_loss=ema_loss,
+                    best_ema_loss=best_ema_loss,
+                    improved=improved,
+                    plateau_reports_since_improvement=plateau_reports_since_improvement,
+                    budget_seconds=budget_seconds,
+                )
+
+                plateau_enabled = not disable_pretrain_plateau_stop and pretrain_plateau_patience_reports > 0
+                if (
+                    plateau_enabled
+                    and steps >= pretrain_plateau_min_steps
+                    and plateau_reports_since_improvement >= pretrain_plateau_patience_reports
+                ):
+                    stop_reason = "plateau"
+                    _emit_progress(
+                        progress_log_path=progress_log_path,
+                        event="pretrain_stop",
+                        stage="pretrain",
+                        step=steps,
+                        elapsed_seconds=round(elapsed, 3),
+                        stop_reason=stop_reason,
+                        ema_loss=ema_loss,
+                        best_ema_loss=best_ema_loss,
+                        plateau_reports_since_improvement=plateau_reports_since_improvement,
+                    )
+                    break
         else:
             continue
         break
 
-    return now() - start, steps
+    elapsed = now() - start
+    _emit_progress(
+        progress_log_path=progress_log_path,
+        event="pretrain_complete",
+        stage="pretrain",
+        step=steps,
+        elapsed_seconds=round(elapsed, 3),
+        stop_reason=stop_reason,
+        last_loss=last_loss,
+        last_ema_loss=ema_loss,
+        best_ema_loss=best_ema_loss,
+        report_count=report_count,
+        plateau_reports_since_improvement=plateau_reports_since_improvement,
+    )
+    return elapsed, steps, PretrainProgressSummary(
+        stop_reason=stop_reason,
+        last_loss=last_loss,
+        last_ema_loss=ema_loss,
+        best_ema_loss=best_ema_loss,
+        report_count=report_count,
+        plateau_reports_since_improvement=plateau_reports_since_improvement,
+    )
 
 
 @torch.no_grad()
@@ -695,14 +860,15 @@ def train_probe_for_session(
     config: RunConfig,
     device: torch.device,
     budget_seconds: float,
+    progress_log_path: Path | None,
 ) -> tuple[float, int]:
     target_stats = compute_feature_stats(train_rows, mode="global")
     train_loader = DataLoader(
-        HDF5SequenceDataset(train_rows, stats=target_stats),
+        CanonicalSequenceDataset(train_rows, stats=target_stats),
         **_loader_kwargs(device, config.probe_batch_size, shuffle=True),
     )
     val_loader = DataLoader(
-        HDF5SequenceDataset(val_rows, stats=target_stats),
+        CanonicalSequenceDataset(val_rows, stats=target_stats),
         **_loader_kwargs(device, config.probe_batch_size, shuffle=False),
     )
 
@@ -726,6 +892,7 @@ def train_probe_for_session(
 
     start = now()
     steps = 0
+    last_report_elapsed = 0.0
     while True:
         if now() - start >= budget_seconds:
             break
@@ -771,6 +938,25 @@ def train_probe_for_session(
             torch.nn.utils.clip_grad_norm_(parameters, max_norm=1.0)
             optimizer.step()
             steps += 1
+
+            elapsed = now() - start
+            should_report = (
+                steps == 1
+                or steps % config.progress_every_steps == 0
+                or elapsed - last_report_elapsed >= config.progress_every_seconds
+            )
+            if should_report:
+                last_report_elapsed = elapsed
+                _emit_progress(
+                    progress_log_path=progress_log_path,
+                    event="probe_train_report",
+                    stage="probe_train",
+                    session_id=session_id,
+                    step=steps,
+                    elapsed_seconds=round(elapsed, 3),
+                    loss_bpphone=float(loss.item()) / math.log(2.0),
+                    budget_seconds=budget_seconds,
+                )
         else:
             continue
         break
@@ -782,6 +968,15 @@ def train_probe_for_session(
         loader=val_loader,
         device=device,
         blank_index=blank_index,
+    )
+    _emit_progress(
+        progress_log_path=progress_log_path,
+        event="probe_session_complete",
+        stage="probe_train",
+        session_id=session_id,
+        step=steps,
+        elapsed_seconds=round(now() - start, 3),
+        val_bpphone=session_bpphone,
     )
     return session_bpphone, steps
 
@@ -830,8 +1025,10 @@ def _write_run_record(
     target_session_ids: tuple[str, ...],
     session_metrics: dict[str, float],
     pretrain_steps: int,
+    pretrain_progress: PretrainProgressSummary,
     probe_steps_by_session: dict[str, int],
     summary: BenchmarkSummary,
+    progress_log_path: Path,
 ) -> None:
     payload = {
         "config": {
@@ -854,12 +1051,30 @@ def _write_run_record(
             "pretrain_batch_size": config.pretrain_batch_size,
             "probe_batch_size": config.probe_batch_size,
             "future_horizons": list(config.future_horizons),
+            "pretrain_budget_seconds": config.pretrain_budget_seconds,
+            "probe_budget_seconds": config.probe_budget_seconds,
+            "progress_every_steps": config.progress_every_steps,
+            "progress_every_seconds": config.progress_every_seconds,
+            "pretrain_loss_ema_alpha": config.pretrain_loss_ema_alpha,
+            "pretrain_plateau_min_steps": config.pretrain_plateau_min_steps,
+            "pretrain_plateau_patience_reports": config.pretrain_plateau_patience_reports,
+            "pretrain_plateau_min_delta": config.pretrain_plateau_min_delta,
+            "disable_pretrain_plateau_stop": config.disable_pretrain_plateau_stop,
         },
         "source_session_ids": list(source_session_ids),
         "target_session_ids": list(target_session_ids),
         "session_metrics": session_metrics,
         "pretrain_steps": pretrain_steps,
+        "pretrain_progress": {
+            "stop_reason": pretrain_progress.stop_reason,
+            "last_loss": pretrain_progress.last_loss,
+            "last_ema_loss": pretrain_progress.last_ema_loss,
+            "best_ema_loss": pretrain_progress.best_ema_loss,
+            "report_count": pretrain_progress.report_count,
+            "plateau_reports_since_improvement": pretrain_progress.plateau_reports_since_improvement,
+        },
         "probe_steps_by_session": probe_steps_by_session,
+        "progress_log_path": str(progress_log_path),
         "summary": {
             "benchmark_state": summary.benchmark_state,
             "primary_metric_name": summary.primary_metric_name,
@@ -901,7 +1116,7 @@ def main() -> int:
     manifest_path, metadata_path = _manifest_paths(artifacts.manifest_dir)
     if not manifest_path.exists() or not metadata_path.exists():
         raise FileNotFoundError(
-            "Probe manifest artifacts are missing. Run build_probe_manifest.py before train.py."
+            "Canonical Brain2Text25 cache metadata is missing. Build data/cache_v1/brain2text25 before train.py."
         )
 
     run_slug = make_run_slug(
@@ -917,8 +1132,24 @@ def main() -> int:
     run_id = f"{run_slug}__{int(overall_start)}"
     checkpoint_path = _checkpoint_path(artifacts.checkpoint_dir, run_id)
     run_record_path = _run_record_path(artifacts.run_dir, run_id)
+    progress_log_path = artifacts.log_dir / f"{run_id}.progress.jsonl"
+    if progress_log_path.exists():
+        progress_log_path.unlink()
+    print(f"checkpoint_path: {checkpoint_path}")
+    print(f"progress_log_path: {progress_log_path}")
 
-    entries = load_b2t25_cache_inventory(TX_CACHE_DIR, SBP_CACHE_DIR)
+    effective_pretrain_budget_seconds = (
+        config.pretrain_budget_seconds
+        if config.pretrain_budget_seconds is not None
+        else profile.pretrain_budget_seconds
+    )
+    effective_probe_budget_seconds = (
+        config.probe_budget_seconds
+        if config.probe_budget_seconds is not None
+        else profile.probe_budget_seconds
+    )
+
+    entries = load_b2t25_canonical_inventory()
     matched_entries = filter_matched_tx_sbp(entries)
     split = split_latest_sessions(
         matched_entries,
@@ -941,11 +1172,21 @@ def main() -> int:
         print(f"profile_name: {profile.name}")
         print(f"profile_pretrain_budget_seconds: {profile.pretrain_budget_seconds}")
         print(f"profile_probe_budget_seconds: {profile.probe_budget_seconds}")
+        print(f"effective_pretrain_budget_seconds: {effective_pretrain_budget_seconds}")
+        print(f"effective_probe_budget_seconds: {effective_probe_budget_seconds}")
+        print(f"progress_every_steps: {config.progress_every_steps}")
+        print(f"progress_every_seconds: {config.progress_every_seconds}")
+        print(f"pretrain_loss_ema_alpha: {config.pretrain_loss_ema_alpha}")
+        print(f"pretrain_plateau_min_steps: {config.pretrain_plateau_min_steps}")
+        print(f"pretrain_plateau_patience_reports: {config.pretrain_plateau_patience_reports}")
+        print(f"pretrain_plateau_min_delta: {config.pretrain_plateau_min_delta}")
+        print(f"disable_pretrain_plateau_stop: {config.disable_pretrain_plateau_stop}")
         print(f"detected_device: {device}")
         print(f"artifact_output_root: {artifacts.output_root}")
-        print(f"manifest_path: {manifest_path}")
+        print(f"cache_manifest_path: {manifest_path}")
         print(f"metadata_path: {metadata_path}")
         print(f"checkpoint_path: {checkpoint_path}")
+        print(f"progress_log_path: {progress_log_path}")
         print(f"inventory_summary: {inventory_summary(entries)}")
         print(f"partition_summary: {probe_partition_summary(partitions)}")
         print(f"train_sessions: {[entry.session_base for entry in split.train]}")
@@ -997,18 +1238,26 @@ def main() -> int:
         source_stats = compute_feature_stats(partitions.source_pretrain, mode="per_session")
 
     pretrain_loader = DataLoader(
-        HDF5SequenceDataset(partitions.source_pretrain, stats=source_stats),
+        CanonicalSequenceDataset(partitions.source_pretrain, stats=source_stats),
         **_loader_kwargs(device, config.pretrain_batch_size, shuffle=True),
     )
-    pretrain_seconds, pretrain_steps = train_ssl_pretrain(
+    pretrain_seconds, pretrain_steps, pretrain_progress = train_ssl_pretrain(
         encoder=encoder,
         future_head=future_head,
         loader=pretrain_loader,
         device=device,
         learning_rate=config.pretrain_learning_rate,
         weight_decay=config.weight_decay,
-        budget_seconds=profile.pretrain_budget_seconds,
+        budget_seconds=effective_pretrain_budget_seconds,
         max_steps=config.max_pretrain_steps,
+        progress_log_path=progress_log_path,
+        progress_every_steps=config.progress_every_steps,
+        progress_every_seconds=config.progress_every_seconds,
+        pretrain_loss_ema_alpha=config.pretrain_loss_ema_alpha,
+        pretrain_plateau_min_steps=config.pretrain_plateau_min_steps,
+        pretrain_plateau_patience_reports=config.pretrain_plateau_patience_reports,
+        pretrain_plateau_min_delta=config.pretrain_plateau_min_delta,
+        disable_pretrain_plateau_stop=config.disable_pretrain_plateau_stop,
     )
 
     _write_checkpoint(
@@ -1023,7 +1272,7 @@ def main() -> int:
     phoneme_vocab = manifest_metadata["phoneme_vocabulary"]
     probe_vocab_size = int(phoneme_vocab["num_classes"])
     blank_index = int(phoneme_vocab["blank_index"])
-    probe_budget_per_session = profile.probe_budget_seconds / max(1, len(target_session_ids))
+    probe_budget_per_session = effective_probe_budget_seconds / max(1, len(target_session_ids))
 
     session_metrics: dict[str, float] = {}
     probe_steps_by_session: dict[str, int] = {}
@@ -1039,6 +1288,7 @@ def main() -> int:
             config=config,
             device=device,
             budget_seconds=probe_budget_per_session,
+            progress_log_path=progress_log_path,
         )
         session_metrics[session_id] = session_bpphone
         probe_steps_by_session[session_id] = probe_steps
@@ -1076,13 +1326,17 @@ def main() -> int:
         target_session_ids=target_session_ids,
         session_metrics=session_metrics,
         pretrain_steps=pretrain_steps,
+        pretrain_progress=pretrain_progress,
         probe_steps_by_session=probe_steps_by_session,
         summary=summary,
+        progress_log_path=progress_log_path,
     )
 
     print(format_summary(summary))
     print(f"run_record_path: {run_record_path}")
+    print(f"progress_log_path: {progress_log_path}")
     print(f"pretrain_steps: {pretrain_steps}")
+    print(f"pretrain_stop_reason: {pretrain_progress.stop_reason}")
     print(f"probe_steps_by_session: {probe_steps_by_session}")
     return 0
 
