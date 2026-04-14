@@ -259,10 +259,16 @@ class MaskedSSLModel(nn.Module):
         post_proj_norm: str,
         source_session_keys: tuple[str, ...] = (),
         feature_mode: str = "tx_only",
+        reconstruction_head_mode: str = "with_output_norm",
     ):
         super().__init__()
         self.feature_mode = str(feature_mode)
         self.source_session_keys = tuple(str(key) for key in source_session_keys)
+        if reconstruction_head_mode not in {"with_output_norm", "no_output_norm"}:
+            raise ValueError(
+                "reconstruction_head_mode must be one of {'with_output_norm', 'no_output_norm'}"
+            )
+        self.reconstruction_head_mode = str(reconstruction_head_mode)
         self.encoder = S5MaskedEncoder(
             input_dim=input_dim,
             hidden_size=hidden_size,
@@ -317,7 +323,12 @@ class MaskedSSLModel(nn.Module):
             use_source_affines=True,
             target_affines=None,
         )
-        reconstruction = self.reverse_patch_embedder(outputs["hidden"])
+        # Preserve legacy checkpoint shape while allowing us to disable output LayerNorm,
+        # which can make the trivial near-zero predictor too stable on z-scored targets.
+        reconstruction = self.reverse_patch_embedder[0](outputs["hidden"])
+        reconstruction = self.reverse_patch_embedder[1](reconstruction)
+        if self.reconstruction_head_mode == "with_output_norm":
+            reconstruction = self.reverse_patch_embedder[2](reconstruction)
         if session_keys is not None:
             reconstruction = self.source_readout(reconstruction, session_keys)
         return {**outputs, "reconstruction": reconstruction}
@@ -326,4 +337,3 @@ class MaskedSSLModel(nn.Module):
 # Compatibility aliases so the downstream probe helpers can stay nearly unchanged.
 S5ContrastiveEncoder = S5MaskedEncoder
 ContrastiveSSLModel = MaskedSSLModel
-

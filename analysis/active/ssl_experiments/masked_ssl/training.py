@@ -52,6 +52,7 @@ class SSLTrainingConfig:
     examples_per_shard: int = 8
     log_every: int = 10
     post_proj_norm: str = "rms"
+    reconstruction_head_mode: str = "no_output_norm"
     mask_unit: str = "patch"
     mask_token_placement: str = "before_projection"
     mask_ratio: float = 0.15
@@ -93,6 +94,10 @@ class SSLTrainingConfig:
             raise ValueError("reconstruct_target must be 'raw_patch'")
         if self.loss_mode != "masked_only":
             raise ValueError("loss_mode must be 'masked_only'")
+        if self.reconstruction_head_mode not in {"with_output_norm", "no_output_norm"}:
+            raise ValueError(
+                "reconstruction_head_mode must be one of {'with_output_norm', 'no_output_norm'}"
+            )
 
     def checkpoint_config(self) -> dict[str, Any]:
         return {
@@ -105,7 +110,52 @@ class SSLTrainingConfig:
             "num_layers": int(self.num_layers),
             "dropout": float(self.dropout),
             "post_proj_norm": str(self.post_proj_norm),
+            "reconstruction_head_mode": str(self.reconstruction_head_mode),
         }
+
+
+def _build_ssl_optimizer(
+    model: MaskedSSLModel,
+    *,
+    learning_rate: float,
+    weight_decay: float,
+) -> torch.optim.Optimizer:
+    decay_params: list[torch.nn.Parameter] = []
+    no_decay_params: list[torch.nn.Parameter] = []
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        lowered_name = name.lower()
+        is_boundary_affine = (
+            lowered_name.startswith("encoder.source_readin.") or lowered_name.startswith("source_readout.")
+        )
+        # Standard no-decay treatment (bias/norm/1D params) plus boundary affines.
+        if (
+            parameter.ndim <= 1
+            or name.endswith(".bias")
+            or "norm" in lowered_name
+            or is_boundary_affine
+        ):
+            no_decay_params.append(parameter)
+        else:
+            decay_params.append(parameter)
+
+    param_groups: list[dict[str, Any]] = []
+    if decay_params:
+        param_groups.append(
+            {
+                "params": decay_params,
+                "weight_decay": float(weight_decay),
+            }
+        )
+    if no_decay_params:
+        param_groups.append(
+            {
+                "params": no_decay_params,
+                "weight_decay": 0.0,
+            }
+        )
+    return torch.optim.AdamW(param_groups, lr=float(learning_rate))
 
 
 def _source_session_keys_from_cache_context(cache_context: CacheContext) -> tuple[str, ...]:
@@ -204,6 +254,7 @@ def _serialize_ssl_training_config(
         "examples_per_shard": int(config.examples_per_shard),
         "log_every": int(config.log_every),
         "post_proj_norm": str(config.post_proj_norm),
+        "reconstruction_head_mode": str(config.reconstruction_head_mode),
         "mask_unit": str(config.mask_unit),
         "mask_token_placement": str(config.mask_token_placement),
         "mask_ratio": float(config.mask_ratio),
@@ -406,6 +457,7 @@ def recover_ssl_run_state_from_checkpoint(
     for key, value in fallback_payload.items():
         recovered_config.setdefault(key, value)
     recovered_config.setdefault("boundary_key_mode", "session")
+    recovered_config.setdefault("reconstruction_head_mode", "with_output_norm")
 
     required_keys = [
         "feature_mode",
@@ -465,6 +517,9 @@ def recover_ssl_run_state_from_checkpoint(
         post_proj_norm=str(recovered_config.get("post_proj_norm", "rms")),
         source_session_keys=tuple(recovered_config.get("source_session_keys", ())),
         feature_mode=str(recovered_config.get("feature_mode", "tx_only")),
+        reconstruction_head_mode=str(
+            recovered_config.get("reconstruction_head_mode", "with_output_norm")
+        ),
     ).to(device)
     model_state = payload.get("model_state")
     if model_state is None:
@@ -472,13 +527,18 @@ def recover_ssl_run_state_from_checkpoint(
     model.load_state_dict(model_state)
     model.eval()
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=float(recovered_config["learning_rate"]),
+    optimizer = _build_ssl_optimizer(
+        model,
+        learning_rate=float(recovered_config["learning_rate"]),
         weight_decay=float(recovered_config["weight_decay"]),
     )
     if payload.get("optimizer_state") is not None:
-        optimizer.load_state_dict(payload["optimizer_state"])
+        try:
+            optimizer.load_state_dict(payload["optimizer_state"])
+        except ValueError:
+            # Legacy checkpoints may have a single AdamW group; keep the recovered
+            # model weights and continue with a fresh optimizer grouping.
+            pass
 
     train_sampler = build_segment_sampler(
         cache_context,
@@ -596,10 +656,11 @@ def run_ssl_training(
         post_proj_norm=str(config.post_proj_norm),
         source_session_keys=_source_session_keys_from_cache_context(cache_context),
         feature_mode=str(config.feature_mode),
+        reconstruction_head_mode=str(config.reconstruction_head_mode),
     ).to(device)
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=float(config.learning_rate),
+    optimizer = _build_ssl_optimizer(
+        model,
+        learning_rate=float(config.learning_rate),
         weight_decay=float(config.weight_decay),
     )
 
