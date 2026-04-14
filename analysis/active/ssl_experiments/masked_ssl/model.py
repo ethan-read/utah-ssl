@@ -271,6 +271,7 @@ class MaskedSSLModel(nn.Module):
         source_session_keys: tuple[str, ...] = (),
         feature_mode: str = "tx_only",
         reconstruction_head_mode: str = "with_output_norm",
+        reconstruction_head_type: str = "linear",
         backbone_direction: str = "bidirectional",
     ):
         super().__init__()
@@ -280,7 +281,10 @@ class MaskedSSLModel(nn.Module):
             raise ValueError(
                 "reconstruction_head_mode must be one of {'with_output_norm', 'no_output_norm'}"
             )
+        if reconstruction_head_type not in {"linear", "mlp"}:
+            raise ValueError("reconstruction_head_type must be one of {'linear', 'mlp'}")
         self.reconstruction_head_mode = str(reconstruction_head_mode)
+        self.reconstruction_head_type = str(reconstruction_head_type)
         self.encoder = S5MaskedEncoder(
             input_dim=input_dim,
             hidden_size=hidden_size,
@@ -294,10 +298,17 @@ class MaskedSSLModel(nn.Module):
             feature_mode=self.feature_mode,
             backbone_direction=backbone_direction,
         )
+        # Keep the legacy linear projection layers for checkpoint compatibility.
         self.reverse_patch_embedder = nn.Sequential(
             nn.LayerNorm(self.encoder.hidden_size),
             nn.Linear(self.encoder.hidden_size, self.encoder.token_dim),
             nn.LayerNorm(self.encoder.token_dim),
+        )
+        self.reverse_patch_mlp = nn.Sequential(
+            nn.LayerNorm(self.encoder.hidden_size),
+            nn.Linear(self.encoder.hidden_size, self.encoder.hidden_size),
+            nn.GELU(),
+            nn.Linear(self.encoder.hidden_size, self.encoder.token_dim),
         )
         self.source_readout = SessionLinearBank(self.source_session_keys, self.encoder.token_dim)
 
@@ -336,10 +347,11 @@ class MaskedSSLModel(nn.Module):
             use_source_affines=True,
             target_affines=None,
         )
-        # Preserve legacy checkpoint shape while allowing us to disable output LayerNorm,
-        # which can make the trivial near-zero predictor too stable on z-scored targets.
-        reconstruction = self.reverse_patch_embedder[0](outputs["hidden"])
-        reconstruction = self.reverse_patch_embedder[1](reconstruction)
+        if self.reconstruction_head_type == "linear":
+            reconstruction = self.reverse_patch_embedder[0](outputs["hidden"])
+            reconstruction = self.reverse_patch_embedder[1](reconstruction)
+        else:
+            reconstruction = self.reverse_patch_mlp(outputs["hidden"])
         if self.reconstruction_head_mode == "with_output_norm":
             reconstruction = self.reverse_patch_embedder[2](reconstruction)
         if session_keys is not None:

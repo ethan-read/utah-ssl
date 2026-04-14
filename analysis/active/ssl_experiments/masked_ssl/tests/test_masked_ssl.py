@@ -51,6 +51,7 @@ def _make_model(
     hidden_size: int = 8,
     source_session_keys: tuple[str, ...] = ("s0", "s1"),
     feature_mode: str = "tx_only",
+    reconstruction_head_type: str = "linear",
     backbone_direction: str = "causal",
 ) -> MaskedSSLModel:
     return MaskedSSLModel(
@@ -64,6 +65,7 @@ def _make_model(
         post_proj_norm="rms",
         source_session_keys=source_session_keys,
         feature_mode=feature_mode,
+        reconstruction_head_type=reconstruction_head_type,
         backbone_direction=backbone_direction,
     )
 
@@ -116,6 +118,7 @@ def _checkpoint_config(model: MaskedSSLModel) -> dict[str, object]:
         "num_spans_mode": "one",
         "allow_bin_fractional_overlap": True,
         "post_proj_norm": "rms",
+        "reconstruction_head_type": model.reconstruction_head_type,
         "backbone_direction": model.encoder.backbone_direction,
     }
 
@@ -465,6 +468,17 @@ class MaskedSSLTests(unittest.TestCase):
             self.assertIn(key, summary)
         self.assertGreaterEqual(float(summary["masked_prediction_std"]), 0.0)
         self.assertGreaterEqual(float(summary["masked_target_std"]), 0.0)
+
+    def test_mlp_reconstruction_head_preserves_reconstruction_shape(self) -> None:
+        model = _make_model(reconstruction_head_type="mlp")
+        batch = _make_batch()
+        outputs = model.reconstruct_from_patched_tokens(
+            *model.encoder.patch_batch(batch["x"], batch["lengths"]),
+            token_mask=None,
+            mask_token_placement="before_projection",
+        )
+        self.assertEqual(tuple(outputs["reconstruction"].shape[0:2]), tuple(outputs["tokens"].shape[0:2]))
+        self.assertEqual(int(outputs["reconstruction"].shape[-1]), model.encoder.token_dim)
 
     def test_bin_level_masking_generates_partial_patch_overlap(self) -> None:
         random.seed(2)
