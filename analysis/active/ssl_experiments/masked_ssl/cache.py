@@ -36,6 +36,8 @@ class CacheAccessConfig:
     examples_per_shard: int = 8
     tx_dim: int = 256
     sbp_dim: int = 256
+    feature_mode: str = "tx_only"
+    boundary_key_mode: str = "session"
     shard_cache_ram_gb: float | None = None
 
     def __post_init__(self) -> None:
@@ -47,6 +49,12 @@ class CacheAccessConfig:
             raise ValueError("examples_per_shard must be positive")
         if self.tx_dim <= 0 or self.sbp_dim <= 0:
             raise ValueError("tx_dim and sbp_dim must be positive")
+        if self.feature_mode not in {"tx_only", "tx_sbp"}:
+            raise ValueError("feature_mode must be one of {'tx_only', 'tx_sbp'}")
+        if self.boundary_key_mode not in {"session", "subject_if_available"}:
+            raise ValueError(
+                "boundary_key_mode must be one of {'session', 'subject_if_available'}"
+            )
         if self.normalize_impl_version not in {"segment_prefix_v1", "session_featurewise_v1"}:
             raise ValueError(
                 "normalize_impl_version must be one of {'segment_prefix_v1', 'session_featurewise_v1'}"
@@ -56,6 +64,8 @@ class CacheAccessConfig:
 
     @property
     def full_dim(self) -> int:
+        if self.feature_mode == "tx_only":
+            return int(self.tx_dim)
         return int(self.tx_dim + self.sbp_dim)
 
 
@@ -63,6 +73,7 @@ class CacheAccessConfig:
 class ExampleRow:
     dataset: str
     session_id: str
+    subject_id: str | None
     shard_relpath: str
     example_index: int
     n_time_bins: int
@@ -113,6 +124,14 @@ class CacheContext:
     @property
     def full_dim(self) -> int:
         return int(self.config.full_dim)
+
+    @property
+    def feature_mode(self) -> str:
+        return str(self.config.feature_mode)
+
+    @property
+    def boundary_key_mode(self) -> str:
+        return str(self.config.boundary_key_mode)
 
     @property
     def normalize_context_bins(self) -> int:
@@ -473,6 +492,22 @@ def _session_stat_key(dataset: str, session_id: str) -> str:
     return f"{dataset}:{session_id}"
 
 
+def resolve_boundary_key(
+    *,
+    dataset: str,
+    session_id: str,
+    subject_id: str | None,
+    boundary_key_mode: str,
+) -> str:
+    if boundary_key_mode == "session":
+        return f"{dataset}:{session_id}"
+    if boundary_key_mode == "subject_if_available":
+        if subject_id:
+            return f"{dataset}:{subject_id}"
+        return f"{dataset}:{session_id}"
+    raise ValueError(f"Unsupported boundary_key_mode: {boundary_key_mode}")
+
+
 def _compute_session_feature_stats(
     shard_store: ShardStore,
     rows_by_dataset: dict[str, list[ExampleRow]],
@@ -509,7 +544,7 @@ def _compute_session_feature_stats(
                 count_x[:tx_dim] += tx_window.shape[0]
 
             sbp = shard["sbp"]
-            if isinstance(sbp, np.ndarray):
+            if config.feature_mode == "tx_sbp" and isinstance(sbp, np.ndarray):
                 sbp_window = np.asarray(sbp[start:stop], dtype=np.float64)
                 sbp_dim = min(sbp_window.shape[1], config.sbp_dim)
                 sbp_slice = slice(config.tx_dim, config.tx_dim + sbp_dim)
@@ -549,6 +584,7 @@ def load_precomputed_session_feature_stats_into_cache_context(
         raise KeyError("Precomputed session stats payload is missing 'session_feature_stats'.")
 
     session_feature_stats: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+    expected_dim = int(cache_context.full_dim)
     for key, value in raw_stats.items():
         if not isinstance(value, (tuple, list)) or len(value) != 2:
             raise ValueError(
@@ -557,6 +593,15 @@ def load_precomputed_session_feature_stats_into_cache_context(
         mean, std = value
         mean_t = torch.as_tensor(mean).float().cpu()
         std_t = torch.as_tensor(std).float().cpu()
+        if mean_t.numel() < expected_dim or std_t.numel() < expected_dim:
+            raise ValueError(
+                f"Session stats entry for {key!r} is too small for feature_mode={cache_context.feature_mode!r}: "
+                f"expected at least {expected_dim} values, got mean={mean_t.numel()} std={std_t.numel()}."
+            )
+        if mean_t.numel() != expected_dim:
+            mean_t = mean_t[:expected_dim].clone()
+        if std_t.numel() != expected_dim:
+            std_t = std_t[:expected_dim].clone()
         session_feature_stats[str(key)] = (mean_t, std_t)
 
     cache_context.session_feature_stats = dict(session_feature_stats)
@@ -579,6 +624,12 @@ def sample_base_segment(
     py_rng: random.Random,
 ) -> dict[str, Any]:
     session_key = _session_stat_key(example.dataset, example.session_id)
+    boundary_key = resolve_boundary_key(
+        dataset=example.dataset,
+        session_id=example.session_id,
+        subject_id=example.subject_id,
+        boundary_key_mode=cache_context.boundary_key_mode,
+    )
     shard = cache_context.shard_store.get(example.shard_relpath)
     time_offsets = shard["time_offsets"]
     assert isinstance(time_offsets, np.ndarray)
@@ -607,7 +658,7 @@ def sample_base_segment(
         feature_mask[:tx_dim] = 1.0
 
     sbp = shard["sbp"]
-    if isinstance(sbp, np.ndarray):
+    if cache_context.feature_mode == "tx_sbp" and isinstance(sbp, np.ndarray):
         sbp_window = np.asarray(sbp[src_start:src_stop], dtype=np.float32)
         sbp_dim = min(sbp_window.shape[1], cache_context.sbp_dim)
         x_seq[:, cache_context.tx_dim : cache_context.tx_dim + sbp_dim] = sbp_window[:, :sbp_dim]
@@ -631,6 +682,7 @@ def sample_base_segment(
         "dataset": example.dataset,
         "session_id": example.session_id,
         "session_key": session_key,
+        "boundary_key": boundary_key,
         "shard_relpath": example.shard_relpath,
         "has_tx": example.has_tx,
         "has_sbp": example.has_sbp,
@@ -644,7 +696,8 @@ def stack_segment_batch(samples: list[dict[str, Any]]) -> dict[str, Any]:
         "feature_mask": torch.stack([item["feature_mask"] for item in samples], dim=0),
         "lengths": torch.tensor([item["length"] for item in samples], dtype=torch.long),
         "datasets": [item["dataset"] for item in samples],
-        "session_keys": [item["session_key"] for item in samples],
+        "session_keys": [item["boundary_key"] for item in samples],
+        "boundary_keys": [item["boundary_key"] for item in samples],
         "sessions": [item["session_id"] for item in samples],
         "shard_relpaths": [item["shard_relpath"] for item in samples],
     }
@@ -913,6 +966,11 @@ def prepare_cache_context(
                     ExampleRow(
                         dataset=dataset,
                         session_id=str(payload["session_id"]),
+                        subject_id=(
+                            str(payload["subject_id"])
+                            if payload.get("subject_id") is not None
+                            else None
+                        ),
                         shard_relpath=str(payload["shard_relpath"]),
                         example_index=int(payload["example_index"]),
                         n_time_bins=int(payload["n_time_bins"]),

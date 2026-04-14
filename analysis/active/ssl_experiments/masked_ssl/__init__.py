@@ -32,6 +32,10 @@ from .probe import (
     run_downstream_probe,
     run_probe_head_sweep,
 )
+from .phoneme_finetune import (
+    PhonemeFinetuneConfig,
+    run_phoneme_finetuning,
+)
 from .training import (
     SSLTrainingConfig,
     list_ssl_checkpoints,
@@ -46,6 +50,7 @@ __all__ = [
     "CacheAccessConfig",
     "CacheContext",
     "DownstreamProbeConfig",
+    "PhonemeFinetuneConfig",
     "SSLTrainingConfig",
     "build_random_init_probe_state",
     "build_segment_sampler",
@@ -57,6 +62,7 @@ __all__ = [
     "recover_ssl_run_state_from_checkpoint",
     "resolve_ssl_checkpoint_path",
     "run_downstream_probe",
+    "run_phoneme_finetuning",
     "run_probe_head_sweep",
     "run_ssl_training",
 ]

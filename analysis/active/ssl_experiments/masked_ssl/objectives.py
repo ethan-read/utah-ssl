@@ -270,6 +270,7 @@ def compute_masked_reconstruction_metrics(
         token_lengths,
         token_mask=token_mask,
         mask_token_placement=mask_token_placement,
+        session_keys=batch.get("session_keys"),
     )
     reconstruction = outputs["reconstruction"]
     sqerr = (reconstruction - tokens).pow(2)

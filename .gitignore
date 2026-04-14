@@ -27,3 +27,12 @@ scratch/
 .ipynb_checkpoints/
 .ruff_cache/
 *.swp
+
+# Local tooling and scratch
+.codex_tmp/
+.mplconfig/
+analysis/active/.mplconfig/
+tmp/
+
+# Failed/archival experiment assets that should stay local
+analysis/active/channel_ablation/

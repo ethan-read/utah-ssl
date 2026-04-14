@@ -15,6 +15,7 @@ import numpy as np
 import torch
 
 from .cache import CacheContext, build_segment_sampler
+from .cache import resolve_boundary_key
 from .model import MaskedSSLModel, sync_device
 from .objectives import compute_objective_metrics, summarize_metrics
 
@@ -31,6 +32,8 @@ def _seed_training_run(seed: int) -> None:
 class SSLTrainingConfig:
     seed: int = 7
     objective_mode: str = "masked_reconstruction"
+    feature_mode: str = "tx_only"
+    boundary_key_mode: str = "session"
     segment_bins: int = 80
     patch_size: int = 4
     patch_stride: int = 2
@@ -62,6 +65,12 @@ class SSLTrainingConfig:
     def __post_init__(self) -> None:
         if self.objective_mode != "masked_reconstruction":
             raise ValueError("objective_mode must be 'masked_reconstruction'")
+        if self.feature_mode not in {"tx_only", "tx_sbp"}:
+            raise ValueError("feature_mode must be one of {'tx_only', 'tx_sbp'}")
+        if self.boundary_key_mode not in {"session", "subject_if_available"}:
+            raise ValueError(
+                "boundary_key_mode must be one of {'session', 'subject_if_available'}"
+            )
         if self.patch_stride > self.patch_size:
             raise ValueError("patch_stride must be <= patch_size")
         if self.checkpoint_every_steps is not None and int(self.checkpoint_every_steps) <= 0:
@@ -87,6 +96,8 @@ class SSLTrainingConfig:
 
     def checkpoint_config(self) -> dict[str, Any]:
         return {
+            "feature_mode": str(self.feature_mode),
+            "boundary_key_mode": str(self.boundary_key_mode),
             "patch_size": int(self.patch_size),
             "patch_stride": int(self.patch_stride),
             "hidden_size": int(self.hidden_size),
@@ -95,6 +106,20 @@ class SSLTrainingConfig:
             "dropout": float(self.dropout),
             "post_proj_norm": str(self.post_proj_norm),
         }
+
+
+def _source_session_keys_from_cache_context(cache_context: CacheContext) -> tuple[str, ...]:
+    session_keys = {
+        resolve_boundary_key(
+            dataset=dataset,
+            session_id=row.session_id,
+            subject_id=row.subject_id,
+            boundary_key_mode=cache_context.boundary_key_mode,
+        )
+        for dataset, rows in cache_context.rows_by_dataset.items()
+        for row in rows
+    }
+    return tuple(sorted(session_keys))
 
 
 def evaluate_model(
@@ -155,6 +180,10 @@ def _serialize_ssl_training_config(
     return {
         "seed": int(config.seed),
         "objective_mode": str(config.objective_mode),
+        "feature_mode": str(config.feature_mode),
+        "boundary_key_mode": str(config.boundary_key_mode),
+        "input_dim": int(cache_context.full_dim),
+        "source_session_keys": list(_source_session_keys_from_cache_context(cache_context)),
         "segment_bins": int(config.segment_bins),
         "patch_size": int(config.patch_size),
         "patch_stride": int(config.patch_stride),
@@ -376,9 +405,12 @@ def recover_ssl_run_state_from_checkpoint(
     fallback_payload = asdict(fallback_config) if fallback_config is not None else {}
     for key, value in fallback_payload.items():
         recovered_config.setdefault(key, value)
+    recovered_config.setdefault("boundary_key_mode", "session")
 
     required_keys = [
+        "feature_mode",
         "segment_bins",
+        "input_dim",
         "patch_size",
         "patch_stride",
         "hidden_size",
@@ -404,9 +436,26 @@ def recover_ssl_run_state_from_checkpoint(
         raise KeyError(
             f"Recovered SSL config is missing keys needed for analysis/probe recovery: {missing_keys}"
         )
+    if str(recovered_config["feature_mode"]) != str(cache_context.feature_mode):
+        raise ValueError(
+            "Recovered checkpoint feature_mode does not match the active cache context. "
+            f"checkpoint={recovered_config['feature_mode']!r} cache={cache_context.feature_mode!r}"
+        )
+    cache_boundary_key_mode = str(getattr(cache_context, "boundary_key_mode", "session"))
+    if str(recovered_config.get("boundary_key_mode", "session")) != cache_boundary_key_mode:
+        raise ValueError(
+            "Recovered checkpoint boundary_key_mode does not match the active cache context. "
+            f"checkpoint={recovered_config.get('boundary_key_mode', 'session')!r} "
+            f"cache={cache_boundary_key_mode!r}"
+        )
+    if int(recovered_config["input_dim"]) != int(cache_context.full_dim):
+        raise ValueError(
+            "Recovered checkpoint input_dim does not match the active cache context. "
+            f"checkpoint={int(recovered_config['input_dim'])} cache={int(cache_context.full_dim)}"
+        )
 
     model = MaskedSSLModel(
-        input_dim=cache_context.full_dim,
+        input_dim=int(recovered_config.get("input_dim", cache_context.full_dim)),
         hidden_size=int(recovered_config["hidden_size"]),
         s5_state_size=int(recovered_config["s5_state_size"]),
         num_layers=int(recovered_config["num_layers"]),
@@ -414,6 +463,8 @@ def recover_ssl_run_state_from_checkpoint(
         patch_size=int(recovered_config["patch_size"]),
         patch_stride=int(recovered_config["patch_stride"]),
         post_proj_norm=str(recovered_config.get("post_proj_norm", "rms")),
+        source_session_keys=tuple(recovered_config.get("source_session_keys", ())),
+        feature_mode=str(recovered_config.get("feature_mode", "tx_only")),
     ).to(device)
     model_state = payload.get("model_state")
     if model_state is None:
@@ -501,6 +552,16 @@ def run_ssl_training(
     device: torch.device,
 ) -> dict[str, Any]:
     _seed_training_run(int(config.seed))
+    if str(config.feature_mode) != str(cache_context.feature_mode):
+        raise ValueError(
+            "SSLTrainingConfig.feature_mode must match CacheAccessConfig.feature_mode. "
+            f"config={config.feature_mode!r} cache={cache_context.feature_mode!r}"
+        )
+    if str(config.boundary_key_mode) != str(cache_context.boundary_key_mode):
+        raise ValueError(
+            "SSLTrainingConfig.boundary_key_mode must match CacheAccessConfig.boundary_key_mode. "
+            f"config={config.boundary_key_mode!r} cache={cache_context.boundary_key_mode!r}"
+        )
 
     train_sampler = build_segment_sampler(
         cache_context,
@@ -533,6 +594,8 @@ def run_ssl_training(
         patch_size=int(config.patch_size),
         patch_stride=int(config.patch_stride),
         post_proj_norm=str(config.post_proj_norm),
+        source_session_keys=_source_session_keys_from_cache_context(cache_context),
+        feature_mode=str(config.feature_mode),
     ).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(),

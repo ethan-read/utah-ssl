@@ -8,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+import numpy as np
 import torch
 
 
@@ -18,27 +19,49 @@ for path in (REPO_ROOT, EXPERIMENTS_DIR):
     if path_str not in sys.path:
         sys.path.insert(0, path_str)
 
-from masked_ssl.model import MaskedSSLModel
+from masked_ssl.cache import sample_base_segment
+from masked_ssl.model import MaskedSSLModel, SessionLinearBank
 from masked_ssl.objectives import (
     build_masked_batch,
     compute_masked_reconstruction_metrics,
     sample_mask_indices,
     summarize_metrics,
 )
-from masked_ssl.probe import DownstreamProbeConfig, recover_downstream_probe_state
+from masked_ssl.phoneme_finetune import (
+    PhonemeFinetuneConfig,
+    RawFeatureAdapter,
+    run_phoneme_finetuning,
+)
+from masked_ssl.probe import (
+    CanonicalProbeManifestRow,
+    CanonicalSequenceDataset,
+    DownstreamProbeConfig,
+    NotebookProbeEncoderAdapter,
+    recover_downstream_probe_state,
+)
 from masked_ssl.training import recover_ssl_run_state_from_checkpoint
 
 
-def _make_model(*, input_dim: int = 4, patch_size: int = 2, patch_stride: int = 2) -> MaskedSSLModel:
+def _make_model(
+    *,
+    input_dim: int = 4,
+    patch_size: int = 2,
+    patch_stride: int = 2,
+    hidden_size: int = 8,
+    source_session_keys: tuple[str, ...] = ("s0", "s1"),
+    feature_mode: str = "tx_only",
+) -> MaskedSSLModel:
     return MaskedSSLModel(
         input_dim=input_dim,
-        hidden_size=8,
+        hidden_size=hidden_size,
         s5_state_size=4,
         num_layers=1,
         dropout=0.0,
         patch_size=patch_size,
         patch_stride=patch_stride,
         post_proj_norm="rms",
+        source_session_keys=source_session_keys,
+        feature_mode=feature_mode,
     )
 
 
@@ -65,6 +88,10 @@ def _make_batch(*, batch_size: int = 2, time_bins: int = 6, input_dim: int = 4) 
 
 def _checkpoint_config(model: MaskedSSLModel) -> dict[str, object]:
     return {
+        "feature_mode": model.feature_mode,
+        "boundary_key_mode": "session",
+        "input_dim": model.encoder.input_dim,
+        "source_session_keys": list(model.source_session_keys),
         "segment_bins": 10,
         "patch_size": model.encoder.patch_size,
         "patch_stride": model.encoder.patch_stride,
@@ -89,7 +116,190 @@ def _checkpoint_config(model: MaskedSSLModel) -> dict[str, object]:
     }
 
 
+def _write_tiny_canonical_probe_cache(cache_root: Path) -> None:
+    dataset_root = cache_root / "brain2text25"
+    shard_dir = dataset_root / "toy_shard"
+    shard_dir.mkdir(parents=True, exist_ok=True)
+
+    tx = np.array(
+        [
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [1.0, 0.0, 1.0],
+            [0.0, 1.0, 1.0],
+            [1.0, 2.0, 0.0],
+            [0.0, 2.0, 1.0],
+            [2.0, 0.0, 1.0],
+            [1.0, 1.0, 1.0],
+            [2.0, 1.0, 0.0],
+            [0.0, 2.0, 2.0],
+            [2.0, 2.0, 0.0],
+            [1.0, 0.0, 2.0],
+            [0.0, 1.0, 2.0],
+            [2.0, 1.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+    sbp = np.array(
+        [
+            [10.0, 0.0],
+            [10.0, 1.0],
+            [11.0, 0.0],
+            [11.0, 1.0],
+            [12.0, 0.0],
+            [12.0, 1.0],
+            [13.0, 0.0],
+            [13.0, 1.0],
+            [14.0, 0.0],
+            [14.0, 1.0],
+            [15.0, 0.0],
+            [15.0, 1.0],
+            [16.0, 0.0],
+            [16.0, 1.0],
+            [17.0, 0.0],
+            [17.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+    np.save(shard_dir / "time_offsets.npy", np.array([0, 4, 8, 12, 16], dtype=np.int64))
+    np.save(shard_dir / "tx.npy", tx)
+    np.save(shard_dir / "sbp.npy", sbp)
+    np.save(shard_dir / "phoneme_offsets.npy", np.array([0, 2, 4, 6, 8], dtype=np.int64))
+    np.save(shard_dir / "phoneme_ids.npy", np.array([1, 2, 2, 1, 1, 1, 2, 2], dtype=np.int64))
+
+    manifest_rows = [
+        {
+            "example_id": "src-train-0",
+            "session_id": "t00.2025.01.01",
+            "subject_id": "t00",
+            "session_date": "2025.01.01",
+            "source_split": "train",
+            "has_labels": True,
+            "shard_relpath": "brain2text25/toy_shard",
+            "example_index": 0,
+            "n_tx_features": 3,
+            "n_sbp_features": 2,
+            "target_length": 2,
+            "transcript": "AA",
+            "has_tx": True,
+            "has_sbp": True,
+        },
+        {
+            "example_id": "src-train-1",
+            "session_id": "t00.2025.01.01",
+            "subject_id": "t00",
+            "session_date": "2025.01.01",
+            "source_split": "train",
+            "has_labels": True,
+            "shard_relpath": "brain2text25/toy_shard",
+            "example_index": 1,
+            "n_tx_features": 3,
+            "n_sbp_features": 2,
+            "target_length": 2,
+            "transcript": "BB",
+            "has_tx": True,
+            "has_sbp": True,
+        },
+        {
+            "example_id": "target-train-0",
+            "session_id": "t00.2025.01.02",
+            "subject_id": "t00",
+            "session_date": "2025.01.02",
+            "source_split": "train",
+            "has_labels": True,
+            "shard_relpath": "brain2text25/toy_shard",
+            "example_index": 2,
+            "n_tx_features": 3,
+            "n_sbp_features": 2,
+            "target_length": 2,
+            "transcript": "AB",
+            "has_tx": True,
+            "has_sbp": True,
+        },
+        {
+            "example_id": "target-val-0",
+            "session_id": "t00.2025.01.02",
+            "subject_id": "t00",
+            "session_date": "2025.01.02",
+            "source_split": "val",
+            "has_labels": True,
+            "shard_relpath": "brain2text25/toy_shard",
+            "example_index": 3,
+            "n_tx_features": 3,
+            "n_sbp_features": 2,
+            "target_length": 2,
+            "transcript": "BA",
+            "has_tx": True,
+            "has_sbp": True,
+        },
+    ]
+    with (dataset_root / "manifest.jsonl").open("w") as handle:
+        for row in manifest_rows:
+            handle.write(json.dumps(row) + "\n")
+
+    metadata = {
+        "n_tx_features": 3,
+        "n_sbp_features": 2,
+        "phoneme_vocabulary": {
+            "num_classes": 3,
+            "blank_index": 0,
+            "index_to_symbol": ["<blk>", "AA", "BB"],
+        },
+    }
+    (dataset_root / "metadata.json").write_text(json.dumps(metadata))
+
+
 class MaskedSSLTests(unittest.TestCase):
+    def test_tx_only_sampling_returns_only_tx_channels_and_featurewise_normalization(self) -> None:
+        session_key = "toy:sess0"
+
+        class _DummyShardStore:
+            def get(self, _shard_relpath):
+                tx = np.arange(24, dtype=np.float32).reshape(6, 4)
+                sbp = (100.0 + np.arange(12, dtype=np.float32)).reshape(6, 2)
+                return {
+                    "time_offsets": np.array([0, 6], dtype=np.int64),
+                    "tx": tx,
+                    "sbp": sbp,
+                }
+
+        cache_context = SimpleNamespace(
+            full_dim=4,
+            tx_dim=4,
+            sbp_dim=2,
+            feature_mode="tx_only",
+            boundary_key_mode="subject_if_available",
+            shard_store=_DummyShardStore(),
+            normalize_context_bins=2,
+            normalize_impl_version="session_featurewise_v1",
+            session_feature_stats={
+                session_key: (
+                    torch.tensor([1.0, 2.0, 3.0, 4.0]),
+                    torch.tensor([2.0, 2.0, 2.0, 2.0]),
+                )
+            },
+        )
+        example = SimpleNamespace(
+            dataset="toy",
+            session_id="sess0",
+            subject_id="subj0",
+            shard_relpath="unused",
+            example_index=0,
+            has_tx=True,
+            has_sbp=True,
+        )
+        sample = sample_base_segment(cache_context, example, segment_bins=6, py_rng=random.Random(0))
+        self.assertEqual(tuple(sample["x"].shape), (6, 4))
+        self.assertTrue(torch.equal(sample["feature_mask"], torch.ones(4)))
+        self.assertEqual(sample["boundary_key"], "toy:subj0")
+        expected = (
+            torch.tensor(np.arange(24, dtype=np.float32).reshape(6, 4))
+            - torch.tensor([1.0, 2.0, 3.0, 4.0])
+        ) / 2.0
+        self.assertTrue(torch.allclose(sample["x"], expected))
+
     def test_sample_mask_indices_one_span_is_contiguous_and_matches_target_count(self) -> None:
         random.seed(0)
         mask = sample_mask_indices(
@@ -263,7 +473,9 @@ class MaskedSSLTests(unittest.TestCase):
         prefix_length = 4
         x_a = torch.randn(1, 6, 3)
         x_b = x_a.clone()
-        x_b[:, prefix_length:, :] += 10.0
+        x_b[:, prefix_length:, 0] *= -3.0
+        x_b[:, prefix_length:, 1] += 7.5
+        x_b[:, prefix_length:, 2] -= 4.25
         lengths = torch.tensor([6], dtype=torch.long)
 
         encoded_a = model.encode_sequence(x_a, lengths)
@@ -306,6 +518,112 @@ class MaskedSSLTests(unittest.TestCase):
                 rtol=1e-6,
             )
         )
+
+    def test_session_keyed_readin_and_readout_route_by_session(self) -> None:
+        model = _make_model(input_dim=2, patch_size=1, patch_stride=1, hidden_size=2)
+        with torch.no_grad():
+            for layer in (model.encoder.source_readin.layers["s0"], model.source_readout.layers["s0"]):
+                layer.weight.zero_()
+                layer.weight += 2.0 * torch.eye(2)
+                layer.bias.zero_()
+            for layer in (model.encoder.source_readin.layers["s1"], model.source_readout.layers["s1"]):
+                layer.weight.zero_()
+                layer.weight += 3.0 * torch.eye(2)
+                layer.bias.zero_()
+
+        tokens = torch.ones(2, 3, 2)
+        token_lengths = torch.tensor([3, 3], dtype=torch.long)
+        encoded = model.encoder.encode_patched(
+            tokens,
+            token_lengths,
+            session_keys=["s0", "s1"],
+            use_source_affines=True,
+        )
+        self.assertTrue(torch.allclose(encoded["aligned_tokens"][0], torch.full((3, 2), 2.0)))
+        self.assertTrue(torch.allclose(encoded["aligned_tokens"][1], torch.full((3, 2), 3.0)))
+
+        readout = model.source_readout(tokens, ["s0", "s1"])
+        self.assertTrue(torch.allclose(readout[0], torch.full((3, 2), 2.0)))
+        self.assertTrue(torch.allclose(readout[1], torch.full((3, 2), 3.0)))
+
+    def test_probe_target_session_bank_gets_gradients_with_frozen_and_unfrozen_encoder(self) -> None:
+        model = _make_model(input_dim=3, patch_size=1, patch_stride=1, hidden_size=3)
+        x = torch.randn(1, 4, 3)
+        lengths = torch.tensor([4], dtype=torch.long)
+        session_ids = ["target"]
+
+        adapter_frozen = NotebookProbeEncoderAdapter(model.encoder)
+        for parameter in adapter_frozen.parameters():
+            parameter.requires_grad = False
+        frozen_target_affines = SessionLinearBank(("target",), adapter_frozen.token_dim)
+        frozen_outputs = adapter_frozen.encode(
+            x,
+            lengths,
+            session_ids,
+            use_source_affines=False,
+            target_affines=frozen_target_affines,
+        )
+        frozen_loss = frozen_outputs.hidden.sum()
+        frozen_loss.backward()
+        self.assertTrue(
+            any(param.grad is not None for param in frozen_target_affines.parameters())
+        )
+        self.assertTrue(
+            all(param.grad is None for param in adapter_frozen.parameters())
+        )
+
+        adapter_trainable = NotebookProbeEncoderAdapter(model.encoder)
+        for parameter in adapter_trainable.parameters():
+            parameter.requires_grad = True
+        trainable_target_affines = SessionLinearBank(("target",), adapter_trainable.token_dim)
+        trainable_outputs = adapter_trainable.encode(
+            x,
+            lengths,
+            session_ids,
+            use_source_affines=False,
+            target_affines=trainable_target_affines,
+        )
+        trainable_loss = trainable_outputs.hidden.sum()
+        trainable_loss.backward()
+        self.assertTrue(
+            any(param.grad is not None for param in trainable_target_affines.parameters())
+        )
+        self.assertTrue(
+            any(param.grad is not None for param in adapter_trainable.parameters())
+        )
+
+    def test_probe_dataset_tx_only_slicing_matches_encoder_width(self) -> None:
+        tmp_dir = Path(self._tmp_dir())
+        shard_dir = tmp_dir / "toy_shard"
+        shard_dir.mkdir(parents=True, exist_ok=True)
+        np.save(shard_dir / "time_offsets.npy", np.array([0, 3], dtype=np.int64))
+        np.save(shard_dir / "tx.npy", np.arange(9, dtype=np.float32).reshape(3, 3))
+        np.save(shard_dir / "sbp.npy", (100.0 + np.arange(6, dtype=np.float32)).reshape(3, 2))
+        np.save(shard_dir / "phoneme_offsets.npy", np.array([0, 0], dtype=np.int64))
+
+        row = CanonicalProbeManifestRow(
+            example_id="ex0",
+            session_id="sess0",
+            subject_id="subj0",
+            source_split="train",
+            has_labels=False,
+            shard_relpath="toy_shard",
+            example_index=0,
+            n_tx_features=3,
+            n_sbp_features=2,
+            target_length=None,
+            transcript="",
+        )
+        dataset = CanonicalSequenceDataset(
+            [row],
+            cache_root=tmp_dir,
+            stats=None,
+            feature_mode="tx_only",
+            boundary_key_mode="subject_if_available",
+        )
+        item = dataset[0]
+        self.assertEqual(int(item["x"].shape[1]), 3)
+        self.assertEqual(item["boundary_key"], "brain2text25:subj0")
 
     def test_probe_recovery_auto_discovers_step_checkpoint(self) -> None:
         model = _make_model()
@@ -362,13 +680,98 @@ class MaskedSSLTests(unittest.TestCase):
         with mock.patch("masked_ssl.training.build_segment_sampler", new=_fake_sampler):
             state = recover_ssl_run_state_from_checkpoint(
                 checkpoint_path=checkpoint_path,
-                cache_context=SimpleNamespace(full_dim=model.encoder.input_dim),
+                cache_context=SimpleNamespace(
+                    full_dim=model.encoder.input_dim,
+                    feature_mode=model.feature_mode,
+                ),
                 device=torch.device("cpu"),
             )
         self.assertEqual(state["checkpoint_step"], 3)
         self.assertEqual(state["train_sampler"]["split"], "train")
         self.assertEqual(state["val_sampler"]["split"], "val")
         self.assertEqual(state["model"].encoder.input_dim, model.encoder.input_dim)
+        self.assertEqual(state["model"].feature_mode, model.feature_mode)
+
+    def test_raw_feature_adapter_starts_as_identity_on_tx_block(self) -> None:
+        adapter = RawFeatureAdapter(input_dim=5, output_dim=3)
+        x = torch.tensor(
+            [[[1.0, 2.0, 3.0, 100.0, 200.0]]],
+            dtype=torch.float32,
+        )
+        y = adapter(x)
+        self.assertTrue(torch.allclose(y, torch.tensor([[[1.0, 2.0, 3.0]]])))
+
+    def test_run_phoneme_finetuning_with_tx_sbp_adapter_writes_checkpoint(self) -> None:
+        model = _make_model(input_dim=3, patch_size=1, patch_stride=1, hidden_size=4)
+        config = _checkpoint_config(model)
+        tmp_path = Path(self._tmp_dir())
+        checkpoint_path = tmp_path / "checkpoint_final.pt"
+        torch.save({"model_state": model.state_dict(), "config": config}, checkpoint_path)
+        _write_tiny_canonical_probe_cache(tmp_path)
+
+        summary = run_phoneme_finetuning(
+            checkpoint_path=checkpoint_path,
+            cache_root=tmp_path,
+            config=PhonemeFinetuneConfig(
+                seed=7,
+                mode="probe_frozen",
+                feature_mode="tx_sbp",
+                session_limit=2,
+                target_session_count=1,
+                batch_size=1,
+                num_steps=2,
+                budget_seconds=30,
+                learning_rate=1e-3,
+                encoder_learning_rate=3e-4,
+                checkpoint_every_steps=1,
+            ),
+            device=torch.device("cpu"),
+        )
+        self.assertEqual(summary["feature_mode"], "tx_sbp")
+        self.assertEqual(summary["adapter_type"], "RawFeatureAdapter")
+        self.assertEqual(summary["external_input_dim"], 5)
+        self.assertEqual(summary["encoder_input_dim"], 3)
+        self.assertTrue(Path(summary["checkpoint_final_path"]).exists())
+        self.assertTrue((Path(summary["checkpoints_dir"]) / "step_000001.pt").exists())
+        self.assertTrue((Path(summary["checkpoints_dir"]) / "step_000002.pt").exists())
+        self.assertEqual(summary["checkpoint_every_steps"], 1)
+
+        payload = torch.load(summary["checkpoint_final_path"], map_location="cpu")
+        self.assertEqual(payload["feature_mode"], "tx_sbp")
+        self.assertEqual(payload["external_input_dim"], 5)
+        self.assertEqual(payload["encoder_input_dim"], 3)
+
+    def test_run_phoneme_finetuning_full_mode_writes_summary(self) -> None:
+        model = _make_model(input_dim=3, patch_size=1, patch_stride=1, hidden_size=4)
+        config = _checkpoint_config(model)
+        tmp_path = Path(self._tmp_dir())
+        checkpoint_path = tmp_path / "checkpoint_final.pt"
+        torch.save({"model_state": model.state_dict(), "config": config}, checkpoint_path)
+        _write_tiny_canonical_probe_cache(tmp_path)
+
+        summary = run_phoneme_finetuning(
+            checkpoint_path=checkpoint_path,
+            cache_root=tmp_path,
+            config=PhonemeFinetuneConfig(
+                seed=7,
+                mode="finetune_full",
+                feature_mode="tx_only",
+                session_limit=2,
+                target_session_count=1,
+                batch_size=1,
+                num_steps=2,
+                budget_seconds=30,
+                learning_rate=1e-3,
+                encoder_learning_rate=3e-4,
+                checkpoint_every_steps=1,
+            ),
+            device=torch.device("cpu"),
+        )
+        self.assertEqual(summary["feature_mode"], "tx_only")
+        self.assertEqual(summary["adapter_type"], "IdentityFeatureAdapter")
+        self.assertIn("val_ctc_bpphone", summary["metrics"])
+        self.assertIn("best_val_ctc_bpphone", summary["metrics"])
+        self.assertIn("best_step", summary["metrics"])
 
     def _tmp_dir(self) -> str:
         import tempfile

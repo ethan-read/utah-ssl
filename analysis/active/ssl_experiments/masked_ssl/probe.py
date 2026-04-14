@@ -20,7 +20,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from .model import ContrastiveSSLModel, S5ContrastiveEncoder
+from .cache import resolve_boundary_key
+from .model import ContrastiveSSLModel, S5ContrastiveEncoder, SessionLinearBank
 from .training import resolve_ssl_checkpoint_path
 
 
@@ -81,6 +82,9 @@ class NotebookProbeEncoderAdapter(nn.Module):
         self.encoder = encoder
         self.input_dim = int(getattr(encoder, "input_dim"))
         self.hidden_size = int(getattr(encoder, "hidden_size"))
+        self.token_dim = int(getattr(encoder, "token_dim"))
+        self.feature_mode = str(getattr(encoder, "feature_mode", "tx_only"))
+        self.source_session_keys = tuple(getattr(encoder, "source_session_keys", ()))
 
     def encode(
         self,
@@ -91,10 +95,15 @@ class NotebookProbeEncoderAdapter(nn.Module):
         use_source_affines: bool,
         target_affines=None,
     ) -> SimpleNamespace:
-        del use_source_affines
-        if target_affines is not None:
-            x = target_affines(x, session_ids)
-        outputs = self.encoder(x, input_lengths)
+        tokens, token_lengths = self.encoder.patch_batch(x, input_lengths)
+        outputs = self.encoder.encode_patched(
+            tokens,
+            token_lengths,
+            token_mask=None,
+            session_keys=session_ids,
+            use_source_affines=bool(use_source_affines),
+            target_affines=target_affines,
+        )
         return SimpleNamespace(
             hidden=outputs["hidden"],
             token_lengths=outputs["token_lengths"],
@@ -223,6 +232,7 @@ def _load_canonical_inventory_from_manifest(
 class CanonicalProbeManifestRow:
     example_id: str
     session_id: str
+    subject_id: str | None
     source_split: str
     has_labels: bool
     shard_relpath: str
@@ -263,7 +273,7 @@ class CanonicalShardAccessor:
             self._shards[key] = cached
         return cached
 
-    def load_features(self, row: CanonicalProbeManifestRow) -> np.ndarray:
+    def load_features(self, row: CanonicalProbeManifestRow, *, feature_mode: str) -> np.ndarray:
         shard = self._get_shard(row)
         time_offsets = shard["time_offsets"]
         assert time_offsets is not None
@@ -275,10 +285,12 @@ class CanonicalShardAccessor:
         sbp = shard["sbp"]
         if tx is not None:
             parts.append(np.asarray(tx[start:stop], dtype=np.float32))
-        if sbp is not None:
+        if feature_mode == "tx_sbp" and sbp is not None:
             parts.append(np.asarray(sbp[start:stop], dtype=np.float32))
         if not parts:
-            raise ValueError(f"Shard {row.shard_relpath} has neither tx.npy nor sbp.npy")
+            raise ValueError(
+                f"Shard {row.shard_relpath} does not contain features for feature_mode={feature_mode!r}"
+            )
         if len(parts) == 1:
             return parts[0]
         return np.concatenate(parts, axis=1)
@@ -321,6 +333,11 @@ def _load_canonical_probe_manifest(manifest_path: Path) -> list[CanonicalProbeMa
                 CanonicalProbeManifestRow(
                     example_id=str(payload["example_id"]),
                     session_id=str(payload["session_id"]),
+                    subject_id=(
+                        str(payload["subject_id"])
+                        if payload.get("subject_id") is not None
+                        else None
+                    ),
                     source_split=str(payload["source_split"]),
                     has_labels=bool(payload["has_labels"]),
                     shard_relpath=str(payload["shard_relpath"]),
@@ -380,6 +397,7 @@ def compute_feature_stats(
     *,
     cache_root: Path,
     mode: str,
+    feature_mode: str,
 ) -> dict[str, tuple[np.ndarray, np.ndarray]] | tuple[np.ndarray, np.ndarray]:
     accessor = CanonicalShardAccessor(cache_root)
     try:
@@ -388,7 +406,7 @@ def compute_feature_stats(
             sum_x = None
             sum_x2 = None
             for row in rows:
-                x = accessor.load_features(row)
+                x = accessor.load_features(row, feature_mode=feature_mode)
                 x64 = x.astype(np.float64, copy=False)
                 if sum_x is None:
                     sum_x = x64.sum(axis=0)
@@ -409,7 +427,12 @@ def compute_feature_stats(
             for row in rows:
                 grouped.setdefault(row.session_id, []).append(row)
             return {
-                session_id: compute_feature_stats(tuple(session_rows), cache_root=cache_root, mode="global")  # type: ignore[arg-type]
+                session_id: compute_feature_stats(
+                    tuple(session_rows),
+                    cache_root=cache_root,
+                    mode="global",
+                    feature_mode=feature_mode,
+                )  # type: ignore[arg-type]
                 for session_id, session_rows in grouped.items()
             }
 
@@ -438,9 +461,13 @@ class CanonicalSequenceDataset(torch.utils.data.Dataset):
         *,
         cache_root: Path,
         stats: dict[str, tuple[np.ndarray, np.ndarray]] | tuple[np.ndarray, np.ndarray] | None = None,
+        feature_mode: str = "tx_only",
+        boundary_key_mode: str = "session",
     ) -> None:
         self.rows = list(rows)
         self.stats = stats
+        self.feature_mode = str(feature_mode)
+        self.boundary_key_mode = str(boundary_key_mode)
         self._accessor = CanonicalShardAccessor(cache_root)
 
     def __len__(self) -> int:
@@ -448,9 +475,11 @@ class CanonicalSequenceDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
         row = self.rows[idx]
-        x = self._accessor.load_features(row)
+        x = self._accessor.load_features(row, feature_mode=self.feature_mode)
         if self.stats is not None:
             x = apply_feature_stats(x, row=row, stats=self.stats)
+        else:
+            x = np.array(x, dtype=np.float32, copy=True)
         labels = self._accessor.load_labels(row)
         if labels is None:
             labels = np.zeros((0,), dtype=np.int64)
@@ -460,6 +489,12 @@ class CanonicalSequenceDataset(torch.utils.data.Dataset):
             "labels": torch.from_numpy(labels),
             "label_length": int(labels.shape[0]),
             "session_id": row.session_id,
+            "boundary_key": resolve_boundary_key(
+                dataset="brain2text25",
+                session_id=row.session_id,
+                subject_id=row.subject_id,
+                boundary_key_mode=self.boundary_key_mode,
+            ),
             "example_id": row.example_id,
         }
 
@@ -478,6 +513,7 @@ def collate_sequence_batch(batch: list[dict[str, Any]]) -> dict[str, Any]:
     input_lengths = torch.empty((batch_size,), dtype=torch.long)
     label_lengths = torch.empty((batch_size,), dtype=torch.long)
     session_ids: list[str] = []
+    boundary_keys: list[str] = []
     example_ids: list[str] = []
 
     for idx, item in enumerate(batch):
@@ -489,6 +525,7 @@ def collate_sequence_batch(batch: list[dict[str, Any]]) -> dict[str, Any]:
         input_lengths[idx] = t
         label_lengths[idx] = l
         session_ids.append(item["session_id"])
+        boundary_keys.append(item["boundary_key"])
         example_ids.append(item["example_id"])
 
     return {
@@ -497,6 +534,7 @@ def collate_sequence_batch(batch: list[dict[str, Any]]) -> dict[str, Any]:
         "input_lengths": input_lengths,
         "label_lengths": label_lengths,
         "session_ids": session_ids,
+        "boundary_keys": boundary_keys,
         "example_ids": example_ids,
     }
 
@@ -504,7 +542,7 @@ def collate_sequence_batch(batch: list[dict[str, Any]]) -> dict[str, Any]:
 def _default_checkpoint_config(default_checkpoint_config: dict[str, Any] | None) -> dict[str, Any]:
     if default_checkpoint_config is None:
         raise ValueError("default_checkpoint_config is required for downstream probe recovery.")
-    return {
+    resolved = {
         "patch_size": int(default_checkpoint_config["patch_size"]),
         "patch_stride": int(default_checkpoint_config["patch_stride"]),
         "hidden_size": int(default_checkpoint_config["hidden_size"]),
@@ -513,6 +551,15 @@ def _default_checkpoint_config(default_checkpoint_config: dict[str, Any] | None)
         "dropout": float(default_checkpoint_config["dropout"]),
         "post_proj_norm": str(default_checkpoint_config.get("post_proj_norm", "rms")),
     }
+    if "feature_mode" in default_checkpoint_config:
+        resolved["feature_mode"] = str(default_checkpoint_config["feature_mode"])
+    if "boundary_key_mode" in default_checkpoint_config:
+        resolved["boundary_key_mode"] = str(default_checkpoint_config["boundary_key_mode"])
+    if "input_dim" in default_checkpoint_config:
+        resolved["input_dim"] = int(default_checkpoint_config["input_dim"])
+    if "source_session_keys" in default_checkpoint_config:
+        resolved["source_session_keys"] = [str(key) for key in default_checkpoint_config["source_session_keys"]]
+    return resolved
 
 
 def _resolve_candidate_checkpoint_path(
@@ -567,7 +614,7 @@ def _recover_encoder_from_notebook_checkpoint(
         )
 
     recovered_encoder = S5ContrastiveEncoder(
-        input_dim=input_dim,
+        input_dim=int(checkpoint_cfg.get("input_dim", input_dim)),
         hidden_size=int(checkpoint_cfg["hidden_size"]),
         s5_state_size=int(checkpoint_cfg["s5_state_size"]),
         num_layers=int(checkpoint_cfg["num_layers"]),
@@ -575,6 +622,8 @@ def _recover_encoder_from_notebook_checkpoint(
         patch_size=int(checkpoint_cfg["patch_size"]),
         patch_stride=int(checkpoint_cfg["patch_stride"]),
         post_proj_norm=str(checkpoint_cfg.get("post_proj_norm", "rms")),
+        source_session_keys=tuple(checkpoint_cfg.get("source_session_keys", ())),
+        feature_mode=str(checkpoint_cfg.get("feature_mode", "tx_only")),
     )
     model_state = payload.get("model_state")
     if model_state is None:
@@ -630,6 +679,10 @@ def _build_probe_state(
         "checkpoint_config": dict(checkpoint_config),
         "checkpoint_path": checkpoint_path,
         "base_run_dir": Path(base_run_dir),
+        "feature_mode": str(getattr(base_encoder, "feature_mode", checkpoint_config.get("feature_mode", "tx_only"))),
+        "boundary_key_mode": str(checkpoint_config.get("boundary_key_mode", "session")),
+        "input_dim": int(getattr(base_encoder, "input_dim")),
+        "source_session_keys": list(getattr(base_encoder, "source_session_keys", checkpoint_config.get("source_session_keys", ()))),
     }
 
 
@@ -719,7 +772,7 @@ def build_random_init_probe_state(
     with torch.random.fork_rng(devices=[]):
         torch.manual_seed(int(seed))
         base_encoder = S5ContrastiveEncoder(
-            input_dim=input_dim,
+            input_dim=int(reference_config.get("input_dim", input_dim)),
             hidden_size=int(checkpoint_cfg["hidden_size"]),
             s5_state_size=int(checkpoint_cfg["s5_state_size"]),
             num_layers=int(checkpoint_cfg["num_layers"]),
@@ -727,6 +780,8 @@ def build_random_init_probe_state(
             patch_size=int(checkpoint_cfg["patch_size"]),
             patch_stride=int(checkpoint_cfg["patch_stride"]),
             post_proj_norm=str(checkpoint_cfg.get("post_proj_norm", "rms")),
+            source_session_keys=tuple(checkpoint_cfg.get("source_session_keys", ())),
+            feature_mode=str(checkpoint_cfg.get("feature_mode", "tx_only")),
         )
 
     return _build_probe_state(
@@ -742,6 +797,8 @@ def build_downstream_probe_problem(
     *,
     cache_root: Path,
     probe_config: DownstreamProbeConfig,
+    feature_mode: str = "tx_only",
+    boundary_key_mode: str = "session",
 ) -> dict[str, Any]:
     _, data_module = _load_benchmark_modules()
     canonical_root, manifest_path, metadata_path = _validate_canonical_probe_assets(cache_root)
@@ -751,7 +808,12 @@ def build_downstream_probe_problem(
         canonical_root=canonical_root,
         cache_root=Path(cache_root),
     )
-    eligible_entries = [entry for entry in inventory if entry.has_tx and entry.has_sbp]
+    if feature_mode == "tx_only":
+        eligible_entries = [entry for entry in inventory if entry.has_tx]
+    elif feature_mode == "tx_sbp":
+        eligible_entries = [entry for entry in inventory if entry.has_tx and entry.has_sbp]
+    else:
+        raise ValueError("feature_mode must be one of {'tx_only', 'tx_sbp'}")
     split = data_module.split_latest_sessions(
         eligible_entries,
         session_limit=int(probe_config.session_limit),
@@ -825,6 +887,8 @@ def build_downstream_probe_problem(
         "target_val_rows": target_val_rows,
         "vocab": metadata["phoneme_vocabulary"],
         "cache_root": Path(cache_root),
+        "feature_mode": str(feature_mode),
+        "boundary_key_mode": str(boundary_key_mode),
     }
 
 
@@ -1005,12 +1069,15 @@ def evaluate_probe_session_metrics(
     *,
     encoder: nn.Module,
     probe_head: nn.Module,
+    target_affines: SessionLinearBank | None,
     loader: DataLoader,
     device: torch.device,
     blank_index: int,
 ) -> dict[str, Any]:
     encoder.eval()
     probe_head.eval()
+    if target_affines is not None:
+        target_affines.eval()
 
     total_loss_sum = 0.0
     total_targets = 0
@@ -1037,7 +1104,7 @@ def evaluate_probe_session_metrics(
                 input_lengths,
                 batch["session_ids"],
                 use_source_affines=False,
-                target_affines=None,
+                target_affines=target_affines,
             )
             logits = probe_head(outputs.hidden)
             loss_sum, target_count = compute_ctc_loss_sum(
@@ -1170,12 +1237,15 @@ def train_probe_with_metrics(
         problem["target_train_rows"],
         cache_root=Path(problem["cache_root"]),
         mode=target_stats_mode,
+        feature_mode=str(problem["feature_mode"]),
     )
     train_loader = DataLoader(
         CanonicalSequenceDataset(
             problem["target_train_rows"],
             cache_root=Path(problem["cache_root"]),
             stats=target_stats,
+            feature_mode=str(problem["feature_mode"]),
+            boundary_key_mode=str(problem.get("boundary_key_mode", "session")),
         ),
         **_loader_kwargs(
             device,
@@ -1190,6 +1260,8 @@ def train_probe_with_metrics(
             problem["target_val_rows"],
             cache_root=Path(problem["cache_root"]),
             stats=target_stats,
+            feature_mode=str(problem["feature_mode"]),
+            boundary_key_mode=str(problem.get("boundary_key_mode", "session")),
         ),
         **_loader_kwargs(
             device,
@@ -1217,6 +1289,12 @@ def train_probe_with_metrics(
             probe_vocab_size=int(problem["vocab"]["num_classes"]),
             probe_config=probe_config,
         ).to(device)
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(int(probe_config.seed) + 3)
+        target_affines = SessionLinearBank(
+            tuple(problem["target_session_ids"]),
+            int(encoder.token_dim),
+        ).to(device)
     probe_head_num_parameters = count_trainable_parameters(probe_head)
     probe_head_learning_rate = float(probe_config.probe_head_learning_rate)
     encoder_learning_rate = (
@@ -1226,7 +1304,9 @@ def train_probe_with_metrics(
     )
     probe_head_parameters = [param for param in probe_head.parameters() if param.requires_grad]
     encoder_parameters = [param for param in encoder.parameters() if param.requires_grad]
+    target_affine_parameters = [param for param in target_affines.parameters() if param.requires_grad]
     trainable_parameters = list(probe_head_parameters)
+    trainable_parameters.extend(target_affine_parameters)
     if train_encoder:
         trainable_parameters.extend(encoder_parameters)
 
@@ -1234,7 +1314,11 @@ def train_probe_with_metrics(
         {
             "params": probe_head_parameters,
             "lr": probe_head_learning_rate,
-        }
+        },
+        {
+            "params": target_affine_parameters,
+            "lr": probe_head_learning_rate,
+        },
     ]
     if train_encoder and encoder_parameters:
         optimizer_param_groups.append(
@@ -1273,29 +1357,20 @@ def train_probe_with_metrics(
             else:
                 encoder.eval()
             probe_head.train()
+            target_affines.train()
 
             x = batch["x"].to(device)
             input_lengths = batch["input_lengths"].to(device)
             labels = batch["labels"].to(device)
             label_lengths = batch["label_lengths"].to(device)
 
-            if train_encoder:
-                outputs = encoder.encode(
-                    x,
-                    input_lengths,
-                    batch["session_ids"],
-                    use_source_affines=False,
-                    target_affines=None,
-                )
-            else:
-                with torch.no_grad():
-                    outputs = encoder.encode(
-                        x,
-                        input_lengths,
-                        batch["session_ids"],
-                        use_source_affines=False,
-                        target_affines=None,
-                    )
+            outputs = encoder.encode(
+                x,
+                input_lengths,
+                batch["session_ids"],
+                use_source_affines=False,
+                target_affines=target_affines,
+            )
             logits = probe_head(outputs.hidden)
             loss_sum, target_count = compute_ctc_loss_sum(
                 logits,
@@ -1345,6 +1420,7 @@ def train_probe_with_metrics(
     metrics = evaluate_probe_session_metrics(
         encoder=encoder,
         probe_head=probe_head,
+        target_affines=target_affines,
         loader=val_loader,
         device=device,
         blank_index=int(problem["vocab"]["blank_index"]),
@@ -1384,6 +1460,8 @@ def run_downstream_probe(
     problem = build_downstream_probe_problem(
         cache_root=cache_root,
         probe_config=effective_probe_config,
+        feature_mode=str(probe_state.get("feature_mode", "tx_only")),
+        boundary_key_mode=str(probe_state.get("boundary_key_mode", "session")),
     )
 
     suffix = probe_head_suffix(resolve_probe_head_type(effective_probe_config))
@@ -1567,6 +1645,7 @@ def run_downstream_probe(
         "checkpoint_path": (
             str(probe_state["checkpoint_path"]) if probe_state["checkpoint_path"] is not None else None
         ),
+        "feature_mode": str(problem["feature_mode"]),
         "run_dir": str(artifact_dir),
         "progress_log_path": str(progress_path),
         "alignment_stats_path": str(alignment_stats_path),
