@@ -153,6 +153,7 @@ def build_masked_batch(
     token_mask = torch.zeros_like(valid_token_mask)
     token_loss_mask = torch.zeros_like(tokens, dtype=torch.bool)
     token_loss_token_mask = torch.zeros_like(valid_token_mask)
+    score_full_patch_spans = getattr(model.encoder, "backbone_direction", "causal") == "bidirectional"
 
     if mask_unit == "patch":
         raw_unit_mask = torch.zeros_like(valid_token_mask)
@@ -165,7 +166,7 @@ def build_masked_batch(
                 num_spans_mode=num_spans_mode,
             )
         token_mask = raw_unit_mask & valid_token_mask
-        token_loss_token_mask = _span_start_mask(token_mask)
+        token_loss_token_mask = token_mask if score_full_patch_spans else _span_start_mask(token_mask)
         token_loss_mask = token_feature_mask & token_loss_token_mask.unsqueeze(-1)
         token_overlap_fraction = token_mask.to(tokens.dtype)
         raw_unit_count = int(raw_unit_mask.sum().item())

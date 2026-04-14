@@ -511,6 +511,7 @@ def _default_checkpoint_config(default_checkpoint_config: dict[str, Any] | None)
         "num_layers": int(default_checkpoint_config["num_layers"]),
         "dropout": float(default_checkpoint_config["dropout"]),
         "post_proj_norm": str(default_checkpoint_config.get("post_proj_norm", "rms")),
+        "backbone_direction": str(default_checkpoint_config.get("backbone_direction", "causal")),
     }
 
 
@@ -580,6 +581,7 @@ def _recover_encoder_from_notebook_checkpoint(
         patch_size=int(checkpoint_cfg["patch_size"]),
         patch_stride=int(checkpoint_cfg["patch_stride"]),
         post_proj_norm=str(checkpoint_cfg.get("post_proj_norm", "rms")),
+        backbone_direction=str(checkpoint_cfg.get("backbone_direction", "causal")),
     )
     model_state = payload.get("model_state")
     if model_state is None:
@@ -732,6 +734,7 @@ def build_random_init_probe_state(
             patch_size=int(checkpoint_cfg["patch_size"]),
             patch_stride=int(checkpoint_cfg["patch_stride"]),
             post_proj_norm=str(checkpoint_cfg.get("post_proj_norm", "rms")),
+            backbone_direction=str(checkpoint_cfg.get("backbone_direction", "causal")),
         )
 
     return _build_probe_state(

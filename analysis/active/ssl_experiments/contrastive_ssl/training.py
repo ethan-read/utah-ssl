@@ -42,6 +42,7 @@ class SSLTrainingConfig:
     examples_per_shard: int = 8
     log_every: int = 10
     post_proj_norm: str = "rms"
+    backbone_direction: str = "bidirectional"
     augment_cfg: dict[str, float] = field(
         default_factory=lambda: {
             "noise_std": 0.01,
@@ -60,6 +61,13 @@ class SSLTrainingConfig:
             raise ValueError("patch_stride must be <= patch_size")
         if self.checkpoint_every_steps is not None and int(self.checkpoint_every_steps) <= 0:
             raise ValueError("checkpoint_every_steps must be positive when provided")
+        if self.backbone_direction not in {"causal", "bidirectional"}:
+            raise ValueError("backbone_direction must be one of {'causal', 'bidirectional'}")
+        if self.objective_mode == "future_infonce" and self.backbone_direction != "causal":
+            raise ValueError(
+                "future_infonce requires backbone_direction='causal' to prevent "
+                "future-context leakage in anchor representations."
+            )
 
     def checkpoint_config(self) -> dict[str, Any]:
         return {
@@ -70,6 +78,7 @@ class SSLTrainingConfig:
             "num_layers": int(self.num_layers),
             "dropout": float(self.dropout),
             "post_proj_norm": str(self.post_proj_norm),
+            "backbone_direction": str(self.backbone_direction),
         }
 
 
@@ -174,6 +183,7 @@ def _serialize_ssl_training_config(
         "normalize_impl_version": cache_context.normalize_impl_version,
         "normalize_context_bins": int(cache_context.normalize_context_bins),
         "post_proj_norm": str(config.post_proj_norm),
+        "backbone_direction": str(config.backbone_direction),
         "has_val_datasets": bool(cache_context.has_val_datasets),
         "session_split_summary": cache_context.session_split_summary,
         "cache_root": str(cache_context.cache_root),
@@ -358,9 +368,12 @@ def recover_ssl_run_state_from_checkpoint(
     if not recovered_config and config_path.exists():
         recovered_config = json.loads(config_path.read_text())
 
+    had_backbone_direction = "backbone_direction" in recovered_config
     fallback_payload = asdict(fallback_config) if fallback_config is not None else {}
     for key, value in fallback_payload.items():
         recovered_config.setdefault(key, value)
+    if not had_backbone_direction:
+        recovered_config["backbone_direction"] = "causal"
 
     required_keys = [
         "segment_bins",
@@ -392,6 +405,7 @@ def recover_ssl_run_state_from_checkpoint(
         patch_size=int(recovered_config["patch_size"]),
         patch_stride=int(recovered_config["patch_stride"]),
         post_proj_norm=str(recovered_config.get("post_proj_norm", "rms")),
+        backbone_direction=str(recovered_config.get("backbone_direction", "causal")),
     ).to(device)
     model_state = payload.get("model_state")
     if model_state is None:
@@ -507,6 +521,7 @@ def run_ssl_training(
         patch_size=int(config.patch_size),
         patch_stride=int(config.patch_stride),
         post_proj_norm=str(config.post_proj_norm),
+        backbone_direction=str(config.backbone_direction),
     ).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(),

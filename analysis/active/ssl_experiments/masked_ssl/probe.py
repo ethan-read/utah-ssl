@@ -550,6 +550,7 @@ def _default_checkpoint_config(default_checkpoint_config: dict[str, Any] | None)
         "num_layers": int(default_checkpoint_config["num_layers"]),
         "dropout": float(default_checkpoint_config["dropout"]),
         "post_proj_norm": str(default_checkpoint_config.get("post_proj_norm", "rms")),
+        "backbone_direction": str(default_checkpoint_config.get("backbone_direction", "causal")),
     }
     if "feature_mode" in default_checkpoint_config:
         resolved["feature_mode"] = str(default_checkpoint_config["feature_mode"])
@@ -624,6 +625,7 @@ def _recover_encoder_from_notebook_checkpoint(
         post_proj_norm=str(checkpoint_cfg.get("post_proj_norm", "rms")),
         source_session_keys=tuple(checkpoint_cfg.get("source_session_keys", ())),
         feature_mode=str(checkpoint_cfg.get("feature_mode", "tx_only")),
+        backbone_direction=str(checkpoint_cfg.get("backbone_direction", "causal")),
     )
     model_state = payload.get("model_state")
     if model_state is None:

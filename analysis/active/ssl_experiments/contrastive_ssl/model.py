@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from s5 import S5SequenceBackbone
+from s5 import BidirectionalS5SequenceBackbone, S5SequenceBackbone
 
 
 def sync_device(device: torch.device) -> None:
@@ -61,19 +61,30 @@ class S5ContrastiveEncoder(nn.Module):
         patch_size: int,
         patch_stride: int,
         post_proj_norm: str,
+        backbone_direction: str = "bidirectional",
     ):
         super().__init__()
+        if backbone_direction not in {"causal", "bidirectional"}:
+            raise ValueError("backbone_direction must be one of {'causal', 'bidirectional'}")
         self.input_dim = int(input_dim)
         self.hidden_size = int(hidden_size)
+        self.s5_state_size = int(s5_state_size)
+        self.num_layers = int(num_layers)
         self.patch_size = int(patch_size)
         self.patch_stride = int(patch_stride)
         self.token_dim = self.input_dim * self.patch_size
+        self.backbone_direction = str(backbone_direction)
         self.proj = nn.Linear(self.token_dim, self.hidden_size)
         self.post_proj_norm = RMSNorm(self.hidden_size) if post_proj_norm == "rms" else nn.Identity()
-        self.backbone = S5SequenceBackbone(
+        backbone_cls = (
+            S5SequenceBackbone
+            if self.backbone_direction == "causal"
+            else BidirectionalS5SequenceBackbone
+        )
+        self.backbone = backbone_cls(
             d_model=self.hidden_size,
-            d_state=int(s5_state_size),
-            num_layers=int(num_layers),
+            d_state=self.s5_state_size,
+            num_layers=self.num_layers,
             dropout=float(dropout),
             ffn_multiplier=2.0,
         )
@@ -131,6 +142,7 @@ class ContrastiveSSLModel(nn.Module):
         patch_size: int,
         patch_stride: int,
         post_proj_norm: str,
+        backbone_direction: str = "bidirectional",
     ):
         super().__init__()
         self.encoder = S5ContrastiveEncoder(
@@ -142,6 +154,7 @@ class ContrastiveSSLModel(nn.Module):
             patch_size=patch_size,
             patch_stride=patch_stride,
             post_proj_norm=post_proj_norm,
+            backbone_direction=backbone_direction,
         )
         self.anchor_head = ProjectionHead(hidden_size)
         self.future_head = ProjectionHead(hidden_size)

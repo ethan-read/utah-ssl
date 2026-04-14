@@ -53,6 +53,7 @@ class SSLTrainingConfig:
     log_every: int = 10
     post_proj_norm: str = "rms"
     reconstruction_head_mode: str = "no_output_norm"
+    backbone_direction: str = "bidirectional"
     mask_unit: str = "patch"
     mask_token_placement: str = "before_projection"
     mask_ratio: float = 0.15
@@ -98,6 +99,8 @@ class SSLTrainingConfig:
             raise ValueError(
                 "reconstruction_head_mode must be one of {'with_output_norm', 'no_output_norm'}"
             )
+        if self.backbone_direction not in {"causal", "bidirectional"}:
+            raise ValueError("backbone_direction must be one of {'causal', 'bidirectional'}")
 
     def checkpoint_config(self) -> dict[str, Any]:
         return {
@@ -111,6 +114,7 @@ class SSLTrainingConfig:
             "dropout": float(self.dropout),
             "post_proj_norm": str(self.post_proj_norm),
             "reconstruction_head_mode": str(self.reconstruction_head_mode),
+            "backbone_direction": str(self.backbone_direction),
         }
 
 
@@ -255,6 +259,7 @@ def _serialize_ssl_training_config(
         "log_every": int(config.log_every),
         "post_proj_norm": str(config.post_proj_norm),
         "reconstruction_head_mode": str(config.reconstruction_head_mode),
+        "backbone_direction": str(config.backbone_direction),
         "mask_unit": str(config.mask_unit),
         "mask_token_placement": str(config.mask_token_placement),
         "mask_ratio": float(config.mask_ratio),
@@ -453,11 +458,16 @@ def recover_ssl_run_state_from_checkpoint(
     if not recovered_config and config_path.exists():
         recovered_config = json.loads(config_path.read_text())
 
+    had_reconstruction_head_mode = "reconstruction_head_mode" in recovered_config
+    had_backbone_direction = "backbone_direction" in recovered_config
     fallback_payload = asdict(fallback_config) if fallback_config is not None else {}
     for key, value in fallback_payload.items():
         recovered_config.setdefault(key, value)
     recovered_config.setdefault("boundary_key_mode", "session")
-    recovered_config.setdefault("reconstruction_head_mode", "with_output_norm")
+    if not had_reconstruction_head_mode:
+        recovered_config["reconstruction_head_mode"] = "with_output_norm"
+    if not had_backbone_direction:
+        recovered_config["backbone_direction"] = "causal"
 
     required_keys = [
         "feature_mode",
@@ -520,6 +530,7 @@ def recover_ssl_run_state_from_checkpoint(
         reconstruction_head_mode=str(
             recovered_config.get("reconstruction_head_mode", "with_output_norm")
         ),
+        backbone_direction=str(recovered_config.get("backbone_direction", "causal")),
     ).to(device)
     model_state = payload.get("model_state")
     if model_state is None:
@@ -657,6 +668,7 @@ def run_ssl_training(
         source_session_keys=_source_session_keys_from_cache_context(cache_context),
         feature_mode=str(config.feature_mode),
         reconstruction_head_mode=str(config.reconstruction_head_mode),
+        backbone_direction=str(config.backbone_direction),
     ).to(device)
     optimizer = _build_ssl_optimizer(
         model,

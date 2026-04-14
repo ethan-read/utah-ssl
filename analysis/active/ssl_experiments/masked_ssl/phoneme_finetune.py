@@ -258,6 +258,7 @@ def _recover_stage1_encoder(
         post_proj_norm=str(checkpoint_cfg.get("post_proj_norm", "rms")),
         source_session_keys=tuple(checkpoint_cfg.get("source_session_keys", ())),
         feature_mode=str(checkpoint_cfg.get("feature_mode", "tx_only")),
+        backbone_direction=str(checkpoint_cfg.get("backbone_direction", "causal")),
     )
     model_state = payload.get("model_state")
     if model_state is None:

@@ -5,7 +5,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from s5 import S5SequenceBackbone
+from s5 import BidirectionalS5SequenceBackbone, S5SequenceBackbone
 
 
 def sync_device(device: torch.device) -> None:
@@ -90,15 +90,21 @@ class S5MaskedEncoder(nn.Module):
         post_proj_norm: str,
         source_session_keys: tuple[str, ...] = (),
         feature_mode: str = "tx_only",
+        backbone_direction: str = "bidirectional",
     ):
         del post_proj_norm  # kept for checkpoint compatibility
         super().__init__()
+        if backbone_direction not in {"causal", "bidirectional"}:
+            raise ValueError("backbone_direction must be one of {'causal', 'bidirectional'}")
         self.input_dim = int(input_dim)
         self.hidden_size = int(hidden_size)
+        self.s5_state_size = int(s5_state_size)
+        self.num_layers = int(num_layers)
         self.patch_size = int(patch_size)
         self.patch_stride = int(patch_stride)
         self.token_dim = self.input_dim * self.patch_size
         self.feature_mode = str(feature_mode)
+        self.backbone_direction = str(backbone_direction)
         self.source_session_keys = tuple(str(key) for key in source_session_keys)
         self.source_readin = SessionLinearBank(self.source_session_keys, self.token_dim)
         self.input_patch_embedder = nn.Sequential(
@@ -106,10 +112,15 @@ class S5MaskedEncoder(nn.Module):
             nn.Linear(self.token_dim, self.hidden_size),
             nn.LayerNorm(self.hidden_size),
         )
-        self.backbone = S5SequenceBackbone(
+        backbone_cls = (
+            S5SequenceBackbone
+            if self.backbone_direction == "causal"
+            else BidirectionalS5SequenceBackbone
+        )
+        self.backbone = backbone_cls(
             d_model=self.hidden_size,
-            d_state=int(s5_state_size),
-            num_layers=int(num_layers),
+            d_state=self.s5_state_size,
+            num_layers=self.num_layers,
             dropout=float(dropout),
             ffn_multiplier=2.0,
         )
@@ -260,6 +271,7 @@ class MaskedSSLModel(nn.Module):
         source_session_keys: tuple[str, ...] = (),
         feature_mode: str = "tx_only",
         reconstruction_head_mode: str = "with_output_norm",
+        backbone_direction: str = "bidirectional",
     ):
         super().__init__()
         self.feature_mode = str(feature_mode)
@@ -280,6 +292,7 @@ class MaskedSSLModel(nn.Module):
             post_proj_norm=post_proj_norm,
             source_session_keys=self.source_session_keys,
             feature_mode=self.feature_mode,
+            backbone_direction=backbone_direction,
         )
         self.reverse_patch_embedder = nn.Sequential(
             nn.LayerNorm(self.encoder.hidden_size),

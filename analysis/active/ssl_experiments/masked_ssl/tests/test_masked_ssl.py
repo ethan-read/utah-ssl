@@ -40,6 +40,7 @@ from masked_ssl.probe import (
     recover_downstream_probe_state,
 )
 from masked_ssl.training import recover_ssl_run_state_from_checkpoint
+from s5 import BidirectionalS5SequenceBackbone, S5SequenceBackbone, reverse_padded_sequence
 
 
 def _make_model(
@@ -50,6 +51,7 @@ def _make_model(
     hidden_size: int = 8,
     source_session_keys: tuple[str, ...] = ("s0", "s1"),
     feature_mode: str = "tx_only",
+    backbone_direction: str = "causal",
 ) -> MaskedSSLModel:
     return MaskedSSLModel(
         input_dim=input_dim,
@@ -62,6 +64,7 @@ def _make_model(
         post_proj_norm="rms",
         source_session_keys=source_session_keys,
         feature_mode=feature_mode,
+        backbone_direction=backbone_direction,
     )
 
 
@@ -96,8 +99,8 @@ def _checkpoint_config(model: MaskedSSLModel) -> dict[str, object]:
         "patch_size": model.encoder.patch_size,
         "patch_stride": model.encoder.patch_stride,
         "hidden_size": model.encoder.hidden_size,
-        "s5_state_size": model.encoder.backbone.blocks[0].ssm.d_state,
-        "num_layers": len(model.encoder.backbone.blocks),
+        "s5_state_size": model.encoder.s5_state_size,
+        "num_layers": model.encoder.num_layers,
         "dropout": 0.0,
         "batch_size": 2,
         "seed": 7,
@@ -113,6 +116,7 @@ def _checkpoint_config(model: MaskedSSLModel) -> dict[str, object]:
         "num_spans_mode": "one",
         "allow_bin_fractional_overlap": True,
         "post_proj_norm": "rms",
+        "backbone_direction": model.encoder.backbone_direction,
     }
 
 
@@ -252,6 +256,39 @@ def _write_tiny_canonical_probe_cache(cache_root: Path) -> None:
 
 
 class MaskedSSLTests(unittest.TestCase):
+    def test_reverse_padded_sequence_reverses_only_valid_prefix(self) -> None:
+        x = torch.tensor(
+            [
+                [[1.0], [2.0], [3.0], [0.0], [0.0]],
+                [[4.0], [5.0], [6.0], [7.0], [8.0]],
+            ]
+        )
+        lengths = torch.tensor([3, 5], dtype=torch.long)
+        reversed_x = reverse_padded_sequence(x, lengths)
+        expected = torch.tensor(
+            [
+                [[3.0], [2.0], [1.0], [0.0], [0.0]],
+                [[8.0], [7.0], [6.0], [5.0], [4.0]],
+            ]
+        )
+        self.assertTrue(torch.equal(reversed_x, expected))
+        self.assertTrue(torch.equal(reverse_padded_sequence(reversed_x, lengths), x))
+
+    def test_bidirectional_backbone_matches_causal_shape_and_masks_padding(self) -> None:
+        x = torch.randn(2, 5, 4)
+        lengths = torch.tensor([3, 5], dtype=torch.long)
+        causal = S5SequenceBackbone(d_model=4, d_state=3, num_layers=2, dropout=0.0)
+        bidirectional = BidirectionalS5SequenceBackbone(
+            d_model=4,
+            d_state=3,
+            num_layers=2,
+            dropout=0.0,
+        )
+        causal_out = causal(x, lengths)
+        bidirectional_out = bidirectional(x, lengths)
+        self.assertEqual(tuple(causal_out.shape), tuple(bidirectional_out.shape))
+        self.assertTrue(torch.allclose(bidirectional_out[0, 3:], torch.zeros_like(bidirectional_out[0, 3:])))
+
     def test_tx_only_sampling_returns_only_tx_channels_and_featurewise_normalization(self) -> None:
         session_key = "toy:sess0"
 
@@ -346,7 +383,7 @@ class MaskedSSLTests(unittest.TestCase):
 
     def test_patch_level_multi_patch_span_only_scores_first_masked_token(self) -> None:
         random.seed(4)
-        model = _make_model(input_dim=3, patch_size=1, patch_stride=1)
+        model = _make_model(input_dim=3, patch_size=1, patch_stride=1, backbone_direction="causal")
         batch = {
             "x": torch.randn(1, 6, 3),
             "feature_mask": torch.ones(1, 3),
@@ -371,6 +408,35 @@ class MaskedSSLTests(unittest.TestCase):
         self.assertEqual(loss_idx.numel(), 1)
         self.assertEqual(int(loss_idx[0]), int(masked_idx[0]))
         expected_loss_mask = masked["token_feature_mask"] & loss_token_mask.view(1, -1, 1)
+        self.assertTrue(torch.equal(masked["token_loss_mask"], expected_loss_mask))
+
+    def test_patch_level_multi_patch_span_scores_all_masked_tokens_when_bidirectional(self) -> None:
+        random.seed(4)
+        model = _make_model(
+            input_dim=3,
+            patch_size=1,
+            patch_stride=1,
+            backbone_direction="bidirectional",
+        )
+        batch = {
+            "x": torch.randn(1, 6, 3),
+            "feature_mask": torch.ones(1, 3),
+            "lengths": torch.tensor([6], dtype=torch.long),
+        }
+        masked = build_masked_batch(
+            model,
+            batch,
+            mask_unit="patch",
+            mask_ratio=2.0 / 6.0,
+            span_length_min=2,
+            span_length_max=2,
+            num_spans_mode="one",
+            allow_bin_fractional_overlap=True,
+        )
+        token_mask = masked["token_mask"][0]
+        loss_token_mask = masked["token_loss_token_mask"][0]
+        self.assertTrue(torch.equal(token_mask, loss_token_mask))
+        expected_loss_mask = masked["token_feature_mask"] & token_mask.view(1, -1, 1)
         self.assertTrue(torch.equal(masked["token_loss_mask"], expected_loss_mask))
 
     def test_masked_reconstruction_summary_includes_prediction_and_target_stats(self) -> None:
@@ -467,7 +533,7 @@ class MaskedSSLTests(unittest.TestCase):
         self.assertEqual(outputs.hidden.shape[2], model.encoder.hidden_size)
 
     def test_encoder_prefix_hidden_and_reconstruction_do_not_depend_on_future_inputs(self) -> None:
-        model = _make_model(input_dim=3, patch_size=1, patch_stride=1)
+        model = _make_model(input_dim=3, patch_size=1, patch_stride=1, backbone_direction="causal")
         model.eval()
 
         prefix_length = 4
@@ -514,6 +580,55 @@ class MaskedSSLTests(unittest.TestCase):
             torch.allclose(
                 encoded_a["hidden"][:, prefix_length:],
                 encoded_b["hidden"][:, prefix_length:],
+                atol=1e-6,
+                rtol=1e-6,
+            )
+        )
+
+    def test_bidirectional_encoder_hidden_and_reconstruction_can_depend_on_future_inputs(self) -> None:
+        model = _make_model(
+            input_dim=3,
+            patch_size=1,
+            patch_stride=1,
+            backbone_direction="bidirectional",
+        )
+        model.eval()
+
+        prefix_length = 4
+        x_a = torch.randn(1, 6, 3)
+        x_b = x_a.clone()
+        x_b[:, prefix_length:, 0] *= -3.0
+        x_b[:, prefix_length:, 1] += 7.5
+        x_b[:, prefix_length:, 2] -= 4.25
+        lengths = torch.tensor([6], dtype=torch.long)
+
+        encoded_a = model.encode_sequence(x_a, lengths)
+        encoded_b = model.encode_sequence(x_b, lengths)
+        self.assertFalse(
+            torch.allclose(
+                encoded_a["hidden"][:, :prefix_length],
+                encoded_b["hidden"][:, :prefix_length],
+                atol=1e-6,
+                rtol=1e-6,
+            )
+        )
+
+        recon_a = model.reconstruct_from_patched_tokens(
+            encoded_a["tokens"],
+            encoded_a["token_lengths"],
+            token_mask=None,
+            mask_token_placement="before_projection",
+        )
+        recon_b = model.reconstruct_from_patched_tokens(
+            encoded_b["tokens"],
+            encoded_b["token_lengths"],
+            token_mask=None,
+            mask_token_placement="before_projection",
+        )
+        self.assertFalse(
+            torch.allclose(
+                recon_a["reconstruction"][:, :prefix_length],
+                recon_b["reconstruction"][:, :prefix_length],
                 atol=1e-6,
                 rtol=1e-6,
             )
@@ -691,6 +806,39 @@ class MaskedSSLTests(unittest.TestCase):
         self.assertEqual(state["val_sampler"]["split"], "val")
         self.assertEqual(state["model"].encoder.input_dim, model.encoder.input_dim)
         self.assertEqual(state["model"].feature_mode, model.feature_mode)
+        self.assertEqual(state["model"].encoder.backbone_direction, "causal")
+
+    def test_recover_ssl_run_state_from_checkpoint_preserves_explicit_bidirectional_direction(self) -> None:
+        model = _make_model(backbone_direction="bidirectional")
+        config = _checkpoint_config(model)
+        tmp_path = Path(self._tmp_dir())
+        checkpoint_path = tmp_path / "checkpoint_final.pt"
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        torch.save(
+            {
+                "model_state": model.state_dict(),
+                "config": config,
+                "step": 1,
+                "best_score": 1.0,
+                "best_step": 1,
+                "checkpoint_kind": "final",
+            },
+            checkpoint_path,
+        )
+
+        def _fake_sampler(_cache_context, split_name, **kwargs):
+            return {"split": split_name, **kwargs}
+
+        with mock.patch("masked_ssl.training.build_segment_sampler", new=_fake_sampler):
+            state = recover_ssl_run_state_from_checkpoint(
+                checkpoint_path=checkpoint_path,
+                cache_context=SimpleNamespace(
+                    full_dim=model.encoder.input_dim,
+                    feature_mode=model.feature_mode,
+                ),
+                device=torch.device("cpu"),
+            )
+        self.assertEqual(state["model"].encoder.backbone_direction, "bidirectional")
 
     def test_raw_feature_adapter_starts_as_identity_on_tx_block(self) -> None:
         adapter = RawFeatureAdapter(input_dim=5, output_dim=3)

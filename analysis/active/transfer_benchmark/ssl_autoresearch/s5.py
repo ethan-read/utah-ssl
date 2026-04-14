@@ -19,6 +19,22 @@ def _apply_sequence_mask(x: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor
     return x * mask.to(x.dtype)
 
 
+def reverse_padded_sequence(x: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+    """Reverse only the valid prefix of each sequence, leaving padding aligned."""
+
+    if x.ndim < 2:
+        raise ValueError("reverse_padded_sequence expects a tensor with shape (B, T, ...).")
+
+    seq_len = x.shape[1]
+    positions = torch.arange(seq_len, device=lengths.device).unsqueeze(0)
+    valid_mask = positions < lengths.unsqueeze(1)
+    reversed_positions = (lengths.unsqueeze(1) - 1 - positions).clamp_min(0)
+    gather_positions = torch.where(valid_mask, reversed_positions, positions)
+    view_shape = (*gather_positions.shape, *([1] * (x.ndim - 2)))
+    gather_index = gather_positions.view(view_shape).expand_as(x)
+    return x.gather(dim=1, index=gather_index)
+
+
 class DiagonalS5SSM(nn.Module):
     """Minimal diagonalized MIMO S5 layer with shared complex state."""
 
@@ -145,3 +161,41 @@ class S5SequenceBackbone(nn.Module):
         for block in self.blocks:
             x = block(x, lengths)
         return _apply_sequence_mask(x, lengths)
+
+
+class BidirectionalS5SequenceBackbone(nn.Module):
+    """Bidirectional S5 wrapper using forward/backward towers and learned fusion."""
+
+    def __init__(
+        self,
+        d_model: int,
+        d_state: int,
+        num_layers: int,
+        *,
+        dropout: float = 0.0,
+        ffn_multiplier: float = 2.0,
+    ):
+        super().__init__()
+        self.forward_backbone = S5SequenceBackbone(
+            d_model=d_model,
+            d_state=d_state,
+            num_layers=num_layers,
+            dropout=dropout,
+            ffn_multiplier=ffn_multiplier,
+        )
+        self.backward_backbone = S5SequenceBackbone(
+            d_model=d_model,
+            d_state=d_state,
+            num_layers=num_layers,
+            dropout=dropout,
+            ffn_multiplier=ffn_multiplier,
+        )
+        self.fusion = nn.Linear(2 * d_model, d_model)
+
+    def forward(self, x: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+        forward_hidden = self.forward_backbone(x, lengths)
+        reversed_x = reverse_padded_sequence(x, lengths)
+        backward_hidden_reversed = self.backward_backbone(reversed_x, lengths)
+        backward_hidden = reverse_padded_sequence(backward_hidden_reversed, lengths)
+        fused = self.fusion(torch.cat([forward_hidden, backward_hidden], dim=-1))
+        return _apply_sequence_mask(fused, lengths)
