@@ -202,9 +202,9 @@ class S5MaskedEncoder(nn.Module):
             if token_mask is not None
             else torch.zeros(tokens.shape[:2], device=tokens.device, dtype=torch.bool)
         )
-        if mask_token_placement not in {"before_projection", "after_projection"}:
+        if mask_token_placement not in {"before_projection", "after_projection", "skip"}:
             raise ValueError(
-                "mask_token_placement must be one of {'before_projection', 'after_projection'}"
+                "mask_token_placement must be one of {'before_projection', 'after_projection', 'skip'}"
             )
 
         aligned_tokens = self._apply_token_alignment(
@@ -217,7 +217,7 @@ class S5MaskedEncoder(nn.Module):
             mask_token = self.raw_mask_token.to(device=tokens.device, dtype=tokens.dtype).view(1, 1, -1)
             masked_tokens = torch.where(token_mask_bool.unsqueeze(-1), mask_token, aligned_tokens)
             hidden_input = self.input_patch_embedder(masked_tokens)
-        else:
+        elif mask_token_placement == "after_projection":
             hidden_input = self.input_patch_embedder(aligned_tokens)
             mask_token = self.hidden_mask_token.to(
                 device=hidden_input.device,
@@ -225,6 +225,14 @@ class S5MaskedEncoder(nn.Module):
             ).view(1, 1, -1)
             hidden_input = torch.where(token_mask_bool.unsqueeze(-1), mask_token, hidden_input)
             masked_tokens = aligned_tokens
+        else:
+            # "skip" mode removes masked-token content from encoder input.
+            masked_tokens = torch.where(
+                token_mask_bool.unsqueeze(-1),
+                torch.zeros_like(aligned_tokens),
+                aligned_tokens,
+            )
+            hidden_input = self.input_patch_embedder(masked_tokens)
 
         hidden = self.backbone(hidden_input, token_lengths)
         return {

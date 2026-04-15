@@ -80,9 +80,9 @@ class SSLTrainingConfig:
             raise ValueError("checkpoint_every_steps must be positive when provided")
         if self.mask_unit not in {"patch", "bin"}:
             raise ValueError("mask_unit must be one of {'patch', 'bin'}")
-        if self.mask_token_placement not in {"before_projection", "after_projection"}:
+        if self.mask_token_placement not in {"before_projection", "after_projection", "skip"}:
             raise ValueError(
-                "mask_token_placement must be one of {'before_projection', 'after_projection'}"
+                "mask_token_placement must be one of {'before_projection', 'after_projection', 'skip'}"
             )
         if not (0.0 < float(self.mask_ratio) <= 1.0):
             raise ValueError("mask_ratio must be in the interval (0, 1].")

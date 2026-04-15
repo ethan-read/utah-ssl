@@ -521,8 +521,15 @@ class MaskedSSLTests(unittest.TestCase):
             token_mask=token_mask,
             mask_token_placement="after_projection",
         )
+        skip = model.reconstruct_from_patched_tokens(
+            tokens,
+            token_lengths,
+            token_mask=token_mask,
+            mask_token_placement="skip",
+        )
         self.assertEqual(tuple(before["reconstruction"].shape), tuple(tokens.shape))
         self.assertEqual(tuple(after["reconstruction"].shape), tuple(tokens.shape))
+        self.assertEqual(tuple(skip["reconstruction"].shape), tuple(tokens.shape))
 
         tmp_path = Path(self._tmp_dir())
         checkpoint_path = tmp_path / "checkpoint_final.pt"
