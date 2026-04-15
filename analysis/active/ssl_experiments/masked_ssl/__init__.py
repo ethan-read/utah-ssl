@@ -44,6 +44,14 @@ from .training import (
     resolve_ssl_checkpoint_path,
     run_ssl_training,
 )
+from .training_mae import (
+    SSLTrainingConfig as SSLTrainingConfigMAE,
+    list_ssl_checkpoints as list_ssl_checkpoints_mae,
+    plot_ssl_training_history as plot_ssl_training_history_mae,
+    recover_ssl_run_state_from_checkpoint as recover_ssl_run_state_from_checkpoint_mae,
+    resolve_ssl_checkpoint_path as resolve_ssl_checkpoint_path_mae,
+    run_ssl_training as run_ssl_training_mae,
+)
 
 
 __all__ = [
@@ -65,4 +73,10 @@ __all__ = [
     "run_phoneme_finetuning",
     "run_probe_head_sweep",
     "run_ssl_training",
+    "SSLTrainingConfigMAE",
+    "list_ssl_checkpoints_mae",
+    "plot_ssl_training_history_mae",
+    "recover_ssl_run_state_from_checkpoint_mae",
+    "resolve_ssl_checkpoint_path_mae",
+    "run_ssl_training_mae",
 ]

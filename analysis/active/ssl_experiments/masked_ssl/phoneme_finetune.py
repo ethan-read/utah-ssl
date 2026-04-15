@@ -17,6 +17,8 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from .model import S5MaskedEncoder
+from .model_mae import MAX_PATCH_COUNT as MAE_MAX_PATCH_COUNT
+from .model_mae import S5MaskedEncoder as MAES5MaskedEncoder
 from .probe import (
     CanonicalSequenceDataset,
     DownstreamProbeConfig,
@@ -229,7 +231,7 @@ def _recover_stage1_encoder(
     *,
     checkpoint_path: Path,
     map_location: str | torch.device = "cpu",
-) -> tuple[S5MaskedEncoder, dict[str, Any], Path]:
+) -> tuple[nn.Module, dict[str, Any], Path]:
     payload = torch.load(checkpoint_path, map_location=map_location)
     checkpoint_cfg = dict(payload.get("config", {}))
     required_keys = [
@@ -247,19 +249,6 @@ def _recover_stage1_encoder(
             f"Checkpoint config is missing keys needed for phoneme fine-tuning: {missing}"
         )
 
-    base_encoder = S5MaskedEncoder(
-        input_dim=int(checkpoint_cfg["input_dim"]),
-        hidden_size=int(checkpoint_cfg["hidden_size"]),
-        s5_state_size=int(checkpoint_cfg["s5_state_size"]),
-        num_layers=int(checkpoint_cfg["num_layers"]),
-        dropout=float(checkpoint_cfg["dropout"]),
-        patch_size=int(checkpoint_cfg["patch_size"]),
-        patch_stride=int(checkpoint_cfg["patch_stride"]),
-        post_proj_norm=str(checkpoint_cfg.get("post_proj_norm", "rms")),
-        source_session_keys=tuple(checkpoint_cfg.get("source_session_keys", ())),
-        feature_mode=str(checkpoint_cfg.get("feature_mode", "tx_only")),
-        backbone_direction=str(checkpoint_cfg.get("backbone_direction", "causal")),
-    )
     model_state = payload.get("model_state")
     if model_state is None:
         raise KeyError("Stage-1 checkpoint is missing 'model_state'.")
@@ -270,6 +259,68 @@ def _recover_stage1_encoder(
     }
     if not encoder_state:
         raise KeyError("Stage-1 checkpoint does not contain encoder weights.")
+    inferred_source_session_keys = tuple(str(key) for key in checkpoint_cfg.get("source_session_keys", ()))
+    if not inferred_source_session_keys:
+        module_keys = sorted(
+            {
+                key[len("source_readin.layers.") : -len(".weight")]
+                for key in encoder_state.keys()
+                if key.startswith("source_readin.layers.") and key.endswith(".weight")
+            }
+        )
+        inferred_source_session_keys = tuple(
+            module_key.replace("_dot_", ".").replace("_slash_", "/")
+            for module_key in module_keys
+        )
+
+    is_mae_checkpoint = (
+        str(checkpoint_cfg.get("objective_mode", "")) == "masked_reconstruction_mae"
+        or "encoder_pos_embed" in encoder_state
+    )
+    if is_mae_checkpoint:
+        max_patches = checkpoint_cfg.get("max_patches")
+        if max_patches is None and "segment_bins" in checkpoint_cfg:
+            max_patches = int(
+                MAE_MAX_PATCH_COUNT(
+                    int(checkpoint_cfg["segment_bins"]),
+                    int(checkpoint_cfg["patch_size"]),
+                    int(checkpoint_cfg["patch_stride"]),
+                )
+            )
+        if max_patches is None and "encoder_pos_embed" in encoder_state:
+            max_patches = int(encoder_state["encoder_pos_embed"].shape[1])
+        if max_patches is None:
+            raise KeyError(
+                "MAE checkpoint is missing max_patches and could not infer it from config/state."
+            )
+        base_encoder = MAES5MaskedEncoder(
+            input_dim=int(checkpoint_cfg["input_dim"]),
+            hidden_size=int(checkpoint_cfg["hidden_size"]),
+            s5_state_size=int(checkpoint_cfg["s5_state_size"]),
+            num_layers=int(checkpoint_cfg["num_layers"]),
+            dropout=float(checkpoint_cfg["dropout"]),
+            patch_size=int(checkpoint_cfg["patch_size"]),
+            patch_stride=int(checkpoint_cfg["patch_stride"]),
+            post_proj_norm=str(checkpoint_cfg.get("post_proj_norm", "rms")),
+            max_patches=int(max_patches),
+            source_session_keys=inferred_source_session_keys,
+            feature_mode=str(checkpoint_cfg.get("feature_mode", "tx_only")),
+            backbone_direction=str(checkpoint_cfg.get("backbone_direction", "bidirectional")),
+        )
+    else:
+        base_encoder = S5MaskedEncoder(
+            input_dim=int(checkpoint_cfg["input_dim"]),
+            hidden_size=int(checkpoint_cfg["hidden_size"]),
+            s5_state_size=int(checkpoint_cfg["s5_state_size"]),
+            num_layers=int(checkpoint_cfg["num_layers"]),
+            dropout=float(checkpoint_cfg["dropout"]),
+            patch_size=int(checkpoint_cfg["patch_size"]),
+            patch_stride=int(checkpoint_cfg["patch_stride"]),
+            post_proj_norm=str(checkpoint_cfg.get("post_proj_norm", "rms")),
+            source_session_keys=inferred_source_session_keys,
+            feature_mode=str(checkpoint_cfg.get("feature_mode", "tx_only")),
+            backbone_direction=str(checkpoint_cfg.get("backbone_direction", "causal")),
+        )
     base_encoder.load_state_dict(encoder_state)
     return base_encoder, checkpoint_cfg, _ssl_run_dir_from_checkpoint_path(checkpoint_path)
 
