@@ -16,6 +16,7 @@ from typing import Any, Sequence
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 try:
     import psutil
@@ -38,6 +39,7 @@ class CacheAccessConfig:
     sbp_dim: int = 256
     feature_mode: str = "tx_only"
     boundary_key_mode: str = "session"
+    gaussian_smoothing_sigma_bins: float = 0.0
     shard_cache_ram_gb: float | None = None
 
     def __post_init__(self) -> None:
@@ -55,6 +57,8 @@ class CacheAccessConfig:
             raise ValueError(
                 "boundary_key_mode must be one of {'session', 'subject_if_available'}"
             )
+        if float(self.gaussian_smoothing_sigma_bins) < 0.0:
+            raise ValueError("gaussian_smoothing_sigma_bins must be non-negative")
         if self.normalize_impl_version not in {"segment_prefix_v1", "session_featurewise_v1"}:
             raise ValueError(
                 "normalize_impl_version must be one of {'segment_prefix_v1', 'session_featurewise_v1'}"
@@ -140,6 +144,10 @@ class CacheContext:
     @property
     def normalize_impl_version(self) -> str:
         return str(self.config.normalize_impl_version)
+
+    @property
+    def gaussian_smoothing_sigma_bins(self) -> float:
+        return float(self.config.gaussian_smoothing_sigma_bins)
 
 
 def _format_bytes(num_bytes: int) -> str:
@@ -488,6 +496,66 @@ def _normalize_segment_session_featurewise(
     return x_norm
 
 
+def _gaussian_kernel_1d(
+    sigma_bins: float,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    radius: int | None = None,
+) -> torch.Tensor:
+    sigma = float(sigma_bins)
+    if sigma <= 0.0:
+        return torch.ones((1,), device=device, dtype=dtype)
+    effective_radius = (
+        int(radius)
+        if radius is not None
+        else max(1, int(math.ceil(4.0 * sigma)))
+    )
+    positions = torch.arange(
+        -effective_radius,
+        effective_radius + 1,
+        device=device,
+        dtype=dtype,
+    )
+    kernel = torch.exp(-0.5 * (positions / sigma).pow(2))
+    return kernel / kernel.sum().clamp_min(1e-8)
+
+
+def _apply_gaussian_smoothing(
+    x_seq: torch.Tensor,
+    feature_mask: torch.Tensor,
+    *,
+    sigma_bins: float,
+) -> torch.Tensor:
+    sigma = float(sigma_bins)
+    if sigma <= 0.0 or x_seq.shape[0] <= 1:
+        return x_seq
+    present_idx = torch.nonzero(feature_mask.bool(), as_tuple=False).squeeze(1)
+    if present_idx.numel() == 0:
+        return x_seq
+
+    max_reflect_radius = int(x_seq.shape[0] - 1)
+    if max_reflect_radius <= 0:
+        return x_seq
+    kernel_radius = min(max(1, int(math.ceil(4.0 * sigma))), max_reflect_radius)
+    kernel = _gaussian_kernel_1d(
+        sigma,
+        device=x_seq.device,
+        dtype=x_seq.dtype,
+        radius=kernel_radius,
+    )
+    kernel = kernel / kernel.sum().clamp_min(1e-8)
+
+    selected = x_seq[:, present_idx].transpose(0, 1).unsqueeze(0)  # (1, C, T)
+    padded = F.pad(selected, (kernel_radius, kernel_radius), mode="reflect")
+    weight = kernel.view(1, 1, -1).expand(selected.shape[1], 1, -1)
+    smoothed = F.conv1d(padded, weight, groups=selected.shape[1]).squeeze(0).transpose(0, 1)
+
+    out = x_seq.clone()
+    out[:, present_idx] = smoothed
+    return out
+
+
 def _session_stat_key(dataset: str, session_id: str) -> str:
     return f"{dataset}:{session_id}"
 
@@ -674,9 +742,21 @@ def sample_base_segment(
         session_feature_stats=cache_context.session_feature_stats,
         session_key=session_key,
     )
+    sigma_bins = float(
+        getattr(
+            cache_context,
+            "gaussian_smoothing_sigma_bins",
+            getattr(getattr(cache_context, "config", object()), "gaussian_smoothing_sigma_bins", 0.0),
+        )
+    )
+    x_preprocessed = _apply_gaussian_smoothing(
+        x_norm,
+        feature_mask_t,
+        sigma_bins=sigma_bins,
+    )
 
     return {
-        "x": x_norm,
+        "x": x_preprocessed,
         "feature_mask": feature_mask_t,
         "length": int(segment_bins),
         "dataset": example.dataset,
