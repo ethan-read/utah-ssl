@@ -19,7 +19,11 @@ for path in (REPO_ROOT, EXPERIMENTS_DIR):
     if path_str not in sys.path:
         sys.path.insert(0, path_str)
 
-from masked_ssl.cache import _apply_gaussian_smoothing, sample_base_segment
+from masked_ssl.cache import (
+    _apply_gaussian_smoothing,
+    _compute_session_feature_stats,
+    sample_base_segment,
+)
 from masked_ssl.model import MaskedSSLModel, SessionLinearBank
 from masked_ssl.objectives import (
     build_masked_batch,
@@ -396,6 +400,45 @@ class MaskedSSLTests(unittest.TestCase):
         )
         self.assertEqual(tuple(sample["x"].shape), (segment_bins, 1))
         self.assertTrue(torch.allclose(sample["x"], expected_smoothed, atol=1e-5, rtol=1e-5))
+
+    def test_session_feature_stats_bin_stride_uses_subsampled_time_bins(self) -> None:
+        class _DummyShardStore:
+            def get(self, _shard_relpath):
+                return {
+                    "time_offsets": np.array([0, 10], dtype=np.int64),
+                    "tx": np.arange(10, dtype=np.float32).reshape(10, 1),
+                    "sbp": None,
+                }
+
+        row = SimpleNamespace(
+            dataset="toy",
+            session_id="sess0",
+            subject_id="subj0",
+            shard_relpath="toy/shard0",
+            example_index=0,
+            n_time_bins=10,
+            has_tx=True,
+            has_sbp=False,
+            n_tx_features=1,
+            n_sbp_features=0,
+        )
+        config = SimpleNamespace(
+            full_dim=1,
+            tx_dim=1,
+            sbp_dim=1,
+            feature_mode="tx_only",
+            gaussian_smoothing_sigma_bins=0.0,
+            session_stats_bin_stride=2,
+        )
+
+        stats = _compute_session_feature_stats(
+            _DummyShardStore(),
+            rows_by_dataset={"toy": [row]},
+            config=config,
+        )
+        mean, std = stats["toy:sess0"]
+        self.assertAlmostEqual(float(mean[0]), 4.0, places=6)
+        self.assertAlmostEqual(float(std[0]), float(np.sqrt(8.0)), places=6)
 
     def test_sample_mask_indices_one_span_is_contiguous_and_matches_target_count(self) -> None:
         random.seed(0)

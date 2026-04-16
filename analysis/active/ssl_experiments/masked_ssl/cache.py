@@ -40,6 +40,7 @@ class CacheAccessConfig:
     feature_mode: str = "tx_only"
     boundary_key_mode: str = "session"
     gaussian_smoothing_sigma_bins: float = 0.0
+    session_stats_bin_stride: int = 1
     shard_cache_ram_gb: float | None = None
 
     def __post_init__(self) -> None:
@@ -59,6 +60,19 @@ class CacheAccessConfig:
             )
         if float(self.gaussian_smoothing_sigma_bins) < 0.0:
             raise ValueError("gaussian_smoothing_sigma_bins must be non-negative")
+        stride_value = self.session_stats_bin_stride
+        if isinstance(stride_value, bool):
+            raise ValueError("session_stats_bin_stride must be a positive integer")
+        try:
+            stride_float = float(stride_value)
+            stride_int = int(stride_value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("session_stats_bin_stride must be a positive integer") from exc
+        if not math.isfinite(stride_float) or abs(stride_float - float(stride_int)) > 1e-9:
+            raise ValueError("session_stats_bin_stride must be a positive integer")
+        if stride_int <= 0:
+            raise ValueError("session_stats_bin_stride must be a positive integer")
+        self.session_stats_bin_stride = stride_int
         if self.normalize_impl_version not in {"segment_prefix_v1", "session_featurewise_v1"}:
             raise ValueError(
                 "normalize_impl_version must be one of {'segment_prefix_v1', 'session_featurewise_v1'}"
@@ -591,6 +605,7 @@ def _compute_session_feature_stats(
     session_stats: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
     total_sessions = len(session_rows)
     smoothing_sigma_bins = float(config.gaussian_smoothing_sigma_bins)
+    bin_stride = int(config.session_stats_bin_stride)
 
     for session_idx, session_key in enumerate(sorted(session_rows), start=1):
         rows = session_rows[session_key]
@@ -604,14 +619,15 @@ def _compute_session_feature_stats(
             assert isinstance(time_offsets, np.ndarray)
             start = int(time_offsets[row.example_index])
             stop = int(time_offsets[row.example_index + 1])
-            row_len = int(max(stop - start, 0))
+            raw_len = int(max(stop - start, 0))
+            row_len = int((raw_len + bin_stride - 1) // bin_stride)
             if row_len <= 0:
                 continue
 
             if smoothing_sigma_bins <= 0.0:
                 tx = shard["tx"]
                 if isinstance(tx, np.ndarray):
-                    tx_window = np.asarray(tx[start:stop], dtype=np.float64)
+                    tx_window = np.asarray(tx[start:stop:bin_stride], dtype=np.float64)
                     tx_dim = min(tx_window.shape[1], config.tx_dim)
                     sum_x[:tx_dim] += tx_window[:, :tx_dim].sum(axis=0)
                     sum_x2[:tx_dim] += np.square(tx_window[:, :tx_dim]).sum(axis=0)
@@ -619,7 +635,7 @@ def _compute_session_feature_stats(
 
                 sbp = shard["sbp"]
                 if config.feature_mode == "tx_sbp" and isinstance(sbp, np.ndarray):
-                    sbp_window = np.asarray(sbp[start:stop], dtype=np.float64)
+                    sbp_window = np.asarray(sbp[start:stop:bin_stride], dtype=np.float64)
                     sbp_dim = min(sbp_window.shape[1], config.sbp_dim)
                     sbp_slice = slice(config.tx_dim, config.tx_dim + sbp_dim)
                     sum_x[sbp_slice] += sbp_window[:, :sbp_dim].sum(axis=0)
@@ -632,14 +648,14 @@ def _compute_session_feature_stats(
 
             tx = shard["tx"]
             if isinstance(tx, np.ndarray):
-                tx_window = np.asarray(tx[start:stop], dtype=np.float32)
+                tx_window = np.asarray(tx[start:stop:bin_stride], dtype=np.float32)
                 tx_dim = min(tx_window.shape[1], config.tx_dim)
                 row_x[:, :tx_dim] = tx_window[:, :tx_dim]
                 row_feature_mask[:tx_dim] = 1.0
 
             sbp = shard["sbp"]
             if config.feature_mode == "tx_sbp" and isinstance(sbp, np.ndarray):
-                sbp_window = np.asarray(sbp[start:stop], dtype=np.float32)
+                sbp_window = np.asarray(sbp[start:stop:bin_stride], dtype=np.float32)
                 sbp_dim = min(sbp_window.shape[1], config.sbp_dim)
                 row_x[:, config.tx_dim : config.tx_dim + sbp_dim] = sbp_window[:, :sbp_dim]
                 row_feature_mask[config.tx_dim : config.tx_dim + sbp_dim] = 1.0
