@@ -19,7 +19,7 @@ for path in (REPO_ROOT, EXPERIMENTS_DIR):
     if path_str not in sys.path:
         sys.path.insert(0, path_str)
 
-from masked_ssl.cache import sample_base_segment
+from masked_ssl.cache import _apply_gaussian_smoothing, sample_base_segment
 from masked_ssl.model import MaskedSSLModel, SessionLinearBank
 from masked_ssl.objectives import (
     build_masked_batch,
@@ -339,6 +339,63 @@ class MaskedSSLTests(unittest.TestCase):
             - torch.tensor([1.0, 2.0, 3.0, 4.0])
         ) / 2.0
         self.assertTrue(torch.allclose(sample["x"], expected))
+
+    def test_sampling_with_smoothing_matches_full_row_smooth_then_crop(self) -> None:
+        session_key = "toy:sess0"
+        tx_series = np.arange(10, dtype=np.float32).reshape(10, 1)
+
+        class _DummyShardStore:
+            def get(self, _shard_relpath):
+                return {
+                    "time_offsets": np.array([0, 10], dtype=np.int64),
+                    "tx": tx_series,
+                    "sbp": None,
+                }
+
+        cache_context = SimpleNamespace(
+            full_dim=1,
+            tx_dim=1,
+            sbp_dim=1,
+            feature_mode="tx_only",
+            boundary_key_mode="subject_if_available",
+            shard_store=_DummyShardStore(),
+            normalize_context_bins=2,
+            normalize_impl_version="session_featurewise_v1",
+            gaussian_smoothing_sigma_bins=1.0,
+            session_feature_stats={
+                session_key: (
+                    torch.zeros(1, dtype=torch.float32),
+                    torch.ones(1, dtype=torch.float32),
+                )
+            },
+        )
+        example = SimpleNamespace(
+            dataset="toy",
+            session_id="sess0",
+            subject_id="subj0",
+            shard_relpath="unused",
+            example_index=0,
+            has_tx=True,
+            has_sbp=False,
+        )
+
+        segment_bins = 4
+        rng_seed = 9
+        expected_offset = random.Random(rng_seed).randrange(10 - segment_bins + 1)
+        expected_smoothed = _apply_gaussian_smoothing(
+            torch.from_numpy(tx_series.copy()),
+            torch.ones(1, dtype=torch.float32),
+            sigma_bins=1.0,
+        )[expected_offset : expected_offset + segment_bins]
+
+        sample = sample_base_segment(
+            cache_context,
+            example,
+            segment_bins=segment_bins,
+            py_rng=random.Random(rng_seed),
+        )
+        self.assertEqual(tuple(sample["x"].shape), (segment_bins, 1))
+        self.assertTrue(torch.allclose(sample["x"], expected_smoothed, atol=1e-5, rtol=1e-5))
 
     def test_sample_mask_indices_one_span_is_contiguous_and_matches_target_count(self) -> None:
         random.seed(0)
