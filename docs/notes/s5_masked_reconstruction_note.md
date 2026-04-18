@@ -12,6 +12,42 @@ Possible future architecture directions are intentionally deferred to a separate
 - a masked-reconstruction objective seemed worth trying as a more direct signal-modeling alternative
 - the goal was to keep the setup causal and `S5`-based rather than switching to a bidirectional encoder
 
+## Latest Run Snapshot (Hyperparams + Result)
+
+- objective: masked reconstruction (`loss_mode="masked_only"`, `reconstruct_target="raw_patch"`)
+- backbone: `S5`, `backbone_direction="bidirectional"`, `num_layers=4`, `hidden_size=256`, `s5_state_size=128`
+- patching: `patch_size=4`, `patch_stride=2`
+- masking:
+  - `mask_unit="patch"`
+  - `mask_ratio=0.15`
+  - `span_length_min=2`
+  - `span_length_max=4`
+  - `num_spans_mode="multiple"`
+  - `mask_token_placement="before_projection"`
+- decoder head: `reconstruction_head_type="mlp"`
+- optimization: `batch_size=32`, `learning_rate=1e-4`, `weight_decay=0`, `dropout=0`
+- preprocessing:
+  - `normalize_impl_version="session_featurewise_v1"`
+  - gaussian smoothing enabled with `gaussian_smoothing_sigma_bins=2.0`
+  - run used precomputed smoothed session stats from Drive
+- result (single run):
+  - at `step=5000`, train loss reached `0.47` and had not plateaued yet
+  - validation loss on a different session reached `0.70`
+
+## Sweep Update (Smoothing Sigma)
+
+- a small sweep over `gaussian_smoothing_sigma_bins in {1.0, 2.0}` and `mask_ratio in {0.15, 0.25}` was run (`1500` SSL steps + short probe)
+- tentative read:
+  - `sigma=2.0` looked better for SSL reconstruction loss (lower train/val loss than `sigma=1.0` in matched settings)
+  - `sigma=2.0` also produced longer probe outputs (`output_len_over_desired_len` higher), i.e. less under-generation
+- downstream CTC/PER differences were small across these short probes, so this should be treated as directional rather than final
+
+## Zero-Predictor Baseline Update
+
+- on the currently smoothed and normalized data, the constant-zero predictor MSE appears to be `0.95+` for the active sessions
+- this means the trivial baseline is still close to `1.0`, but future reconstruction losses should be compared to the measured session/mask-specific zero baseline rather than assuming exactly `1.0`
+- a model loss around `0.75` is therefore a real improvement over the zero predictor, but only a modest one; downstream probe behavior remains the key test of whether the representation is useful
+
 ## What Has Been Implemented
 
 - a new reusable package at `analysis/active/ssl_experiments/masked_ssl`

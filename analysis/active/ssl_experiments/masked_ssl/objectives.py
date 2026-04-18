@@ -24,6 +24,8 @@ def summarize_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
         "masked_target_mean": float(metrics["masked_target_mean"]),
         "masked_target_std": float(metrics["masked_target_std"]),
     }
+    if "masked_prediction_target_corr" in metrics:
+        summary["masked_prediction_target_corr"] = float(metrics["masked_prediction_target_corr"])
     if "patch_fraction_weighted_mse" in metrics:
         summary["patch_fraction_weighted_mse"] = float(metrics["patch_fraction_weighted_mse"])
     return summary
@@ -281,6 +283,16 @@ def compute_masked_reconstruction_metrics(
     loss = (sqerr * element_weights).sum() / loss_denom
     masked_predictions = reconstruction[token_loss_mask]
     masked_targets = tokens[token_loss_mask]
+    prediction_centered = masked_predictions - masked_predictions.mean()
+    target_centered = masked_targets - masked_targets.mean()
+    corr_denom = prediction_centered.norm() * target_centered.norm()
+    corr_denom_value = float(corr_denom.detach().cpu().item())
+    prediction_target_corr = (
+        float((prediction_centered * target_centered).sum().detach().cpu().item())
+        / corr_denom_value
+        if corr_denom_value > 1e-8
+        else 0.0
+    )
 
     token_feature_weights = token_feature_mask.to(sqerr.dtype)
     per_token_full_patch_mse = (
@@ -311,6 +323,7 @@ def compute_masked_reconstruction_metrics(
         "masked_prediction_std": float(masked_predictions.std(unbiased=False).detach().cpu().item()),
         "masked_target_mean": float(masked_targets.mean().detach().cpu().item()),
         "masked_target_std": float(masked_targets.std(unbiased=False).detach().cpu().item()),
+        "masked_prediction_target_corr": prediction_target_corr,
     }
 
     if mask_unit == "bin":

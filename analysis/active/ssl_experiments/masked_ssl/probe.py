@@ -28,6 +28,54 @@ from .training import resolve_ssl_checkpoint_path
 
 
 DEFAULT_PROBE_SUMMARY_BASENAME = "downstream_probe_summary.json"
+DEFAULT_PHONEME_VOCABULARY = {
+    "index_to_symbol": [
+        "BLANK",
+        "AA",
+        "AE",
+        "AH",
+        "AO",
+        "AW",
+        "AY",
+        "B",
+        "CH",
+        "D",
+        "DH",
+        "EH",
+        "ER",
+        "EY",
+        "F",
+        "G",
+        "HH",
+        "IH",
+        "IY",
+        "JH",
+        "K",
+        "L",
+        "M",
+        "N",
+        "NG",
+        "OW",
+        "OY",
+        "P",
+        "R",
+        "S",
+        "SH",
+        "T",
+        "TH",
+        "UH",
+        "UW",
+        "V",
+        "W",
+        "Y",
+        "Z",
+        "ZH",
+        "SIL",
+    ],
+    "num_classes": 41,
+    "blank_index": 0,
+    "sil_index": 40,
+}
 
 
 @dataclass
@@ -324,6 +372,13 @@ def _load_probe_metadata_json(metadata_path: Path) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError(f"Expected dict probe metadata at {metadata_path}, got {type(payload).__name__}")
     return payload
+
+
+def _resolve_phoneme_vocabulary(metadata: dict[str, Any]) -> dict[str, Any]:
+    vocab = metadata.get("phoneme_vocabulary")
+    if isinstance(vocab, dict) and "index_to_symbol" in vocab:
+        return vocab
+    return DEFAULT_PHONEME_VOCABULARY
 
 
 def _load_canonical_probe_manifest(manifest_path: Path) -> list[CanonicalProbeManifestRow]:
@@ -938,7 +993,7 @@ def build_downstream_probe_problem(
         "target_val_examples_by_session": target_val_examples_by_session,
         "target_train_rows": target_train_rows,
         "target_val_rows": target_val_rows,
-        "vocab": metadata["phoneme_vocabulary"],
+        "vocab": _resolve_phoneme_vocabulary(metadata),
         "cache_root": Path(cache_root),
         "feature_mode": str(feature_mode),
         "boundary_key_mode": str(boundary_key_mode),

@@ -358,6 +358,9 @@ def list_ssl_checkpoints(run_dir: str | Path) -> list[dict[str, Any]]:
     final_path = run_dir / "checkpoint_final.pt"
     if final_path.exists():
         checkpoint_paths.append(final_path)
+    best_path = run_dir / "checkpoint_best.pt"
+    if best_path.exists():
+        checkpoint_paths.append(best_path)
 
     rows: list[dict[str, Any]] = []
     for path in checkpoint_paths:
@@ -365,6 +368,9 @@ def list_ssl_checkpoints(run_dir: str | Path) -> list[dict[str, Any]]:
             "path": str(path),
             "name": path.name,
             "kind": (
+                "best"
+                if path.name == "checkpoint_best.pt"
+                else
                 "final"
                 if path.name == "checkpoint_final.pt" or path.name.startswith("checkpoint_final_step_")
                 else "step"
@@ -609,6 +615,7 @@ def recover_ssl_run_state_from_checkpoint(
         "run_dir": run_dir,
         "progress_path": progress_path,
         "checkpoint_path": resolved_checkpoint_path,
+        "best_checkpoint_path": run_dir / "checkpoint_best.pt",
         "checkpoints_dir": run_dir / "checkpoints",
         "plot_loss_path": run_dir / "loss_curve.png",
         "plot_metric_path": metric_plot_path,
@@ -694,6 +701,7 @@ def run_ssl_training(
     run_dir.mkdir(parents=True, exist_ok=True)
     progress_path = run_dir / "progress.jsonl"
     checkpoint_path = run_dir / "checkpoint_final.pt"
+    best_checkpoint_path = run_dir / "checkpoint_best.pt"
     checkpoints_dir = run_dir / "checkpoints"
     plot_loss_path = run_dir / "loss_curve.png"
     plot_metric_path = run_dir / "masked_metric_curve.png"
@@ -832,9 +840,7 @@ def run_ssl_training(
             )
             print("saved_step_checkpoint:", step_checkpoint_path)
 
-    if best_state is not None:
-        model.load_state_dict(best_state)
-    else:
+    if best_state is None:
         best_state = {
             key: value.detach().cpu().clone() for key, value in model.state_dict().items()
         }
@@ -856,9 +862,17 @@ def run_ssl_training(
     checkpoints_dir.mkdir(parents=True, exist_ok=True)
     torch.save(final_payload, timestamped_final_checkpoint_path)
 
+    best_payload = dict(final_payload)
+    best_payload["model_state"] = best_state
+    best_payload["optimizer_state"] = None
+    best_payload["step"] = int(best_step if best_step is not None else config.num_steps)
+    best_payload["checkpoint_kind"] = "best"
+    torch.save(best_payload, best_checkpoint_path)
+
     print("run_dir:", run_dir)
     print("progress_path:", progress_path)
     print("checkpoint_path:", checkpoint_path)
+    print("best_checkpoint_path:", best_checkpoint_path)
     if config.checkpoint_every_steps is not None:
         print("checkpoints_dir:", checkpoints_dir)
     print("timestamped_final_checkpoint_path:", timestamped_final_checkpoint_path)
@@ -875,6 +889,7 @@ def run_ssl_training(
         "run_dir": run_dir,
         "progress_path": progress_path,
         "checkpoint_path": checkpoint_path,
+        "best_checkpoint_path": best_checkpoint_path,
         "checkpoints_dir": checkpoints_dir,
         "plot_loss_path": plot_loss_path,
         "plot_metric_path": plot_metric_path,
@@ -886,6 +901,233 @@ def run_ssl_training(
         "val_history": val_history,
         "dataset_counts": dict(dataset_counter),
     }
+
+
+def resume_ssl_training(
+    *,
+    run_state: dict[str, Any],
+    additional_steps: int,
+    cache_context: CacheContext,
+    device: torch.device,
+) -> dict[str, Any]:
+    """Continue an in-memory SSL run and update final/best checkpoints.
+
+    The final checkpoint keeps the final-step model and optimizer state so it is
+    suitable for continued training. Best weights are written separately to
+    ``checkpoint_best.pt`` when this resume pass finds a new best score.
+    """
+    model = run_state["model"]
+    optimizer = run_state["optimizer"]
+    train_sampler = run_state["train_sampler"]
+    val_sampler = run_state["val_sampler"]
+
+    run_dir = Path(run_state["run_dir"])
+    progress_path = Path(run_state["progress_path"])
+    checkpoint_path = run_dir / "checkpoint_final.pt"
+    best_checkpoint_path = Path(run_state.get("best_checkpoint_path", run_dir / "checkpoint_best.pt"))
+    checkpoints_dir = Path(run_state["checkpoints_dir"])
+    checkpoints_dir.mkdir(parents=True, exist_ok=True)
+
+    config_payload = dict(run_state["config"])
+    train_history = list(run_state.get("train_history", []))
+    val_history = list(run_state.get("val_history", []))
+
+    actionable_steps = [
+        int(record["step"]) for record in train_history if int(record.get("step", 0)) > 0
+    ]
+    start_step = max(actionable_steps) if actionable_steps else int(run_state.get("checkpoint_step", 0) or 0)
+
+    additional_steps = int(additional_steps)
+    if additional_steps <= 0:
+        raise ValueError(f"additional_steps must be positive, got {additional_steps}")
+
+    target_step = start_step + additional_steps
+    config_payload["num_steps"] = int(target_step)
+
+    dataset_counter = Counter(run_state.get("dataset_counts", {}))
+    best_score = float(run_state["best_score"]) if run_state.get("best_score") is not None else float("inf")
+    best_step = int(run_state["best_step"]) if run_state.get("best_step") is not None else None
+    best_state = None
+
+    log_every = int(config_payload.get("log_every", 10))
+    val_every = int(config_payload.get("val_every", 50))
+    val_batches = int(config_payload.get("val_batches", 10))
+
+    print("Continuing in-memory masked SSL training")
+    print(" - run_dir:", run_dir)
+    print(" - start_step:", start_step)
+    print(" - target_step:", target_step)
+    print(" - mask_ratio:", float(config_payload["mask_ratio"]))
+
+    resume_start_time = time.time()
+
+    for step in range(start_step + 1, target_step + 1):
+        model.train()
+        optimizer.zero_grad(set_to_none=True)
+
+        sample_start = time.time()
+        batch = train_sampler.sample_batch()
+        sample_seconds = time.time() - sample_start
+        dataset_mix = dict(Counter(batch["datasets"]))
+        dataset_counter.update(batch["datasets"])
+
+        sync_device(device)
+        model_start = time.time()
+        metrics = compute_objective_metrics(
+            model,
+            batch,
+            mask_unit=str(config_payload["mask_unit"]),
+            mask_token_placement=str(config_payload["mask_token_placement"]),
+            mask_ratio=float(config_payload["mask_ratio"]),
+            span_length_min=int(config_payload["span_length_min"]),
+            span_length_max=int(config_payload["span_length_max"]),
+            num_spans_mode=str(config_payload["num_spans_mode"]),
+            allow_bin_fractional_overlap=bool(config_payload["allow_bin_fractional_overlap"]),
+            device=device,
+        )
+        loss = metrics["loss"]
+        loss.backward()
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+        sync_device(device)
+        model_seconds = time.time() - model_start
+
+        summary = summarize_metrics(metrics)
+        shard_summary = cache_context.shard_store.summary()
+        train_record = {
+            "event": "train",
+            "step": step,
+            "elapsed_seconds": float(time.time() - resume_start_time),
+            "sample_seconds": float(sample_seconds),
+            "model_seconds": float(model_seconds),
+            "grad_norm": float(grad_norm),
+            "cached_shards": int(shard_summary["cached_shards"]),
+            "cached_gb": float(shard_summary["cached_gb"]),
+            "dataset_mix": dataset_mix,
+            **summary,
+        }
+        train_history.append(train_record)
+        with progress_path.open("a") as handle:
+            handle.write(json.dumps(train_record) + "\n")
+
+        if val_sampler is None and summary["loss"] < best_score:
+            best_score = float(summary["loss"])
+            best_step = int(step)
+            best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
+
+        if step == start_step + 1 or step % log_every == 0:
+            print(
+                f"step={step:04d} train_loss={summary['loss']:.4f} "
+                f"mask_ratio={summary['actual_mask_ratio']:.3f} "
+                f"masked_token_ratio={summary['masked_token_ratio']:.3f} "
+                f"grad_norm={float(grad_norm):.4f} sample_s={sample_seconds:.2f} model_s={model_seconds:.2f}"
+            )
+
+        if val_sampler is not None and (step % val_every == 0 or step == target_step):
+            val_summary = evaluate_model(
+                model,
+                val_sampler,
+                num_batches=val_batches,
+                device=device,
+                mask_unit=str(config_payload["mask_unit"]),
+                mask_token_placement=str(config_payload["mask_token_placement"]),
+                mask_ratio=float(config_payload["mask_ratio"]),
+                span_length_min=int(config_payload["span_length_min"]),
+                span_length_max=int(config_payload["span_length_max"]),
+                num_spans_mode=str(config_payload["num_spans_mode"]),
+                allow_bin_fractional_overlap=bool(config_payload["allow_bin_fractional_overlap"]),
+            )
+            assert val_summary is not None
+            val_record = {
+                "event": "val",
+                "step": step,
+                "elapsed_seconds": float(time.time() - resume_start_time),
+                **val_summary,
+            }
+            val_history.append(val_record)
+            with progress_path.open("a") as handle:
+                handle.write(json.dumps(val_record) + "\n")
+
+            print(
+                f"step={step:04d} val_loss={val_summary['loss']:.4f} "
+                f"val_mask_ratio={val_summary['actual_mask_ratio']:.3f} "
+                f"val_masked_token_ratio={val_summary['masked_token_ratio']:.3f}"
+            )
+
+            if val_summary["loss"] < best_score:
+                best_score = float(val_summary["loss"])
+                best_step = int(step)
+                best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
+
+        checkpoint_every_steps = config_payload.get("checkpoint_every_steps")
+        if checkpoint_every_steps is not None and step % int(checkpoint_every_steps) == 0:
+            checkpoint_payload = _build_checkpoint_payload(
+                model=model,
+                optimizer=optimizer,
+                config_payload=config_payload,
+                step=step,
+                best_score=best_score,
+                best_step=best_step,
+                checkpoint_kind="step",
+                train_history=train_history,
+                val_history=val_history,
+                dataset_counter=dataset_counter,
+            )
+            step_checkpoint = checkpoints_dir / _step_checkpoint_filename(step)
+            torch.save(checkpoint_payload, step_checkpoint)
+            print("saved_step_checkpoint:", step_checkpoint)
+
+    final_payload = _build_checkpoint_payload(
+        model=model,
+        optimizer=optimizer,
+        config_payload=config_payload,
+        step=target_step,
+        best_score=best_score,
+        best_step=best_step,
+        checkpoint_kind="final",
+        train_history=train_history,
+        val_history=val_history,
+        dataset_counter=dataset_counter,
+    )
+    final_checkpoint = run_dir / _final_checkpoint_filename(target_step)
+    torch.save(final_payload, checkpoint_path)
+    torch.save(final_payload, final_checkpoint)
+
+    if best_state is not None:
+        best_payload = dict(final_payload)
+        best_payload["model_state"] = best_state
+        best_payload["optimizer_state"] = None
+        best_payload["step"] = int(best_step if best_step is not None else target_step)
+        best_payload["checkpoint_kind"] = "best"
+        torch.save(best_payload, best_checkpoint_path)
+    elif best_checkpoint_path.exists():
+        print("No new best checkpoint this resume; keeping existing best checkpoint:", best_checkpoint_path)
+    else:
+        print("No best checkpoint was written during this resume.")
+
+    run_state.update(
+        {
+            "model": model,
+            "optimizer": optimizer,
+            "train_sampler": train_sampler,
+            "val_sampler": val_sampler,
+            "best_score": best_score,
+            "best_step": best_step,
+            "train_history": train_history,
+            "val_history": val_history,
+            "dataset_counts": dict(dataset_counter),
+            "checkpoint_step": target_step,
+            "checkpoint_path": checkpoint_path,
+            "best_checkpoint_path": best_checkpoint_path,
+        }
+    )
+
+    print("Resume complete")
+    print(" - final_checkpoint:", final_checkpoint)
+    print(" - checkpoint_path:", checkpoint_path)
+    print(" - best_checkpoint:", best_checkpoint_path)
+    print(" - best_score:", best_score, "best_step:", best_step)
+    return run_state
 
 
 def plot_ssl_training_history(run_state: dict[str, Any]) -> dict[str, Any]:
