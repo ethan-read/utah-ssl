@@ -29,6 +29,7 @@ from .probe import (
     DownstreamProbeConfig,
     build_random_init_probe_state,
     recover_downstream_probe_state,
+    run_checkpoint_probe_suite,
     run_downstream_probe,
     run_probe_head_sweep,
 )
@@ -82,6 +83,7 @@ __all__ = [
     "plot_ssl_training_history",
     "prepare_cache_context",
     "recover_downstream_probe_state",
+    "run_checkpoint_probe_suite",
     "recover_ssl_run_state_from_checkpoint",
     "resolve_ssl_checkpoint_path",
     "resume_ssl_training",

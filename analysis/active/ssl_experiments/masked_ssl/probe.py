@@ -88,13 +88,15 @@ class DownstreamProbeConfig:
     adaptation_regime: str = "A"
     probe_batch_size: int = 8
     probe_budget_seconds: int = 240
-    max_probe_steps: int = 400
+    max_probe_steps: int = 80
     progress_every_steps: int = 25
     progress_every_seconds: float = 15.0
     probe_head_learning_rate: float = 1e-3
     encoder_learning_rate: float | None = None
     weight_decay: float = 1e-2
     probe_head_type: str = "linear"
+    probe_mlp_hidden_size: int | None = None
+    probe_mlp_dropout: float = 0.1
     probe_lstm_hidden_size: int = 64
     probe_conv_hidden_size: int = 128
     probe_conv_kernel_size: int = 3
@@ -117,8 +119,12 @@ class DownstreamProbeConfig:
             raise ValueError("encoder_learning_rate must be positive when provided")
         if float(self.weight_decay) < 0.0:
             raise ValueError("weight_decay must be non-negative")
-        if self.probe_head_type not in {"linear", "lstm", "conv1d"}:
-            raise ValueError("probe_head_type must be one of {'linear', 'lstm', 'conv1d'}")
+        if self.probe_head_type not in {"linear", "mlp2", "lstm", "conv1d"}:
+            raise ValueError("probe_head_type must be one of {'linear', 'mlp2', 'lstm', 'conv1d'}")
+        if self.probe_mlp_hidden_size is not None and int(self.probe_mlp_hidden_size) <= 0:
+            raise ValueError("probe_mlp_hidden_size must be positive when provided")
+        if not (0.0 <= float(self.probe_mlp_dropout) < 1.0):
+            raise ValueError("probe_mlp_dropout must be in [0, 1)")
         if self.checkpoint_source not in {
             "most_recent_valid_then_in_memory",
             "in_memory_then_most_recent_valid",
@@ -168,6 +174,21 @@ class LinearCTCProbe(nn.Module):
 
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
         return self.linear(hidden)
+
+
+class TwoLayerMLPCTCProbe(nn.Module):
+    def __init__(self, input_size: int, hidden_size: int, vocab_size: int, dropout: float = 0.1):
+        super().__init__()
+        self.proj_in = nn.Linear(input_size, hidden_size)
+        self.activation = nn.GELU()
+        self.dropout = nn.Dropout(float(dropout))
+        self.proj_out = nn.Linear(hidden_size, vocab_size)
+
+    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        x = self.proj_in(hidden)
+        x = self.activation(x)
+        x = self.dropout(x)
+        return self.proj_out(x)
 
 
 class TinyLSTMCTCProbe(nn.Module):
@@ -1299,6 +1320,7 @@ def resolve_probe_head_type(config: DownstreamProbeConfig) -> str:
 def probe_head_suffix(probe_head_type: str) -> str:
     return {
         "linear": "linear_probe",
+        "mlp2": "mlp2_probe",
         "lstm": "lstm_probe",
         "conv1d": "conv1d_probe",
     }[probe_head_type]
@@ -1313,6 +1335,18 @@ def build_probe_head(
     probe_head_type = resolve_probe_head_type(probe_config)
     if probe_head_type == "linear":
         return LinearCTCProbe(encoder_hidden_size, probe_vocab_size)
+    if probe_head_type == "mlp2":
+        mlp_hidden = (
+            int(probe_config.probe_mlp_hidden_size)
+            if probe_config.probe_mlp_hidden_size is not None
+            else int(encoder_hidden_size)
+        )
+        return TwoLayerMLPCTCProbe(
+            input_size=int(encoder_hidden_size),
+            hidden_size=mlp_hidden,
+            vocab_size=probe_vocab_size,
+            dropout=float(probe_config.probe_mlp_dropout),
+        )
     if probe_head_type == "lstm":
         return TinyLSTMCTCProbe(
             input_size=encoder_hidden_size,
@@ -1777,12 +1811,7 @@ def run_probe_head_sweep(
 ) -> list[dict[str, Any]]:
     specs = head_specs or [
         {"probe_head_type": "linear"},
-        {"probe_head_type": "lstm", "probe_lstm_hidden_size": 64},
-        {
-            "probe_head_type": "conv1d",
-            "probe_conv_hidden_size": probe_state["encoder"].hidden_size,
-            "probe_conv_kernel_size": 3,
-        },
+        {"probe_head_type": "mlp2"},
     ]
     results = []
     for spec in specs:
@@ -1805,3 +1834,82 @@ def run_probe_head_sweep(
             )
         )
     return results
+
+
+def _checkpoint_probe_label(checkpoint_path: Path, *, ordinal: int) -> str:
+    name = checkpoint_path.name
+    stem = checkpoint_path.stem
+    if name.startswith("step_"):
+        parts = stem.split("_")
+        if len(parts) >= 2 and parts[1].isdigit():
+            return f"step{int(parts[1]):06d}"
+    if name.startswith("checkpoint_final_step_"):
+        parts = stem.split("_")
+        if len(parts) >= 4 and parts[3].isdigit():
+            return f"step{int(parts[3]):06d}"
+    if name == "checkpoint_best.pt":
+        return "best"
+    if name == "checkpoint_final.pt":
+        return "final"
+    clean = "".join(char if char.isalnum() else "_" for char in stem).strip("_")
+    return clean or f"checkpoint_{ordinal:02d}"
+
+
+def run_checkpoint_probe_suite(
+    *,
+    checkpoint_paths: list[str | Path],
+    probe_config: DownstreamProbeConfig,
+    output_root: Path,
+    input_dim: int,
+    default_checkpoint_config: dict[str, Any],
+    cache_root: Path,
+    device: torch.device,
+    head_specs: list[dict[str, Any]] | None = None,
+    variant_prefix: str = "ssl_checkpoint",
+    artifact_prefix: str = "ssl_checkpoint",
+    train_encoder: bool = False,
+) -> list[dict[str, Any]]:
+    if not checkpoint_paths:
+        raise ValueError("checkpoint_paths must be non-empty")
+
+    summaries: list[dict[str, Any]] = []
+    for idx, checkpoint_value in enumerate(checkpoint_paths):
+        checkpoint_path = Path(checkpoint_value)
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+        if checkpoint_path.parent.name == "checkpoints":
+            run_dir = checkpoint_path.parent.parent
+        else:
+            run_dir = checkpoint_path.parent
+
+        checkpoint_probe_config = replace(
+            probe_config,
+            explicit_checkpoint_path=str(checkpoint_path),
+        )
+        checkpoint_state = recover_downstream_probe_state(
+            probe_config=checkpoint_probe_config,
+            output_root=output_root,
+            input_dim=int(input_dim),
+            default_checkpoint_config=default_checkpoint_config,
+            in_memory_model=None,
+            current_checkpoint_path=checkpoint_path,
+            current_run_dir=run_dir,
+        )
+
+        checkpoint_label = _checkpoint_probe_label(checkpoint_path, ordinal=idx)
+        checkpoint_summaries = run_probe_head_sweep(
+            probe_state=checkpoint_state,
+            probe_config=checkpoint_probe_config,
+            cache_root=cache_root,
+            device=device,
+            variant_prefix=f"{variant_prefix}_{checkpoint_label}",
+            artifact_prefix=f"{artifact_prefix}_{checkpoint_label}",
+            train_encoder=bool(train_encoder),
+            comparison_mode_prefix=checkpoint_label,
+            head_specs=head_specs,
+        )
+        for summary in checkpoint_summaries:
+            summary["evaluated_checkpoint_path"] = str(checkpoint_path)
+            summary["evaluated_checkpoint_label"] = checkpoint_label
+        summaries.extend(checkpoint_summaries)
+    return summaries

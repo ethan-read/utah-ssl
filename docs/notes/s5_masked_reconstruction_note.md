@@ -34,6 +34,26 @@ Possible future architecture directions are intentionally deferred to a separate
   - at `step=5000`, train loss reached `0.47` and had not plateaued yet
   - validation loss on a different session reached `0.70`
 
+## Medium-Scale Brain2Text24 Holdout Run (Current)
+
+- scale / split:
+  - dataset: `brain2text24` only
+  - chronological subset: latest `12` sessions
+  - SSL split: `9` train sessions (`2022-07-05` through `2022-08-13`) and `3` val sessions (`2022-08-18`, `2022-08-23`, `2022-08-25`)
+- SSL hyperparameters:
+  - target run length: `10000` steps
+  - `mask_ratio=0.25`
+  - gaussian smoothing: `gaussian_smoothing_sigma_bins=2.5` with precomputed session stats
+  - logging / eval / checkpoint cadence: `log_every=25`, `val_every=100`, `checkpoint_every_steps=1000`
+  - architecture and optimizer otherwise unchanged from the active `S5` masked-reconstruction config (`hidden_size=256`, `num_layers=4`, `patch_size=4`, `patch_stride=2`, `learning_rate=1e-4`, `batch_size=32`)
+- downstream probe readout (current checkpoint, short probe):
+  - probe setup: frozen encoder, linear probe, `80` probe steps, evaluated on held-out val set
+  - result:
+
+| model_variant | downstream_ctc_bpphone | downstream_per | reference_output_len | actual_output_len | actual_over_reference_len | most_common_prediction | most_common_prediction_rate |
+|---|---:|---:|---:|---:|---:|---|---:|
+| `ssl_run_probe80_colab_s5_masked_reconstruction...` | 9.146503 | 0.958631 | 701 | 744 | 1.061341 | SIL | 0.520161 |
+
 ## Sweep Update (Smoothing Sigma)
 
 - a small sweep over `gaussian_smoothing_sigma_bins in {1.0, 2.0}` and `mask_ratio in {0.15, 0.25}` was run (`1500` SSL steps + short probe)
