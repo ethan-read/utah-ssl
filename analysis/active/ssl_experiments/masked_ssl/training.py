@@ -413,13 +413,21 @@ def resolve_ssl_checkpoint_path(
         candidate = Path(explicit_checkpoint_path)
         if not candidate.exists():
             raise FileNotFoundError(f"Explicit SSL checkpoint path does not exist: {candidate}")
+        if candidate.is_dir():
+            raise IsADirectoryError(
+                f"Explicit SSL checkpoint path points to a directory, expected a .pt file: {candidate}"
+            )
         return candidate
 
     resolved_run_dir: Path | None = None
     if run_dir is not None:
-        resolved_run_dir = Path(run_dir)
-        if not resolved_run_dir.exists():
-            raise FileNotFoundError(f"Requested SSL run directory does not exist: {resolved_run_dir}")
+        run_dir_candidate = Path(run_dir)
+        if not run_dir_candidate.exists():
+            raise FileNotFoundError(f"Requested SSL run directory does not exist: {run_dir_candidate}")
+        if run_dir_candidate.is_file():
+            # Be forgiving: if a checkpoint file is passed as run_dir, recover from it directly.
+            return run_dir_candidate
+        resolved_run_dir = run_dir_candidate
     else:
         run_candidates = sorted(
             [path for path in Path(output_root).glob("colab_s5_*") if path.is_dir()],

@@ -12,7 +12,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 import torch
@@ -95,6 +95,7 @@ class DownstreamProbeConfig:
     encoder_learning_rate: float | None = None
     weight_decay: float = 1e-2
     probe_head_type: str = "linear"
+    probe_input_tail_bins: int | None = None
     probe_mlp_hidden_size: int | None = None
     probe_mlp_dropout: float = 0.1
     probe_lstm_hidden_size: int = 64
@@ -121,6 +122,8 @@ class DownstreamProbeConfig:
             raise ValueError("weight_decay must be non-negative")
         if self.probe_head_type not in {"linear", "mlp2", "lstm", "conv1d"}:
             raise ValueError("probe_head_type must be one of {'linear', 'mlp2', 'lstm', 'conv1d'}")
+        if self.probe_input_tail_bins is not None and int(self.probe_input_tail_bins) <= 0:
+            raise ValueError("probe_input_tail_bins must be positive when provided")
         if self.probe_mlp_hidden_size is not None and int(self.probe_mlp_hidden_size) <= 0:
             raise ValueError("probe_mlp_hidden_size must be positive when provided")
         if not (0.0 <= float(self.probe_mlp_dropout) < 1.0):
@@ -236,16 +239,24 @@ def _load_benchmark_modules() -> tuple[Any, Any]:
     return prepare_module, data_module
 
 
-def _canonical_probe_paths(cache_root: Path) -> tuple[Path, Path, Path]:
-    canonical_root = Path(cache_root) / "brain2text25"
+def _canonical_probe_paths(
+    cache_root: Path,
+    *,
+    dataset: str = "brain2text25",
+) -> tuple[Path, Path, Path]:
+    canonical_root = Path(cache_root) / str(dataset)
     return canonical_root, canonical_root / "manifest.jsonl", canonical_root / "metadata.json"
 
 
-def _validate_canonical_probe_assets(cache_root: Path) -> tuple[Path, Path, Path]:
-    canonical_root, manifest_path, metadata_path = _canonical_probe_paths(cache_root)
+def _validate_canonical_probe_assets(
+    cache_root: Path,
+    *,
+    dataset: str = "brain2text25",
+) -> tuple[Path, Path, Path]:
+    canonical_root, manifest_path, metadata_path = _canonical_probe_paths(cache_root, dataset=str(dataset))
     if not manifest_path.exists() or not metadata_path.exists():
         raise FileNotFoundError(
-            "Canonical Brain2Text25 cache manifest / metadata is missing from the mounted cache. "
+            f"Canonical {dataset} cache manifest / metadata is missing from the mounted cache. "
             f"Expected {manifest_path} and {metadata_path}."
         )
     return canonical_root, manifest_path, metadata_path
@@ -541,11 +552,15 @@ class CanonicalSequenceDataset(torch.utils.data.Dataset):
         stats: dict[str, tuple[np.ndarray, np.ndarray]] | tuple[np.ndarray, np.ndarray] | None = None,
         feature_mode: str = "tx_only",
         boundary_key_mode: str = "session",
+        dataset: str = "brain2text25",
+        input_tail_bins: int | None = None,
     ) -> None:
         self.rows = list(rows)
         self.stats = stats
         self.feature_mode = str(feature_mode)
         self.boundary_key_mode = str(boundary_key_mode)
+        self.dataset = str(dataset)
+        self.input_tail_bins = int(input_tail_bins) if input_tail_bins is not None else None
         self._accessor = CanonicalShardAccessor(cache_root)
 
     def __len__(self) -> int:
@@ -558,6 +573,8 @@ class CanonicalSequenceDataset(torch.utils.data.Dataset):
             x = apply_feature_stats(x, row=row, stats=self.stats)
         else:
             x = np.array(x, dtype=np.float32, copy=True)
+        if self.input_tail_bins is not None and x.shape[0] > self.input_tail_bins:
+            x = x[-self.input_tail_bins :, :]
         labels = self._accessor.load_labels(row)
         if labels is None:
             labels = np.zeros((0,), dtype=np.int64)
@@ -568,7 +585,7 @@ class CanonicalSequenceDataset(torch.utils.data.Dataset):
             "label_length": int(labels.shape[0]),
             "session_id": row.session_id,
             "boundary_key": resolve_boundary_key(
-                dataset="brain2text25",
+                dataset=self.dataset,
                 session_id=row.session_id,
                 subject_id=row.subject_id,
                 boundary_key_mode=self.boundary_key_mode,
@@ -928,58 +945,111 @@ def build_downstream_probe_problem(
     probe_config: DownstreamProbeConfig,
     feature_mode: str = "tx_only",
     boundary_key_mode: str = "session",
+    dataset: str = "brain2text25",
+    source_session_ids: Sequence[str] | None = None,
+    target_session_ids: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     _, data_module = _load_benchmark_modules()
-    canonical_root, manifest_path, metadata_path = _validate_canonical_probe_assets(cache_root)
+    canonical_root, manifest_path, metadata_path = _validate_canonical_probe_assets(
+        cache_root,
+        dataset=str(dataset),
+    )
+    manifest_rows = _load_canonical_probe_manifest(manifest_path)
+    metadata = _load_probe_metadata_json(metadata_path)
+    available_session_ids = tuple(sorted({row.session_id for row in manifest_rows}))
 
-    inventory = _load_canonical_inventory_from_manifest(
-        data_module=data_module,
-        canonical_root=canonical_root,
-        cache_root=Path(cache_root),
-    )
-    if feature_mode == "tx_only":
-        eligible_entries = [entry for entry in inventory if entry.has_tx]
-    elif feature_mode == "tx_sbp":
-        eligible_entries = [entry for entry in inventory if entry.has_tx and entry.has_sbp]
+    inventory = []
+    eligible_entries = []
+    split = None
+    if target_session_ids is None:
+        inventory = _load_canonical_inventory_from_manifest(
+            data_module=data_module,
+            canonical_root=canonical_root,
+            cache_root=Path(cache_root),
+        )
+        if feature_mode == "tx_only":
+            eligible_entries = [entry for entry in inventory if entry.has_tx]
+        elif feature_mode == "tx_sbp":
+            eligible_entries = [entry for entry in inventory if entry.has_tx and entry.has_sbp]
+        else:
+            raise ValueError("feature_mode must be one of {'tx_only', 'tx_sbp'}")
+        split = data_module.split_latest_sessions(
+            eligible_entries,
+            session_limit=int(probe_config.session_limit),
+            val_session_count=int(probe_config.target_session_count),
+        )
+        if hasattr(data_module, "session_ids_from_cache_split"):
+            source_session_ids, target_session_ids = data_module.session_ids_from_cache_split(split)
+        else:
+            source_session_ids, target_session_ids = _session_ids_from_split(split)
     else:
-        raise ValueError("feature_mode must be one of {'tx_only', 'tx_sbp'}")
-    split = data_module.split_latest_sessions(
-        eligible_entries,
-        session_limit=int(probe_config.session_limit),
-        val_session_count=int(probe_config.target_session_count),
-    )
-    if hasattr(data_module, "session_ids_from_cache_split"):
-        source_session_ids, target_session_ids = data_module.session_ids_from_cache_split(split)
-    else:
-        source_session_ids, target_session_ids = _session_ids_from_split(split)
+        target_session_ids = tuple(str(session_id) for session_id in target_session_ids)
+        missing_targets = [sid for sid in target_session_ids if sid not in set(available_session_ids)]
+        if missing_targets:
+            raise ValueError(
+                f"Requested target sessions were not found in {dataset} manifest: {missing_targets}"
+            )
+        if source_session_ids is None:
+            target_set = set(target_session_ids)
+            source_session_ids = tuple(session_id for session_id in available_session_ids if session_id not in target_set)
+        else:
+            source_session_ids = tuple(str(session_id) for session_id in source_session_ids)
+        split = SimpleNamespace(
+            train=[SimpleNamespace(session_base=session_id) for session_id in source_session_ids],
+            val=[SimpleNamespace(session_base=session_id) for session_id in target_session_ids],
+        )
+
+    source_session_ids = tuple(source_session_ids or ())
+    target_session_ids = tuple(target_session_ids or ())
     if len(target_session_ids) <= 0:
         raise ValueError("No held-out target sessions were selected for the downstream probe.")
 
-    manifest_rows = _load_canonical_probe_manifest(manifest_path)
-    metadata = _load_probe_metadata_json(metadata_path)
-    partitions = _partition_probe_records(
-        manifest_rows,
-        source_session_ids=source_session_ids,
-        target_session_ids=target_session_ids,
+    partition_attempts = (
+        {"pretrain_source_splits": ("train",), "probe_train_split": "train", "probe_val_split": "val"},
+        {
+            "pretrain_source_splits": ("competition_train",),
+            "probe_train_split": "competition_train",
+            "probe_val_split": "competition_test",
+        },
     )
+    partitions: CanonicalProbePartitions | None = None
+    target_train_examples_by_session: dict[str, int] = {}
+    target_val_examples_by_session: dict[str, int] = {}
+    missing_sessions: list[str] = []
+    for attempt in partition_attempts:
+        candidate = _partition_probe_records(
+            manifest_rows,
+            source_session_ids=source_session_ids,
+            target_session_ids=target_session_ids,
+            pretrain_source_splits=attempt["pretrain_source_splits"],
+            probe_train_split=attempt["probe_train_split"],
+            probe_val_split=attempt["probe_val_split"],
+        )
+        target_train_examples_by_session = {
+            session_id: len(candidate.target_train_by_session[session_id])
+            for session_id in target_session_ids
+        }
+        target_val_examples_by_session = {
+            session_id: len(candidate.target_val_by_session[session_id])
+            for session_id in target_session_ids
+        }
+        missing_sessions = [
+            session_id
+            for session_id in target_session_ids
+            if target_train_examples_by_session[session_id] == 0 or target_val_examples_by_session[session_id] == 0
+        ]
+        if not missing_sessions:
+            partitions = candidate
+            break
 
-    target_train_examples_by_session = {
-        session_id: len(partitions.target_train_by_session[session_id])
-        for session_id in target_session_ids
-    }
-    target_val_examples_by_session = {
-        session_id: len(partitions.target_val_by_session[session_id])
-        for session_id in target_session_ids
-    }
-    missing_sessions = [
-        session_id
-        for session_id in target_session_ids
-        if target_train_examples_by_session[session_id] == 0 or target_val_examples_by_session[session_id] == 0
-    ]
-    if missing_sessions:
+    if partitions is None:
+        split_counts: Counter[str] = Counter()
+        for row in manifest_rows:
+            if row.session_id in set(target_session_ids) and row.has_labels:
+                split_counts[str(row.source_split).strip().lower()] += 1
         raise ValueError(
             "At least one held-out target session does not have both train and val examples with phoneme labels. "
-            f"Missing sessions: {missing_sessions}"
+            f"Missing sessions: {missing_sessions}. Split counts on selected target sessions: {dict(split_counts)}"
         )
     target_train_rows = tuple(
         row
@@ -1016,6 +1086,7 @@ def build_downstream_probe_problem(
         "target_val_rows": target_val_rows,
         "vocab": _resolve_phoneme_vocabulary(metadata),
         "cache_root": Path(cache_root),
+        "dataset": str(dataset),
         "feature_mode": str(feature_mode),
         "boundary_key_mode": str(boundary_key_mode),
     }
@@ -1374,6 +1445,12 @@ def train_probe_with_metrics(
     progress_log_path: Path | None,
     train_encoder: bool,
 ) -> tuple[dict[str, Any], int]:
+    dataset_name = str(problem.get("dataset", "brain2text25"))
+    input_tail_bins = (
+        int(probe_config.probe_input_tail_bins)
+        if probe_config.probe_input_tail_bins is not None
+        else None
+    )
     target_stats_mode = "global" if len(problem["target_session_ids"]) == 1 else "per_session"
     target_stats = compute_feature_stats(
         problem["target_train_rows"],
@@ -1388,6 +1465,8 @@ def train_probe_with_metrics(
             stats=target_stats,
             feature_mode=str(problem["feature_mode"]),
             boundary_key_mode=str(problem.get("boundary_key_mode", "session")),
+            dataset=dataset_name,
+            input_tail_bins=input_tail_bins,
         ),
         **_loader_kwargs(
             device,
@@ -1404,6 +1483,8 @@ def train_probe_with_metrics(
             stats=target_stats,
             feature_mode=str(problem["feature_mode"]),
             boundary_key_mode=str(problem.get("boundary_key_mode", "session")),
+            dataset=dataset_name,
+            input_tail_bins=input_tail_bins,
         ),
         **_loader_kwargs(
             device,
@@ -1595,6 +1676,9 @@ def run_downstream_probe(
     variant_prefix: str,
     artifact_prefix: str,
     train_encoder: bool,
+    probe_dataset: str = "brain2text25",
+    source_session_ids: Sequence[str] | None = None,
+    target_session_ids: Sequence[str] | None = None,
     probe_overrides: dict[str, Any] | None = None,
     comparison_mode: str | None = None,
 ) -> dict[str, Any]:
@@ -1604,6 +1688,9 @@ def run_downstream_probe(
         probe_config=effective_probe_config,
         feature_mode=str(probe_state.get("feature_mode", "tx_only")),
         boundary_key_mode=str(probe_state.get("boundary_key_mode", "session")),
+        dataset=str(probe_dataset),
+        source_session_ids=source_session_ids,
+        target_session_ids=target_session_ids,
     )
 
     suffix = probe_head_suffix(resolve_probe_head_type(effective_probe_config))
@@ -1787,7 +1874,13 @@ def run_downstream_probe(
         "checkpoint_path": (
             str(probe_state["checkpoint_path"]) if probe_state["checkpoint_path"] is not None else None
         ),
+        "dataset": str(problem.get("dataset", probe_dataset)),
         "feature_mode": str(problem["feature_mode"]),
+        "probe_input_tail_bins": (
+            int(effective_probe_config.probe_input_tail_bins)
+            if effective_probe_config.probe_input_tail_bins is not None
+            else None
+        ),
         "run_dir": str(artifact_dir),
         "progress_log_path": str(progress_path),
         "alignment_stats_path": str(alignment_stats_path),
@@ -1806,6 +1899,9 @@ def run_probe_head_sweep(
     variant_prefix: str,
     artifact_prefix: str,
     train_encoder: bool = False,
+    probe_dataset: str = "brain2text25",
+    source_session_ids: Sequence[str] | None = None,
+    target_session_ids: Sequence[str] | None = None,
     comparison_mode_prefix: str | None = None,
     head_specs: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
@@ -1826,6 +1922,9 @@ def run_probe_head_sweep(
                 variant_prefix=variant_prefix,
                 artifact_prefix=artifact_prefix,
                 train_encoder=train_encoder,
+                probe_dataset=str(probe_dataset),
+                source_session_ids=source_session_ids,
+                target_session_ids=target_session_ids,
                 comparison_mode=(
                     f"{comparison_mode_prefix}_{suffix}"
                     if comparison_mode_prefix is not None
