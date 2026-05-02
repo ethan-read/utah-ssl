@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import random
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -20,8 +21,10 @@ for path in (REPO_ROOT, EXPERIMENTS_DIR):
         sys.path.insert(0, path_str)
 
 from masked_ssl.cache import (
+    CacheAccessConfig,
     _apply_gaussian_smoothing,
     _compute_session_feature_stats,
+    prepare_cache_context,
     sample_base_segment,
 )
 from masked_ssl.model import MaskedSSLModel, SessionLinearBank
@@ -43,8 +46,10 @@ from masked_ssl.probe import (
     NotebookProbeEncoderAdapter,
     recover_downstream_probe_state,
 )
+from masked_ssl.sweeps import resolve_cache_candidates_for_sigma
 from masked_ssl.training import recover_ssl_run_state_from_checkpoint
 from s5 import BidirectionalS5SequenceBackbone, S5SequenceBackbone, reverse_padded_sequence
+from build_smoothed_cache import build_smoothed_cache
 
 
 def _make_model(
@@ -262,6 +267,61 @@ def _write_tiny_canonical_probe_cache(cache_root: Path) -> None:
     (dataset_root / "metadata.json").write_text(json.dumps(metadata))
 
 
+def _write_tiny_pretrain_cache(
+    cache_root: Path,
+    *,
+    dataset: str = "toyset",
+    smoothing_provenance: dict[str, object] | None = None,
+) -> None:
+    dataset_root = cache_root / dataset
+    shard_dir = dataset_root / "shards" / "toy_shard"
+    shard_dir.mkdir(parents=True, exist_ok=True)
+
+    tx = np.arange(12, dtype=np.float32).reshape(6, 2)
+    sbp = (100.0 + np.arange(12, dtype=np.float32)).reshape(6, 2)
+    np.save(shard_dir / "time_offsets.npy", np.array([0, 3, 6], dtype=np.int64))
+    np.save(shard_dir / "tx.npy", tx)
+    np.save(shard_dir / "sbp.npy", sbp)
+
+    manifest_rows = [
+        {
+            "example_id": "toy-0",
+            "session_id": "toy.2025.01.01",
+            "subject_id": "toy",
+            "shard_relpath": f"{dataset}/shards/toy_shard",
+            "example_index": 0,
+            "n_time_bins": 3,
+            "has_tx": True,
+            "has_sbp": True,
+            "n_tx_features": 2,
+            "n_sbp_features": 2,
+        },
+        {
+            "example_id": "toy-1",
+            "session_id": "toy.2025.01.02",
+            "subject_id": "toy",
+            "shard_relpath": f"{dataset}/shards/toy_shard",
+            "example_index": 1,
+            "n_time_bins": 3,
+            "has_tx": True,
+            "has_sbp": True,
+            "n_tx_features": 2,
+            "n_sbp_features": 2,
+        },
+    ]
+    with (dataset_root / "manifest.jsonl").open("w") as handle:
+        for row in manifest_rows:
+            handle.write(json.dumps(row) + "\n")
+
+    metadata: dict[str, object] = {
+        "n_tx_features": 2,
+        "n_sbp_features": 2,
+    }
+    if smoothing_provenance is not None:
+        metadata["smoothing_provenance"] = dict(smoothing_provenance)
+    (dataset_root / "metadata.json").write_text(json.dumps(metadata))
+
+
 class MaskedSSLTests(unittest.TestCase):
     def test_reverse_padded_sequence_reverses_only_valid_prefix(self) -> None:
         x = torch.tensor(
@@ -344,7 +404,7 @@ class MaskedSSLTests(unittest.TestCase):
         ) / 2.0
         self.assertTrue(torch.allclose(sample["x"], expected))
 
-    def test_sampling_with_smoothing_matches_full_row_smooth_then_crop(self) -> None:
+    def test_sampling_ignores_legacy_runtime_smoothing_field(self) -> None:
         session_key = "toy:sess0"
         tx_series = np.arange(10, dtype=np.float32).reshape(10, 1)
 
@@ -386,11 +446,7 @@ class MaskedSSLTests(unittest.TestCase):
         segment_bins = 4
         rng_seed = 9
         expected_offset = random.Random(rng_seed).randrange(10 - segment_bins + 1)
-        expected_smoothed = _apply_gaussian_smoothing(
-            torch.from_numpy(tx_series.copy()),
-            torch.ones(1, dtype=torch.float32),
-            sigma_bins=1.0,
-        )[expected_offset : expected_offset + segment_bins]
+        expected_raw = torch.from_numpy(tx_series[expected_offset : expected_offset + segment_bins].copy())
 
         sample = sample_base_segment(
             cache_context,
@@ -399,7 +455,7 @@ class MaskedSSLTests(unittest.TestCase):
             py_rng=random.Random(rng_seed),
         )
         self.assertEqual(tuple(sample["x"].shape), (segment_bins, 1))
-        self.assertTrue(torch.allclose(sample["x"], expected_smoothed, atol=1e-5, rtol=1e-5))
+        self.assertTrue(torch.allclose(sample["x"], expected_raw, atol=1e-5, rtol=1e-5))
 
     def test_session_feature_stats_bin_stride_uses_subsampled_time_bins(self) -> None:
         class _DummyShardStore:
@@ -439,6 +495,90 @@ class MaskedSSLTests(unittest.TestCase):
         mean, std = stats["toy:sess0"]
         self.assertAlmostEqual(float(mean[0]), 4.0, places=6)
         self.assertAlmostEqual(float(std[0]), float(np.sqrt(8.0)), places=6)
+
+    def test_prepare_cache_context_rejects_runtime_smoothing_requests(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_root = Path(tmpdir) / "cache_v1"
+            _write_tiny_pretrain_cache(cache_root, dataset="toyset")
+            with self.assertRaisesRegex(RuntimeError, "Runtime Gaussian smoothing has been removed"):
+                prepare_cache_context(
+                    cache_candidates=[cache_root],
+                    config=CacheAccessConfig(
+                        mode="drive_direct",
+                        excluded_datasets=(),
+                        feature_mode="tx_sbp",
+                        gaussian_smoothing_sigma_bins=2.0,
+                    ),
+                )
+
+    def test_resolve_cache_candidates_for_sigma_finds_sibling_smoothed_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            raw_root = tmp_path / "cache_v1"
+            smoothed_root = tmp_path / "cache_v1_smoothed_sigma2p0"
+            _write_tiny_pretrain_cache(raw_root, dataset="toyset")
+            _write_tiny_pretrain_cache(
+                smoothed_root,
+                dataset="toyset",
+                smoothing_provenance={
+                    "source_cache_root": str(raw_root.resolve()),
+                    "sigma_bins": 2.0,
+                },
+            )
+            resolved = resolve_cache_candidates_for_sigma(
+                sigma=2.0,
+                cache_candidates=[raw_root],
+                dataset="toyset",
+            )
+        self.assertEqual(resolved, (smoothed_root,))
+
+    def test_build_smoothed_cache_preserves_manifest_and_smooths_features(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            src_root = tmp_path / "cache_v1"
+            dst_root = tmp_path / "cache_v1_smoothed"
+            _write_tiny_pretrain_cache(src_root, dataset="toyset")
+
+            summary = build_smoothed_cache(
+                src_root=src_root,
+                dst_root=dst_root,
+                sigma_bins=1.5,
+            )
+
+            self.assertEqual(summary["datasets"]["toyset"]["shard_count"], 1)
+            src_tx = np.load(src_root / "toyset" / "shards" / "toy_shard" / "tx.npy")
+            dst_tx = np.load(dst_root / "toyset" / "shards" / "toy_shard" / "tx.npy")
+            expected_tx = _apply_gaussian_smoothing(
+                torch.from_numpy(src_tx.copy()),
+                torch.ones(src_tx.shape[1], dtype=torch.float32),
+                sigma_bins=1.5,
+            ).numpy()
+            self.assertTrue(np.allclose(dst_tx, expected_tx, atol=1e-5, rtol=1e-5))
+            self.assertEqual(
+                (src_root / "toyset" / "manifest.jsonl").read_text(),
+                (dst_root / "toyset" / "manifest.jsonl").read_text(),
+            )
+            metadata = json.loads((dst_root / "toyset" / "metadata.json").read_text())
+            self.assertEqual(float(metadata["smoothing_provenance"]["sigma_bins"]), 1.5)
+            self.assertEqual(
+                metadata["smoothing_provenance"]["source_cache_root"],
+                str(src_root.resolve()),
+            )
+
+    def test_build_smoothed_cache_dry_run_is_non_mutating(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            src_root = tmp_path / "cache_v1"
+            dst_root = tmp_path / "cache_v1_smoothed"
+            _write_tiny_pretrain_cache(src_root, dataset="toyset")
+            summary = build_smoothed_cache(
+                src_root=src_root,
+                dst_root=dst_root,
+                sigma_bins=1.0,
+                dry_run=True,
+            )
+            self.assertTrue(summary["dry_run"])
+            self.assertFalse(dst_root.exists())
 
     def test_sample_mask_indices_one_span_is_contiguous_and_matches_target_count(self) -> None:
         random.seed(0)

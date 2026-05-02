@@ -24,6 +24,13 @@ except ImportError:  # pragma: no cover - optional dependency
     psutil = None
 
 
+RUNTIME_SMOOTHING_MIGRATION_MESSAGE = (
+    "Runtime Gaussian smoothing has been removed from masked_ssl. "
+    "Build or select a pre-smoothed cache root instead and keep "
+    "gaussian_smoothing_sigma_bins=0.0 during training."
+)
+
+
 @dataclass
 class CacheAccessConfig:
     mode: str = "copy_to_local"
@@ -162,6 +169,54 @@ class CacheContext:
     @property
     def gaussian_smoothing_sigma_bins(self) -> float:
         return float(self.config.gaussian_smoothing_sigma_bins)
+
+
+def runtime_smoothing_requested(config: CacheAccessConfig) -> bool:
+    return float(config.gaussian_smoothing_sigma_bins) > 0.0
+
+
+def ensure_runtime_smoothing_disabled(
+    config: CacheAccessConfig,
+    *,
+    context: str,
+) -> None:
+    if runtime_smoothing_requested(config):
+        raise RuntimeError(
+            f"{context}: {RUNTIME_SMOOTHING_MIGRATION_MESSAGE} "
+            f"Requested gaussian_smoothing_sigma_bins={float(config.gaussian_smoothing_sigma_bins):.6g}."
+        )
+
+
+def load_dataset_metadata(
+    cache_root: str | Path,
+    dataset: str,
+) -> dict[str, Any]:
+    metadata_path = Path(cache_root) / str(dataset) / "metadata.json"
+    if not metadata_path.exists():
+        raise FileNotFoundError(f"Missing dataset metadata: {metadata_path}")
+    return json.loads(metadata_path.read_text())
+
+
+def load_cache_smoothing_provenance(
+    cache_root: str | Path,
+    *,
+    dataset: str | None = None,
+) -> dict[str, Any] | None:
+    root = Path(cache_root)
+    if dataset is not None:
+        metadata = load_dataset_metadata(root, dataset)
+        provenance = metadata.get("smoothing_provenance")
+        return dict(provenance) if isinstance(provenance, dict) else None
+
+    for dataset_root in sorted(path for path in root.iterdir() if path.is_dir()):
+        metadata_path = dataset_root / "metadata.json"
+        if not metadata_path.exists():
+            continue
+        metadata = json.loads(metadata_path.read_text())
+        provenance = metadata.get("smoothing_provenance")
+        if isinstance(provenance, dict):
+            return dict(provenance)
+    return None
 
 
 def _format_bytes(num_bytes: int) -> str:
@@ -604,7 +659,6 @@ def _compute_session_feature_stats(
     full_dim = int(config.full_dim)
     session_stats: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
     total_sessions = len(session_rows)
-    smoothing_sigma_bins = float(config.gaussian_smoothing_sigma_bins)
     bin_stride = int(config.session_stats_bin_stride)
 
     for session_idx, session_key in enumerate(sorted(session_rows), start=1):
@@ -620,61 +674,25 @@ def _compute_session_feature_stats(
             start = int(time_offsets[row.example_index])
             stop = int(time_offsets[row.example_index + 1])
             raw_len = int(max(stop - start, 0))
-            row_len = int((raw_len + bin_stride - 1) // bin_stride)
-            if row_len <= 0:
+            if raw_len <= 0:
                 continue
-
-            if smoothing_sigma_bins <= 0.0:
-                tx = shard["tx"]
-                if isinstance(tx, np.ndarray):
-                    tx_window = np.asarray(tx[start:stop:bin_stride], dtype=np.float64)
-                    tx_dim = min(tx_window.shape[1], config.tx_dim)
-                    sum_x[:tx_dim] += tx_window[:, :tx_dim].sum(axis=0)
-                    sum_x2[:tx_dim] += np.square(tx_window[:, :tx_dim]).sum(axis=0)
-                    count_x[:tx_dim] += tx_window.shape[0]
-
-                sbp = shard["sbp"]
-                if config.feature_mode == "tx_sbp" and isinstance(sbp, np.ndarray):
-                    sbp_window = np.asarray(sbp[start:stop:bin_stride], dtype=np.float64)
-                    sbp_dim = min(sbp_window.shape[1], config.sbp_dim)
-                    sbp_slice = slice(config.tx_dim, config.tx_dim + sbp_dim)
-                    sum_x[sbp_slice] += sbp_window[:, :sbp_dim].sum(axis=0)
-                    sum_x2[sbp_slice] += np.square(sbp_window[:, :sbp_dim]).sum(axis=0)
-                    count_x[sbp_slice] += sbp_window.shape[0]
-                continue
-
-            row_x = np.zeros((row_len, full_dim), dtype=np.float32)
-            row_feature_mask = np.zeros((full_dim,), dtype=np.float32)
 
             tx = shard["tx"]
             if isinstance(tx, np.ndarray):
-                tx_window = np.asarray(tx[start:stop:bin_stride], dtype=np.float32)
+                tx_window = np.asarray(tx[start:stop:bin_stride], dtype=np.float64)
                 tx_dim = min(tx_window.shape[1], config.tx_dim)
-                row_x[:, :tx_dim] = tx_window[:, :tx_dim]
-                row_feature_mask[:tx_dim] = 1.0
+                sum_x[:tx_dim] += tx_window[:, :tx_dim].sum(axis=0)
+                sum_x2[:tx_dim] += np.square(tx_window[:, :tx_dim]).sum(axis=0)
+                count_x[:tx_dim] += tx_window.shape[0]
 
             sbp = shard["sbp"]
             if config.feature_mode == "tx_sbp" and isinstance(sbp, np.ndarray):
-                sbp_window = np.asarray(sbp[start:stop:bin_stride], dtype=np.float32)
+                sbp_window = np.asarray(sbp[start:stop:bin_stride], dtype=np.float64)
                 sbp_dim = min(sbp_window.shape[1], config.sbp_dim)
-                row_x[:, config.tx_dim : config.tx_dim + sbp_dim] = sbp_window[:, :sbp_dim]
-                row_feature_mask[config.tx_dim : config.tx_dim + sbp_dim] = 1.0
-
-            present_idx = np.nonzero(row_feature_mask > 0.5)[0]
-            if present_idx.size <= 0:
-                continue
-
-            row_x_t = torch.from_numpy(row_x)
-            row_feature_mask_t = torch.from_numpy(row_feature_mask)
-            row_x_smoothed = _apply_gaussian_smoothing(
-                row_x_t,
-                row_feature_mask_t,
-                sigma_bins=smoothing_sigma_bins,
-            ).cpu().numpy().astype(np.float64, copy=False)
-            row_present = row_x_smoothed[:, present_idx]
-            sum_x[present_idx] += row_present.sum(axis=0)
-            sum_x2[present_idx] += np.square(row_present).sum(axis=0)
-            count_x[present_idx] += row_present.shape[0]
+                sbp_slice = slice(config.tx_dim, config.tx_dim + sbp_dim)
+                sum_x[sbp_slice] += sbp_window[:, :sbp_dim].sum(axis=0)
+                sum_x2[sbp_slice] += np.square(sbp_window[:, :sbp_dim]).sum(axis=0)
+                count_x[sbp_slice] += sbp_window.shape[0]
 
         mean = np.zeros((full_dim,), dtype=np.float32)
         std = np.ones((full_dim,), dtype=np.float32)
@@ -770,57 +788,27 @@ def sample_base_segment(
     offset = py_rng.randrange(max_start + 1)
     src_start = start + offset
     src_stop = src_start + total_needed
-
-    sigma_bins = float(
-        getattr(
-            cache_context,
-            "gaussian_smoothing_sigma_bins",
-            getattr(getattr(cache_context, "config", object()), "gaussian_smoothing_sigma_bins", 0.0),
-        )
-    )
-    kernel_radius = (
-        min(max(1, int(math.ceil(4.0 * sigma_bins))), max(length - 1, 0))
-        if sigma_bins > 0.0
-        else 0
-    )
-    window_start = max(start, src_start - kernel_radius)
-    window_stop = min(stop, src_stop + kernel_radius)
-    window_len = int(window_stop - window_start)
-
-    x_seq = np.zeros((window_len, cache_context.full_dim), dtype=np.float32)
+    x_seq = np.zeros((total_needed, cache_context.full_dim), dtype=np.float32)
     feature_mask = np.zeros((cache_context.full_dim,), dtype=np.float32)
 
     tx = shard["tx"]
     if isinstance(tx, np.ndarray):
-        tx_window = np.asarray(tx[window_start:window_stop], dtype=np.float32)
+        tx_window = np.asarray(tx[src_start:src_stop], dtype=np.float32)
         tx_dim = min(tx_window.shape[1], cache_context.tx_dim)
         x_seq[:, :tx_dim] = tx_window[:, :tx_dim]
         feature_mask[:tx_dim] = 1.0
 
     sbp = shard["sbp"]
     if cache_context.feature_mode == "tx_sbp" and isinstance(sbp, np.ndarray):
-        sbp_window = np.asarray(sbp[window_start:window_stop], dtype=np.float32)
+        sbp_window = np.asarray(sbp[src_start:src_stop], dtype=np.float32)
         sbp_dim = min(sbp_window.shape[1], cache_context.sbp_dim)
         x_seq[:, cache_context.tx_dim : cache_context.tx_dim + sbp_dim] = sbp_window[:, :sbp_dim]
         feature_mask[cache_context.tx_dim : cache_context.tx_dim + sbp_dim] = 1.0
 
     x_seq_t = torch.from_numpy(x_seq)
     feature_mask_t = torch.from_numpy(feature_mask)
-    x_preprocessed = _apply_gaussian_smoothing(
-        x_seq_t,
-        feature_mask_t,
-        sigma_bins=sigma_bins,
-    )
-    inner_start = int(src_start - window_start)
-    inner_stop = int(inner_start + total_needed)
-    x_cropped = x_preprocessed[inner_start:inner_stop]
-    if int(x_cropped.shape[0]) != int(total_needed):
-        raise RuntimeError(
-            "Internal sampling error: cropped segment length does not match segment_bins "
-            f"(expected={total_needed}, got={int(x_cropped.shape[0])})."
-        )
     x_norm = _normalize_segment(
-        x_cropped,
+        x_seq_t,
         feature_mask_t,
         context_bins=cache_context.normalize_context_bins,
         normalize_impl_version=cache_context.normalize_impl_version,
@@ -1031,6 +1019,7 @@ def prepare_cache_context(
     cache_candidates: Sequence[Path],
     config: CacheAccessConfig,
 ) -> CacheContext:
+    ensure_runtime_smoothing_disabled(config, context="prepare_cache_context")
     random.seed(config.seed)
     np.random.seed(config.seed)
     torch.manual_seed(config.seed)

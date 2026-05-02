@@ -14,7 +14,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from .cache import CacheContext, build_segment_sampler
+from .cache import CacheContext, build_segment_sampler, runtime_smoothing_requested
 from .cache import resolve_boundary_key
 from .model_mae import MAX_PATCH_COUNT, MaskedSSLModel, sync_device
 from .objectives_mae import compute_objective_metrics, summarize_metrics
@@ -717,6 +717,11 @@ def run_ssl_training(
     device: torch.device,
 ) -> dict[str, Any]:
     _seed_training_run(int(config.seed))
+    if runtime_smoothing_requested(cache_context.config):
+        raise RuntimeError(
+            "run_ssl_training: runtime Gaussian smoothing is no longer supported. "
+            "Use a pre-smoothed cache root with gaussian_smoothing_sigma_bins=0.0."
+        )
     if str(config.feature_mode) != str(cache_context.feature_mode):
         raise ValueError(
             "SSLTrainingConfig.feature_mode must match CacheAccessConfig.feature_mode. "

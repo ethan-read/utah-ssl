@@ -10,7 +10,12 @@ from typing import Any, Sequence
 
 import pandas as pd
 
-from .cache import CacheAccessConfig, load_precomputed_session_feature_stats_into_cache_context, prepare_cache_context
+from .cache import (
+    CacheAccessConfig,
+    load_cache_smoothing_provenance,
+    load_precomputed_session_feature_stats_into_cache_context,
+    prepare_cache_context,
+)
 from .probe import (
     CanonicalProbeManifestRow,
     DownstreamProbeConfig,
@@ -59,7 +64,9 @@ def resolve_smoothed_stats_path(
     tag = sigma_tag(sigma)
     session_stats_dir = Path(session_stats_dir)
 
-    def path_matches_smoothed_sigma(path_obj: Path) -> bool:
+    def path_matches_requested_sigma(path_obj: Path) -> bool:
+        if abs(sigma) < 1e-6:
+            return "smooth_sigma" not in path_obj.name
         return f"smooth_sigma{tag}" in path_obj.name
 
     if abs(sigma - active_sigma) < 1e-6:
@@ -73,30 +80,100 @@ def resolve_smoothed_stats_path(
             loaded_sigma = loaded_meta.get("gaussian_smoothing_sigma_bins")
             if loaded_path and loaded_sigma is not None:
                 path = Path(loaded_path)
-                if path.exists() and abs(float(loaded_sigma) - sigma) < 1e-6 and path_matches_smoothed_sigma(path):
+                if (
+                    path.exists()
+                    and abs(float(loaded_sigma) - sigma) < 1e-6
+                    and path_matches_requested_sigma(path)
+                ):
                     return path
 
         if stable_stats_path is not None:
             path = Path(stable_stats_path)
-            if path.exists() and path_matches_smoothed_sigma(path):
+            if path.exists() and path_matches_requested_sigma(path):
                 return path
 
-    candidates = [
-        session_stats_dir
-        / (
-            "session_feature_stats_session_featurewise_v1_refds000950_cap126682_tx256_sbp256_"
-            f"smooth_sigma{tag}_stride{int(stride)}_stable.pt"
-        ),
-        session_stats_dir
-        / (
-            "session_feature_stats_session_featurewise_v1_refds000950_cap126682_tx256_sbp256_"
-            f"smooth_sigma{tag}_stable.pt"
-        ),
-    ]
+    if abs(sigma) < 1e-6:
+        candidates = [
+            session_stats_dir
+            / (
+                "session_feature_stats_session_featurewise_v1_refds000950_cap126682_tx256_sbp256_"
+                f"stride{int(stride)}_stable.pt"
+            ),
+            session_stats_dir
+            / "session_feature_stats_session_featurewise_v1_refds000950_cap126682_tx256_sbp256_stable.pt",
+        ]
+    else:
+        candidates = [
+            session_stats_dir
+            / (
+                "session_feature_stats_session_featurewise_v1_refds000950_cap126682_tx256_sbp256_"
+                f"smooth_sigma{tag}_stride{int(stride)}_stable.pt"
+            ),
+            session_stats_dir
+            / (
+                "session_feature_stats_session_featurewise_v1_refds000950_cap126682_tx256_sbp256_"
+                f"smooth_sigma{tag}_stable.pt"
+            ),
+        ]
     for path in candidates:
         if path.exists():
             return path
     return None
+
+
+def _cache_root_matches_sigma(
+    cache_root: Path,
+    *,
+    sigma: float,
+    dataset: str,
+) -> bool:
+    provenance = load_cache_smoothing_provenance(cache_root, dataset=dataset)
+    if provenance is None:
+        return abs(float(sigma)) < 1e-6
+    try:
+        provenance_sigma = float(provenance.get("sigma_bins"))
+    except (TypeError, ValueError):
+        return False
+    return abs(provenance_sigma - float(sigma)) < 1e-6
+
+
+def resolve_cache_candidates_for_sigma(
+    *,
+    sigma: float,
+    cache_candidates: Sequence[Path],
+    dataset: str,
+) -> tuple[Path, ...]:
+    sigma = float(sigma)
+    candidate_paths = [Path(path) for path in cache_candidates]
+    if abs(sigma) < 1e-6:
+        return tuple(candidate_paths)
+
+    source_roots = {str(path.resolve()) for path in candidate_paths if path.exists()}
+    matches: list[tuple[int, Path]] = []
+    seen: set[Path] = set()
+
+    def maybe_add(path: Path) -> None:
+        if path in seen or not path.exists() or not path.is_dir():
+            return
+        if not _cache_root_matches_sigma(path, sigma=sigma, dataset=dataset):
+            return
+        seen.add(path)
+        provenance = load_cache_smoothing_provenance(path, dataset=dataset) or {}
+        source_root = provenance.get("source_cache_root")
+        priority = 0 if isinstance(source_root, str) and source_root in source_roots else 1
+        matches.append((priority, path))
+
+    for path in candidate_paths:
+        maybe_add(path)
+    for path in candidate_paths:
+        parent = path.parent
+        if not parent.exists():
+            continue
+        for sibling in sorted(parent.iterdir(), key=lambda item: item.name):
+            maybe_add(sibling)
+
+    matches.sort(key=lambda item: (item[0], item[1].name))
+    return tuple(path for _, path in matches)
 
 
 def apply_two_session_split(
@@ -271,6 +348,17 @@ def run_sigma_mask_probe_sweep(
     contexts_by_sigma: dict[float, Any] = {}
     for sigma_value in sweep_sigmas:
         sigma = float(sigma_value)
+        sigma_cache_candidates = resolve_cache_candidates_for_sigma(
+            sigma=sigma,
+            cache_candidates=cache_candidates,
+            dataset=train_dataset,
+        )
+        if not sigma_cache_candidates:
+            msg = f"[sigma={sigma}] no pre-smoothed cache root found."
+            if skip_sigma_if_stats_missing:
+                print(f"[skip] {msg}")
+                continue
+            raise RuntimeError(msg)
         stats_path = resolve_smoothed_stats_path(
             sigma=sigma,
             stride=base_stride,
@@ -294,6 +382,11 @@ def run_sigma_mask_probe_sweep(
             and stats_path is not None
             and stats_path.exists()
             and bool(getattr(active_cache_context, "session_feature_stats", {}))
+            and _cache_root_matches_sigma(
+                Path(active_cache_context.cache_root),
+                sigma=sigma,
+                dataset=train_dataset,
+            )
         )
 
         if can_reuse_existing_ctx:
@@ -308,12 +401,12 @@ def run_sigma_mask_probe_sweep(
             cache_config = replace(
                 base_cache_config,
                 normalize_impl_version=prepare_norm,
-                gaussian_smoothing_sigma_bins=float(sigma),
+                gaussian_smoothing_sigma_bins=0.0,
                 session_stats_bin_stride=int(base_stride),
                 boundary_key_mode=boundary_key_mode,
             )
 
-            context = prepare_cache_context(cache_candidates=cache_candidates, config=cache_config)
+            context = prepare_cache_context(cache_candidates=sigma_cache_candidates, config=cache_config)
 
             if stats_path is not None:
                 _ = load_precomputed_session_feature_stats_into_cache_context(
