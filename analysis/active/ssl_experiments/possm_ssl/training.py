@@ -447,7 +447,7 @@ def _serialize_config(
     return {
         **asdict(config),
         "input_dim": int(cache_context.full_dim),
-        "cache_normalize_impl_version": str(cache_context.normalize_impl_version),
+        "cache_use_normalization": bool(cache_context.use_normalization),
         "cache_source_signature": (
             None
             if getattr(cache_context, "source_cache_signature", None) is None
@@ -900,6 +900,13 @@ def recover_possm_run_state_from_checkpoint(
         raise ValueError(
             "Recovered checkpoint input_dim does not match the active cache context. "
             f"checkpoint={int(recovered_config['input_dim'])} cache={int(cache_context.full_dim)}"
+        )
+    recovered_use_normalization = bool(recovered_config.get("cache_use_normalization", True))
+    recovered_data_mode = str(recovered_config.get("data_mode", "normalized"))
+    if recovered_data_mode == "normalized" and recovered_use_normalization != bool(cache_context.use_normalization):
+        raise ValueError(
+            "Recovered checkpoint cache normalization setting does not match the active cache context. "
+            f"checkpoint={recovered_use_normalization!r} cache={bool(cache_context.use_normalization)!r}"
         )
 
     model = _build_model_from_config(recovered_config).to(device)

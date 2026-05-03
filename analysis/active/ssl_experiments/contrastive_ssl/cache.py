@@ -23,6 +23,10 @@ except ImportError:  # pragma: no cover - optional dependency
     psutil = None
 
 
+# Fixed stride for session-stat computation to match the normalized cache artifacts.
+SESSION_STATS_BIN_STRIDE = 2
+
+
 @dataclass
 class CacheAccessConfig:
     mode: str = "copy_to_local"
@@ -31,8 +35,7 @@ class CacheAccessConfig:
     excluded_datasets: tuple[str, ...] = ("brain2text25",)
     seed: int = 7
     segment_bins: int = 64
-    normalize_context_bins: int | None = None
-    normalize_impl_version: str = "segment_prefix_v1"
+    use_normalization: bool = True
     examples_per_shard: int = 8
     tx_dim: int = 256
     sbp_dim: int = 256
@@ -47,12 +50,8 @@ class CacheAccessConfig:
             raise ValueError("examples_per_shard must be positive")
         if self.tx_dim <= 0 or self.sbp_dim <= 0:
             raise ValueError("tx_dim and sbp_dim must be positive")
-        if self.normalize_impl_version not in {"segment_prefix_v1", "session_featurewise_v1"}:
-            raise ValueError(
-                "normalize_impl_version must be one of {'segment_prefix_v1', 'session_featurewise_v1'}"
-            )
-        if self.normalize_context_bins is None:
-            self.normalize_context_bins = min(16, int(self.segment_bins))
+        if not isinstance(self.use_normalization, bool):
+            raise ValueError("use_normalization must be a boolean")
 
     @property
     def full_dim(self) -> int:
@@ -115,12 +114,8 @@ class CacheContext:
         return int(self.config.full_dim)
 
     @property
-    def normalize_context_bins(self) -> int:
-        return int(self.config.normalize_context_bins or 1)
-
-    @property
-    def normalize_impl_version(self) -> str:
-        return str(self.config.normalize_impl_version)
+    def use_normalization(self) -> bool:
+        return bool(self.config.use_normalization)
 
 
 def _format_bytes(num_bytes: int) -> str:
@@ -392,55 +387,22 @@ class ShardStore:
 def _normalize_segment(
     x_seq: torch.Tensor,
     feature_mask: torch.Tensor,
-    context_bins: int,
     *,
-    normalize_impl_version: str,
     session_feature_stats: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = None,
     session_key: str | None = None,
     min_scale_std: float = 0.1,
     clip_value: float = 20.0,
+    use_normalization: bool = True,
 ) -> torch.Tensor:
-    if normalize_impl_version == "segment_prefix_v1":
-        return _normalize_segment_prefix(
-            x_seq,
-            feature_mask,
-            context_bins=context_bins,
-            min_scale_std=min_scale_std,
-            clip_value=clip_value,
-        )
-    if normalize_impl_version == "session_featurewise_v1":
-        return _normalize_segment_session_featurewise(
-            x_seq,
-            feature_mask,
-            session_feature_stats=session_feature_stats,
-            session_key=session_key,
-            clip_value=clip_value,
-        )
-    raise ValueError(f"Unsupported normalize_impl_version: {normalize_impl_version}")
-
-
-def _normalize_segment_prefix(
-    x_seq: torch.Tensor,
-    feature_mask: torch.Tensor,
-    context_bins: int,
-    *,
-    min_scale_std: float = 0.1,
-    clip_value: float = 20.0,
-) -> torch.Tensor:
-    x_norm = x_seq.clone()
-    present_idx = torch.nonzero(feature_mask.bool(), as_tuple=False).squeeze(1)
-    if present_idx.numel() == 0:
-        return x_norm
-
-    context_x = x_norm[:context_bins, present_idx]
-    mean = context_x.mean(dim=0)
-    centered = x_norm[:, present_idx] - mean
-    std = context_x.std(dim=0, unbiased=False)
-    scale_mask = std >= min_scale_std
-    if scale_mask.any():
-        centered[:, scale_mask] = centered[:, scale_mask] / std[scale_mask]
-    x_norm[:, present_idx] = centered.clamp(min=-clip_value, max=clip_value)
-    return x_norm
+    if not bool(use_normalization):
+        return x_seq
+    return _normalize_segment_session_featurewise(
+        x_seq,
+        feature_mask,
+        session_feature_stats=session_feature_stats,
+        session_key=session_key,
+        clip_value=clip_value,
+    )
 
 
 def _normalize_segment_session_featurewise(
@@ -452,7 +414,7 @@ def _normalize_segment_session_featurewise(
     clip_value: float = 20.0,
 ) -> torch.Tensor:
     if session_feature_stats is None or session_key is None:
-        raise ValueError("Session feature stats are required for session_featurewise_v1 normalization.")
+        raise ValueError("Session feature stats are required when normalization is enabled.")
     if session_key not in session_feature_stats:
         raise KeyError(f"Missing session feature stats for {session_key}")
 
@@ -502,7 +464,7 @@ def _compute_session_feature_stats(
 
             tx = shard["tx"]
             if isinstance(tx, np.ndarray):
-                tx_window = np.asarray(tx[start:stop], dtype=np.float64)
+                tx_window = np.asarray(tx[start:stop:SESSION_STATS_BIN_STRIDE], dtype=np.float64)
                 tx_dim = min(tx_window.shape[1], config.tx_dim)
                 sum_x[:tx_dim] += tx_window[:, :tx_dim].sum(axis=0)
                 sum_x2[:tx_dim] += np.square(tx_window[:, :tx_dim]).sum(axis=0)
@@ -510,7 +472,7 @@ def _compute_session_feature_stats(
 
             sbp = shard["sbp"]
             if isinstance(sbp, np.ndarray):
-                sbp_window = np.asarray(sbp[start:stop], dtype=np.float64)
+                sbp_window = np.asarray(sbp[start:stop:SESSION_STATS_BIN_STRIDE], dtype=np.float64)
                 sbp_dim = min(sbp_window.shape[1], config.sbp_dim)
                 sbp_slice = slice(config.tx_dim, config.tx_dim + sbp_dim)
                 sum_x[sbp_slice] += sbp_window[:, :sbp_dim].sum(axis=0)
@@ -537,7 +499,6 @@ def load_precomputed_session_feature_stats_into_cache_context(
     *,
     cache_context: CacheContext,
     stats_path: str | Path,
-    normalize_impl_version: str = "session_featurewise_v1",
 ) -> dict[str, Any]:
     path = Path(stats_path)
     if not path.exists():
@@ -560,7 +521,6 @@ def load_precomputed_session_feature_stats_into_cache_context(
         session_feature_stats[str(key)] = (mean_t, std_t)
 
     cache_context.session_feature_stats = dict(session_feature_stats)
-    cache_context.config.normalize_impl_version = str(normalize_impl_version)
 
     metadata = dict(payload.get("metadata", {}))
     return {
@@ -568,7 +528,7 @@ def load_precomputed_session_feature_stats_into_cache_context(
         "metadata": metadata,
         "session_feature_stats": session_feature_stats,
         "session_count": int(len(session_feature_stats)),
-        "normalize_impl_version": cache_context.normalize_impl_version,
+        "use_normalization": cache_context.use_normalization,
     }
 
 
@@ -618,10 +578,9 @@ def sample_base_segment(
     x_norm = _normalize_segment(
         x_seq_t,
         feature_mask_t,
-        context_bins=cache_context.normalize_context_bins,
-        normalize_impl_version=cache_context.normalize_impl_version,
         session_feature_stats=cache_context.session_feature_stats,
         session_key=session_key,
+        use_normalization=cache_context.use_normalization,
     )
 
     return {
@@ -961,7 +920,7 @@ def prepare_cache_context(
         for dataset in pretrain_datasets
     )
     session_feature_stats: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
-    if config.normalize_impl_version == "session_featurewise_v1":
+    if config.use_normalization:
         session_feature_stats = _compute_session_feature_stats(
             shard_store=shard_store,
             rows_by_dataset=rows_by_dataset,

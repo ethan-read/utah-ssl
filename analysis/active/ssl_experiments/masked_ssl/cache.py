@@ -30,6 +30,9 @@ RUNTIME_SMOOTHING_MIGRATION_MESSAGE = (
     "gaussian_smoothing_sigma_bins=0.0 during training."
 )
 
+# Fixed stride for session-stat computation to match the normalized cache artifacts.
+SESSION_STATS_BIN_STRIDE = 2
+
 
 @dataclass
 class CacheAccessConfig:
@@ -39,15 +42,13 @@ class CacheAccessConfig:
     excluded_datasets: tuple[str, ...] = ("brain2text25",)
     seed: int = 7
     segment_bins: int = 64
-    normalize_context_bins: int | None = None
-    normalize_impl_version: str = "segment_prefix_v1"
+    use_normalization: bool = True
     examples_per_shard: int = 8
     tx_dim: int = 256
     sbp_dim: int = 256
     feature_mode: str = "tx_only"
     boundary_key_mode: str = "session"
     gaussian_smoothing_sigma_bins: float = 0.0
-    session_stats_bin_stride: int = 1
     shard_cache_ram_gb: float | None = None
 
     def __post_init__(self) -> None:
@@ -67,25 +68,8 @@ class CacheAccessConfig:
             )
         if float(self.gaussian_smoothing_sigma_bins) < 0.0:
             raise ValueError("gaussian_smoothing_sigma_bins must be non-negative")
-        stride_value = self.session_stats_bin_stride
-        if isinstance(stride_value, bool):
-            raise ValueError("session_stats_bin_stride must be a positive integer")
-        try:
-            stride_float = float(stride_value)
-            stride_int = int(stride_value)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("session_stats_bin_stride must be a positive integer") from exc
-        if not math.isfinite(stride_float) or abs(stride_float - float(stride_int)) > 1e-9:
-            raise ValueError("session_stats_bin_stride must be a positive integer")
-        if stride_int <= 0:
-            raise ValueError("session_stats_bin_stride must be a positive integer")
-        self.session_stats_bin_stride = stride_int
-        if self.normalize_impl_version not in {"segment_prefix_v1", "session_featurewise_v1"}:
-            raise ValueError(
-                "normalize_impl_version must be one of {'segment_prefix_v1', 'session_featurewise_v1'}"
-            )
-        if self.normalize_context_bins is None:
-            self.normalize_context_bins = min(16, int(self.segment_bins))
+        if not isinstance(self.use_normalization, bool):
+            raise ValueError("use_normalization must be a boolean")
 
     @property
     def full_dim(self) -> int:
@@ -159,12 +143,8 @@ class CacheContext:
         return str(self.config.boundary_key_mode)
 
     @property
-    def normalize_context_bins(self) -> int:
-        return int(self.config.normalize_context_bins or 1)
-
-    @property
-    def normalize_impl_version(self) -> str:
-        return str(self.config.normalize_impl_version)
+    def use_normalization(self) -> bool:
+        return bool(self.config.use_normalization)
 
     @property
     def gaussian_smoothing_sigma_bins(self) -> float:
@@ -488,55 +468,22 @@ class ShardStore:
 def _normalize_segment(
     x_seq: torch.Tensor,
     feature_mask: torch.Tensor,
-    context_bins: int,
     *,
-    normalize_impl_version: str,
     session_feature_stats: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = None,
     session_key: str | None = None,
     min_scale_std: float = 0.1,
     clip_value: float = 20.0,
+    use_normalization: bool = True,
 ) -> torch.Tensor:
-    if normalize_impl_version == "segment_prefix_v1":
-        return _normalize_segment_prefix(
-            x_seq,
-            feature_mask,
-            context_bins=context_bins,
-            min_scale_std=min_scale_std,
-            clip_value=clip_value,
-        )
-    if normalize_impl_version == "session_featurewise_v1":
-        return _normalize_segment_session_featurewise(
-            x_seq,
-            feature_mask,
-            session_feature_stats=session_feature_stats,
-            session_key=session_key,
-            clip_value=clip_value,
-        )
-    raise ValueError(f"Unsupported normalize_impl_version: {normalize_impl_version}")
-
-
-def _normalize_segment_prefix(
-    x_seq: torch.Tensor,
-    feature_mask: torch.Tensor,
-    context_bins: int,
-    *,
-    min_scale_std: float = 0.1,
-    clip_value: float = 20.0,
-) -> torch.Tensor:
-    x_norm = x_seq.clone()
-    present_idx = torch.nonzero(feature_mask.bool(), as_tuple=False).squeeze(1)
-    if present_idx.numel() == 0:
-        return x_norm
-
-    context_x = x_norm[:context_bins, present_idx]
-    mean = context_x.mean(dim=0)
-    centered = x_norm[:, present_idx] - mean
-    std = context_x.std(dim=0, unbiased=False)
-    scale_mask = std >= min_scale_std
-    if scale_mask.any():
-        centered[:, scale_mask] = centered[:, scale_mask] / std[scale_mask]
-    x_norm[:, present_idx] = centered.clamp(min=-clip_value, max=clip_value)
-    return x_norm
+    if not bool(use_normalization):
+        return x_seq
+    return _normalize_segment_session_featurewise(
+        x_seq,
+        feature_mask,
+        session_feature_stats=session_feature_stats,
+        session_key=session_key,
+        clip_value=clip_value,
+    )
 
 
 def _normalize_segment_session_featurewise(
@@ -548,7 +495,7 @@ def _normalize_segment_session_featurewise(
     clip_value: float = 20.0,
 ) -> torch.Tensor:
     if session_feature_stats is None or session_key is None:
-        raise ValueError("Session feature stats are required for session_featurewise_v1 normalization.")
+        raise ValueError("Session feature stats are required when normalization is enabled.")
     if session_key not in session_feature_stats:
         raise KeyError(f"Missing session feature stats for {session_key}")
 
@@ -659,7 +606,7 @@ def _compute_session_feature_stats(
     full_dim = int(config.full_dim)
     session_stats: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
     total_sessions = len(session_rows)
-    bin_stride = int(config.session_stats_bin_stride)
+    bin_stride = int(SESSION_STATS_BIN_STRIDE)
 
     for session_idx, session_key in enumerate(sorted(session_rows), start=1):
         rows = session_rows[session_key]
@@ -714,7 +661,6 @@ def load_precomputed_session_feature_stats_into_cache_context(
     *,
     cache_context: CacheContext,
     stats_path: str | Path,
-    normalize_impl_version: str = "session_featurewise_v1",
 ) -> dict[str, Any]:
     path = Path(stats_path)
     if not path.exists():
@@ -747,7 +693,6 @@ def load_precomputed_session_feature_stats_into_cache_context(
         session_feature_stats[str(key)] = (mean_t, std_t)
 
     cache_context.session_feature_stats = dict(session_feature_stats)
-    cache_context.config.normalize_impl_version = str(normalize_impl_version)
 
     metadata = dict(payload.get("metadata", {}))
     return {
@@ -755,7 +700,7 @@ def load_precomputed_session_feature_stats_into_cache_context(
         "metadata": metadata,
         "session_feature_stats": session_feature_stats,
         "session_count": int(len(session_feature_stats)),
-        "normalize_impl_version": cache_context.normalize_impl_version,
+        "use_normalization": cache_context.use_normalization,
     }
 
 
@@ -810,10 +755,9 @@ def sample_base_segment(
     x_norm = _normalize_segment(
         x_seq_t,
         feature_mask_t,
-        context_bins=cache_context.normalize_context_bins,
-        normalize_impl_version=cache_context.normalize_impl_version,
         session_feature_stats=cache_context.session_feature_stats,
         session_key=session_key,
+        use_normalization=cache_context.use_normalization,
     )
 
     return {
@@ -1161,7 +1105,7 @@ def prepare_cache_context(
         for dataset in pretrain_datasets
     )
     session_feature_stats: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
-    if config.normalize_impl_version == "session_featurewise_v1":
+    if config.use_normalization:
         session_feature_stats = _compute_session_feature_stats(
             shard_store=shard_store,
             rows_by_dataset=rows_by_dataset,

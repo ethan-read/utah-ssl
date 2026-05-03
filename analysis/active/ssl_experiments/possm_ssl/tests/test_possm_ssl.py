@@ -115,8 +115,7 @@ def _make_sampling_cache_context() -> SimpleNamespace:
         sbp_dim=2,
         feature_mode="tx_sbp",
         boundary_key_mode="session",
-        normalize_context_bins=2,
-        normalize_impl_version="session_featurewise_v1",
+        use_normalization=True,
         gaussian_smoothing_sigma_bins=0.0,
         session_feature_stats={
             "brain2text24:t00.2025.01.01": (torch.zeros(5), torch.ones(5)),

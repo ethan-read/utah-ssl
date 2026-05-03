@@ -36,7 +36,7 @@ class ValueEncoder(nn.Module):
         else:
             inner_dim = int(hidden_dim) if hidden_dim is not None else int(output_dim)
             self.net = nn.Sequential(
-                nn.Linear(1, inner_dim),
+                nn.Linear(1, inner_dim),  # takes one scalar value
                 nn.GELU(),
                 nn.Linear(inner_dim, int(output_dim)),
             )

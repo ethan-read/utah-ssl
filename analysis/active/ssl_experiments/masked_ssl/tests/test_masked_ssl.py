@@ -376,8 +376,7 @@ class MaskedSSLTests(unittest.TestCase):
             feature_mode="tx_only",
             boundary_key_mode="subject_if_available",
             shard_store=_DummyShardStore(),
-            normalize_context_bins=2,
-            normalize_impl_version="session_featurewise_v1",
+            use_normalization=True,
             session_feature_stats={
                 session_key: (
                     torch.tensor([1.0, 2.0, 3.0, 4.0]),
@@ -404,6 +403,47 @@ class MaskedSSLTests(unittest.TestCase):
         ) / 2.0
         self.assertTrue(torch.allclose(sample["x"], expected))
 
+    def test_sampling_can_bypass_normalization_when_disabled(self) -> None:
+        session_key = "toy:sess0"
+
+        class _DummyShardStore:
+            def get(self, _shard_relpath):
+                tx = np.arange(12, dtype=np.float32).reshape(6, 2)
+                return {
+                    "time_offsets": np.array([0, 6], dtype=np.int64),
+                    "tx": tx,
+                    "sbp": None,
+                }
+
+        cache_context = SimpleNamespace(
+            full_dim=2,
+            tx_dim=2,
+            sbp_dim=0,
+            feature_mode="tx_only",
+            boundary_key_mode="session",
+            shard_store=_DummyShardStore(),
+            use_normalization=False,
+            session_feature_stats={
+                session_key: (
+                    torch.tensor([10.0, 20.0]),
+                    torch.tensor([2.0, 4.0]),
+                )
+            },
+        )
+        example = SimpleNamespace(
+            dataset="toy",
+            session_id="sess0",
+            subject_id=None,
+            shard_relpath="unused",
+            example_index=0,
+            has_tx=True,
+            has_sbp=False,
+        )
+        sample = sample_base_segment(cache_context, example, segment_bins=6, py_rng=random.Random(0))
+        expected = torch.from_numpy(np.arange(12, dtype=np.float32).reshape(6, 2))
+        self.assertTrue(torch.equal(sample["x"], expected))
+        self.assertEqual(sample["boundary_key"], "toy:sess0")
+
     def test_sampling_ignores_legacy_runtime_smoothing_field(self) -> None:
         session_key = "toy:sess0"
         tx_series = np.arange(10, dtype=np.float32).reshape(10, 1)
@@ -423,8 +463,7 @@ class MaskedSSLTests(unittest.TestCase):
             feature_mode="tx_only",
             boundary_key_mode="subject_if_available",
             shard_store=_DummyShardStore(),
-            normalize_context_bins=2,
-            normalize_impl_version="session_featurewise_v1",
+            use_normalization=True,
             gaussian_smoothing_sigma_bins=1.0,
             session_feature_stats={
                 session_key: (
@@ -484,7 +523,6 @@ class MaskedSSLTests(unittest.TestCase):
             sbp_dim=1,
             feature_mode="tx_only",
             gaussian_smoothing_sigma_bins=0.0,
-            session_stats_bin_stride=2,
         )
 
         stats = _compute_session_feature_stats(

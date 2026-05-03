@@ -12,6 +12,7 @@ import pandas as pd
 
 from .cache import (
     CacheAccessConfig,
+    SESSION_STATS_BIN_STRIDE,
     load_cache_smoothing_provenance,
     load_precomputed_session_feature_stats_into_cache_context,
     prepare_cache_context,
@@ -53,7 +54,6 @@ def sigma_tag(value: float) -> str:
 def resolve_smoothed_stats_path(
     *,
     sigma: float,
-    stride: int,
     session_stats_dir: str | Path,
     active_sigma: float | None = None,
     loaded_session_stats_state: dict[str, Any] | None = None,
@@ -97,7 +97,7 @@ def resolve_smoothed_stats_path(
             session_stats_dir
             / (
                 "session_feature_stats_session_featurewise_v1_refds000950_cap126682_tx256_sbp256_"
-                f"stride{int(stride)}_stable.pt"
+                f"stride{int(SESSION_STATS_BIN_STRIDE)}_stable.pt"
             ),
             session_stats_dir
             / "session_feature_stats_session_featurewise_v1_refds000950_cap126682_tx256_sbp256_stable.pt",
@@ -107,7 +107,7 @@ def resolve_smoothed_stats_path(
             session_stats_dir
             / (
                 "session_feature_stats_session_featurewise_v1_refds000950_cap126682_tx256_sbp256_"
-                f"smooth_sigma{tag}_stride{int(stride)}_stable.pt"
+                f"smooth_sigma{tag}_stride{int(SESSION_STATS_BIN_STRIDE)}_stable.pt"
             ),
             session_stats_dir
             / (
@@ -327,7 +327,7 @@ def run_sigma_mask_probe_sweep(
     loaded_session_stats_state: dict[str, Any] | None,
     stable_stats_path: str | Path | None,
     session_stats_dir: str | Path,
-    normalize_impl_version: str,
+    use_normalization: bool,
     train_dataset: str,
     train_session_id: str,
     val_session_id: str,
@@ -343,8 +343,6 @@ def run_sigma_mask_probe_sweep(
     require_precomputed_stats_for_sweep: bool,
     boundary_key_mode: str = "subject_if_available",
 ) -> tuple[pd.DataFrame, dict[float, Any]]:
-    base_stride = int(base_cache_config.session_stats_bin_stride)
-
     contexts_by_sigma: dict[float, Any] = {}
     for sigma_value in sweep_sigmas:
         sigma = float(sigma_value)
@@ -359,29 +357,29 @@ def run_sigma_mask_probe_sweep(
                 print(f"[skip] {msg}")
                 continue
             raise RuntimeError(msg)
-        stats_path = resolve_smoothed_stats_path(
-            sigma=sigma,
-            stride=base_stride,
-            session_stats_dir=session_stats_dir,
-            active_sigma=active_sigma,
-            loaded_session_stats_state=loaded_session_stats_state,
-            stable_stats_path=stable_stats_path,
-        )
+        stats_path = None
+        if use_normalization:
+            stats_path = resolve_smoothed_stats_path(
+                sigma=sigma,
+                session_stats_dir=session_stats_dir,
+                active_sigma=active_sigma,
+                loaded_session_stats_state=loaded_session_stats_state,
+                stable_stats_path=stable_stats_path,
+            )
 
-        if stats_path is None:
-            msg = f"[sigma={sigma}] no precomputed smoothed stats found."
-            if skip_sigma_if_stats_missing:
-                print(f"[skip] {msg}")
-                continue
-            if require_precomputed_stats_for_sweep:
-                raise RuntimeError(msg + " Refusing to recompute session z-scores during sweep.")
+            if stats_path is None:
+                msg = f"[sigma={sigma}] no precomputed smoothed stats found."
+                if skip_sigma_if_stats_missing:
+                    print(f"[skip] {msg}")
+                    continue
+                if require_precomputed_stats_for_sweep:
+                    raise RuntimeError(msg + " Refusing to recompute session z-scores during sweep.")
 
         can_reuse_existing_ctx = (
             active_cache_context is not None
             and abs(sigma - float(active_sigma)) < 1e-6
-            and stats_path is not None
-            and stats_path.exists()
-            and bool(getattr(active_cache_context, "session_feature_stats", {}))
+            and (not use_normalization or (stats_path is not None and stats_path.exists()))
+            and (not use_normalization or bool(getattr(active_cache_context, "session_feature_stats", {})))
             and _cache_root_matches_sigma(
                 Path(active_cache_context.cache_root),
                 sigma=sigma,
@@ -393,29 +391,22 @@ def run_sigma_mask_probe_sweep(
             context = active_cache_context
             print(f"[sigma={sigma}] reusing existing CACHE_CONTEXT with preloaded session stats.")
         else:
-            prepare_norm = (
-                "segment_prefix_v1"
-                if (normalize_impl_version == "session_featurewise_v1" and stats_path is not None)
-                else normalize_impl_version
-            )
             cache_config = replace(
                 base_cache_config,
-                normalize_impl_version=prepare_norm,
+                use_normalization=use_normalization,
                 gaussian_smoothing_sigma_bins=0.0,
-                session_stats_bin_stride=int(base_stride),
                 boundary_key_mode=boundary_key_mode,
             )
 
             context = prepare_cache_context(cache_candidates=sigma_cache_candidates, config=cache_config)
 
-            if stats_path is not None:
+            if use_normalization and stats_path is not None:
                 _ = load_precomputed_session_feature_stats_into_cache_context(
                     cache_context=context,
                     stats_path=stats_path,
-                    normalize_impl_version=normalize_impl_version,
                 )
                 print(f"[sigma={sigma}] loaded stats: {stats_path.name}")
-            else:
+            elif use_normalization:
                 print(f"[sigma={sigma}] no precomputed stats found; used recomputed in-memory stats.")
 
         n_train, n_val = apply_two_session_split(

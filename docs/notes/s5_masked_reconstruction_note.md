@@ -27,7 +27,7 @@ Possible future architecture directions are intentionally deferred to a separate
 - decoder head: `reconstruction_head_type="mlp"`
 - optimization: `batch_size=32`, `learning_rate=1e-4`, `weight_decay=0`, `dropout=0`
 - preprocessing:
-  - `normalize_impl_version="session_featurewise_v1"`
+  - `use_normalization=true`
   - gaussian smoothing enabled with `gaussian_smoothing_sigma_bins=2.0`
   - run used precomputed smoothed session stats from Drive
 - result (single run):
@@ -53,6 +53,8 @@ Possible future architecture directions are intentionally deferred to a separate
 | model_variant | downstream_ctc_bpphone | downstream_per | reference_output_len | actual_output_len | actual_over_reference_len | most_common_prediction | most_common_prediction_rate |
 |---|---:|---:|---:|---:|---:|---|---:|
 | `ssl_run_probe80_colab_s5_masked_reconstruction...` | 9.146503 | 0.958631 | 701 | 744 | 1.061341 | SIL | 0.520161 |
+
+Brief takeaway (latest reruns): this larger masked-reconstruction run on most of `brain2text24` produced only minimal downstream gains with the current hyperparameters.
 
 ## Sweep Update (Smoothing Sigma)
 
