@@ -549,6 +549,48 @@ class MaskedSSLTests(unittest.TestCase):
                     ),
                 )
 
+    def test_prepare_cache_context_loads_precomputed_stats_without_recomputing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            cache_root = tmp_path / "cache_v1"
+            stats_path = tmp_path / "session_stats.pt"
+            _write_tiny_pretrain_cache(cache_root, dataset="toyset")
+            torch.save(
+                {
+                    "session_feature_stats": {
+                        "toyset:toy.2025.01.01": (torch.zeros(4), torch.ones(4)),
+                        "toyset:toy.2025.01.02": (torch.full((4,), 2.0), torch.ones(4)),
+                    },
+                    "metadata": {"kind": "test"},
+                },
+                stats_path,
+            )
+
+            with mock.patch(
+                "masked_ssl.cache._compute_session_feature_stats",
+                side_effect=AssertionError("should not recompute stats"),
+            ):
+                context = prepare_cache_context(
+                    cache_candidates=[cache_root],
+                    config=CacheAccessConfig(
+                        mode="drive_direct",
+                        excluded_datasets=(),
+                        feature_mode="tx_sbp",
+                        tx_dim=2,
+                        sbp_dim=2,
+                        use_normalization=True,
+                        precomputed_session_stats_path=stats_path,
+                    ),
+                )
+
+            self.assertEqual(set(context.session_feature_stats), {
+                "toyset:toy.2025.01.01",
+                "toyset:toy.2025.01.02",
+            })
+            mean, std = context.session_feature_stats["toyset:toy.2025.01.02"]
+            self.assertTrue(torch.equal(mean, torch.full((4,), 2.0)))
+            self.assertTrue(torch.equal(std, torch.ones(4)))
+
     def test_resolve_cache_candidates_for_sigma_finds_sibling_smoothed_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = Path(tmpdir)

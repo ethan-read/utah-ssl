@@ -50,6 +50,7 @@ class CacheAccessConfig:
     boundary_key_mode: str = "session"
     gaussian_smoothing_sigma_bins: float = 0.0
     shard_cache_ram_gb: float | None = None
+    precomputed_session_stats_path: str | Path | None = None
 
     def __post_init__(self) -> None:
         if self.mode not in {"copy_to_local", "drive_direct"}:
@@ -662,6 +663,27 @@ def load_precomputed_session_feature_stats_into_cache_context(
     cache_context: CacheContext,
     stats_path: str | Path,
 ) -> dict[str, Any]:
+    session_feature_stats, metadata, path = _load_precomputed_session_feature_stats(
+        stats_path=stats_path,
+        expected_dim=int(cache_context.full_dim),
+        feature_mode=str(cache_context.feature_mode),
+    )
+    cache_context.session_feature_stats = dict(session_feature_stats)
+    return {
+        "stats_path": path,
+        "metadata": metadata,
+        "session_feature_stats": session_feature_stats,
+        "session_count": int(len(session_feature_stats)),
+        "use_normalization": cache_context.use_normalization,
+    }
+
+
+def _load_precomputed_session_feature_stats(
+    *,
+    stats_path: str | Path,
+    expected_dim: int,
+    feature_mode: str,
+) -> tuple[dict[str, tuple[torch.Tensor, torch.Tensor]], dict[str, Any], Path]:
     path = Path(stats_path)
     if not path.exists():
         raise FileNotFoundError(f"Precomputed session stats file does not exist: {path}")
@@ -672,7 +694,6 @@ def load_precomputed_session_feature_stats_into_cache_context(
         raise KeyError("Precomputed session stats payload is missing 'session_feature_stats'.")
 
     session_feature_stats: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
-    expected_dim = int(cache_context.full_dim)
     for key, value in raw_stats.items():
         if not isinstance(value, (tuple, list)) or len(value) != 2:
             raise ValueError(
@@ -683,7 +704,7 @@ def load_precomputed_session_feature_stats_into_cache_context(
         std_t = torch.as_tensor(std).float().cpu()
         if mean_t.numel() < expected_dim or std_t.numel() < expected_dim:
             raise ValueError(
-                f"Session stats entry for {key!r} is too small for feature_mode={cache_context.feature_mode!r}: "
+                f"Session stats entry for {key!r} is too small for feature_mode={feature_mode!r}: "
                 f"expected at least {expected_dim} values, got mean={mean_t.numel()} std={std_t.numel()}."
             )
         if mean_t.numel() != expected_dim:
@@ -692,16 +713,8 @@ def load_precomputed_session_feature_stats_into_cache_context(
             std_t = std_t[:expected_dim].clone()
         session_feature_stats[str(key)] = (mean_t, std_t)
 
-    cache_context.session_feature_stats = dict(session_feature_stats)
-
     metadata = dict(payload.get("metadata", {}))
-    return {
-        "stats_path": path,
-        "metadata": metadata,
-        "session_feature_stats": session_feature_stats,
-        "session_count": int(len(session_feature_stats)),
-        "use_normalization": cache_context.use_normalization,
-    }
+    return session_feature_stats, metadata, path
 
 
 def sample_base_segment(
@@ -1106,11 +1119,19 @@ def prepare_cache_context(
     )
     session_feature_stats: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
     if config.use_normalization:
-        session_feature_stats = _compute_session_feature_stats(
-            shard_store=shard_store,
-            rows_by_dataset=rows_by_dataset,
-            config=config,
-        )
+        if config.precomputed_session_stats_path is not None:
+            session_feature_stats, _, stats_path = _load_precomputed_session_feature_stats(
+                stats_path=config.precomputed_session_stats_path,
+                expected_dim=int(config.full_dim),
+                feature_mode=str(config.feature_mode),
+            )
+            print(f"loaded precomputed SSL session-level featurewise z-scoring stats: {stats_path}")
+        else:
+            session_feature_stats = _compute_session_feature_stats(
+                shard_store=shard_store,
+                rows_by_dataset=rows_by_dataset,
+                config=config,
+            )
 
     return CacheContext(
         config=config,

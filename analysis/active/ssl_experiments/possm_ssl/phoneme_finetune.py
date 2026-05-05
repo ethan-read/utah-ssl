@@ -35,18 +35,16 @@ class POSSMFinetuneConfig:
     feature_mode: str | None = None
     data_mode: str | None = None
     boundary_key_mode: str | None = None
-    session_limit: int = 8
+    session_limit: int = 28
     target_session_count: int = 4
     batch_size: int = 8
-    num_steps: int = 400
-    budget_seconds: int = 240
+    num_steps: int = 5000
     learning_rate: float = 1e-3
     encoder_learning_rate: float = 3e-4
     weight_decay: float = 1e-2
     max_grad_norm: float = 1.0
     checkpoint_every_steps: int = 200
     progress_every_steps: int = 25
-    progress_every_seconds: float = 15.0
     gru_hidden_size: int = 768
     gru_num_layers: int = 5
     gru_dropout: float = 0.4
@@ -75,8 +73,6 @@ class POSSMFinetuneConfig:
             raise ValueError("target_session_count must be smaller than session_limit")
         if int(self.batch_size) <= 0 or int(self.num_steps) <= 0:
             raise ValueError("batch_size and num_steps must be positive")
-        if float(self.budget_seconds) <= 0.0:
-            raise ValueError("budget_seconds must be positive")
         if float(self.learning_rate) <= 0.0 or float(self.encoder_learning_rate) <= 0.0:
             raise ValueError("learning rates must be positive")
         if float(self.weight_decay) < 0.0:
@@ -85,8 +81,8 @@ class POSSMFinetuneConfig:
             raise ValueError("max_grad_norm must be positive")
         if int(self.checkpoint_every_steps) <= 0:
             raise ValueError("checkpoint_every_steps must be positive")
-        if int(self.progress_every_steps) <= 0 or float(self.progress_every_seconds) <= 0.0:
-            raise ValueError("progress reporting cadence must be positive")
+        if int(self.progress_every_steps) <= 0:
+            raise ValueError("progress_every_steps must be positive")
         if int(self.gru_hidden_size) <= 0 or int(self.gru_num_layers) <= 0:
             raise ValueError("GRU sizes must be positive")
         if not (0.0 <= float(self.gru_dropout) < 1.0):
@@ -361,7 +357,8 @@ def _build_problem(
         session_limit=int(config.session_limit),
         target_session_count=int(config.target_session_count),
         probe_batch_size=int(config.batch_size),
-        probe_budget_seconds=int(config.budget_seconds),
+        # This helper only needs the split-selection fields from DownstreamProbeConfig.
+        probe_budget_seconds=10**9,
         max_probe_steps=int(config.num_steps),
         probe_head_learning_rate=float(config.learning_rate),
         encoder_learning_rate=float(config.encoder_learning_rate),
@@ -630,12 +627,12 @@ def run_possm_phoneme_finetuning(
 
     while True:
         elapsed = time.time() - start_time
-        if elapsed >= float(effective_config.budget_seconds) or steps >= int(effective_config.num_steps):
+        if steps >= int(effective_config.num_steps):
             break
         made_progress = False
         for batch in train_loader:
             elapsed = time.time() - start_time
-            if elapsed >= float(effective_config.budget_seconds) or steps >= int(effective_config.num_steps):
+            if steps >= int(effective_config.num_steps):
                 break
             if train_encoder:
                 _set_train_mode(model, train_encoder=True)
@@ -669,7 +666,6 @@ def run_possm_phoneme_finetuning(
             should_report = (
                 steps == 1
                 or steps % int(effective_config.progress_every_steps) == 0
-                or elapsed - last_report_elapsed >= float(effective_config.progress_every_seconds)
             )
             if should_report:
                 last_report_elapsed = elapsed

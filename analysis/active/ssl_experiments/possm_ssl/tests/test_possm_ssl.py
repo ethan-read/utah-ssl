@@ -881,7 +881,6 @@ class POSSMSSLTests(unittest.TestCase):
                     target_session_count=1,
                     batch_size=1,
                     num_steps=2,
-                    budget_seconds=30,
                     learning_rate=1e-3,
                     encoder_learning_rate=3e-4,
                     checkpoint_every_steps=1,
