@@ -281,6 +281,7 @@ def _make_stage1_checkpoint(
     temporal_backbone_type: str = "gru",
     temporal_gru_hidden_size: int | None = None,
     temporal_backbone_kwargs: dict[str, object] | None = None,
+    use_token_norm: bool = True,
 ) -> Path:
     model = POSSMReconstructionModel(
         input_dim=5,
@@ -288,6 +289,7 @@ def _make_stage1_checkpoint(
         latent_count=4,
         ffn_hidden_size=16,
         dropout=0.0,
+        use_token_norm=use_token_norm,
         temporal_backbone_type=temporal_backbone_type,
         temporal_gru_hidden_size=temporal_gru_hidden_size,
         temporal_backbone_kwargs=temporal_backbone_kwargs,
@@ -313,6 +315,7 @@ def _make_stage1_checkpoint(
                 "value_mlp_hidden_size": None,
                 "ffn_hidden_size": 16,
                 "dropout": 0.0,
+                "use_token_norm": use_token_norm,
                 "temporal_backbone_type": temporal_backbone_type,
                 "temporal_gru_hidden_size": temporal_gru_hidden_size,
                 "temporal_gru_num_layers": 1,
@@ -711,6 +714,13 @@ class POSSMSSLTests(unittest.TestCase):
         self.assertEqual(encoder.input_dim, 5)
         self.assertEqual(encoder.hidden_size, 16)
         self.assertEqual(checkpoint_cfg["feature_mode"], "tx_sbp")
+
+    def test_recover_stage1_encoder_respects_saved_token_norm_flag(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            checkpoint_path = _make_stage1_checkpoint(Path(tmpdir), use_token_norm=False)
+            encoder, checkpoint_cfg, _ = recover_possm_stage1_encoder(checkpoint_path=checkpoint_path)
+        self.assertFalse(encoder.use_token_norm)
+        self.assertFalse(bool(checkpoint_cfg["use_token_norm"]))
 
     def test_recover_stage1_sequence_components_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

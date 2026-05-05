@@ -276,6 +276,7 @@ def _build_stage1_encoder_from_checkpoint_state(
         ),
         ffn_hidden_size=int(checkpoint_cfg["ffn_hidden_size"]),
         dropout=float(checkpoint_cfg["dropout"]),
+        use_token_norm=bool(checkpoint_cfg.get("use_token_norm", True)),
         feature_mode=str(checkpoint_cfg.get("feature_mode", "tx_sbp")),
     )
     encoder.load_state_dict(encoder_state)
