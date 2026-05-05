@@ -43,6 +43,7 @@ class POSSMTrainingConfig:
     value_mlp_hidden_size: int | None = None
     ffn_hidden_size: int = 256
     dropout: float = 0.1
+    use_token_norm: bool = True
     temporal_backbone_type: str = "gru"
     temporal_gru_hidden_size: int | None = None
     temporal_gru_num_layers: int = 1
@@ -127,6 +128,8 @@ class POSSMTrainingConfig:
             raise ValueError("ffn_hidden_size must be positive")
         if not (0.0 <= float(self.dropout) < 1.0):
             raise ValueError("dropout must be in [0, 1)")
+        if not isinstance(self.use_token_norm, bool):
+            raise ValueError("use_token_norm must be a boolean")
         if int(self.batch_size) <= 0 or int(self.num_steps) <= 0:
             raise ValueError("batch_size and num_steps must be positive")
         if float(self.learning_rate) <= 0.0:
@@ -557,6 +560,7 @@ def _build_model_from_config(config: dict[str, Any]) -> POSSMReconstructionModel
         ),
         ffn_hidden_size=int(config["ffn_hidden_size"]),
         dropout=float(config["dropout"]),
+        use_token_norm=bool(config.get("use_token_norm", True)),
         temporal_backbone_type=str(config.get("temporal_backbone_type", "gru")),
         temporal_gru_hidden_size=(
             None
@@ -658,6 +662,7 @@ def _train_loop(
         batch = train_sampler.sample_batch()
         sample_seconds = time.time() - sample_start
         dataset_counter.update(batch["datasets"])
+        model_start = time.time()
         metrics = compute_reconstruction_metrics(
             model,
             batch,
@@ -668,6 +673,7 @@ def _train_loop(
         loss = metrics["loss"]
         loss.backward()
         optimizer.step()
+        model_seconds = time.time() - model_start
 
         train_record = {
             "event": "train",
@@ -675,6 +681,7 @@ def _train_loop(
             "elapsed_seconds": round(time.time() - loop_start, 3),
             "loss": float(metrics["mse"]),
             "sample_seconds": round(sample_seconds, 4),
+            "model_seconds": round(model_seconds, 4),
             "objective_type": str(metrics.get("objective_type", config_payload.get("stage1_objective_type", "plain_mse"))),
             "masked_fraction": float(metrics.get("masked_fraction", 0.0)),
             "dataset_mix": dict(Counter(batch["datasets"])),
@@ -682,7 +689,10 @@ def _train_loop(
         train_history.append(train_record)
         if step == 1 or step % log_every == 0:
             _emit_progress(progress_path, train_record)
-            print(f"step={step:04d} train_loss={metrics['mse']:.6f}")
+            print(
+                f"step={step:04d} train_loss={metrics['mse']:.6f} "
+                f"sample_s={sample_seconds:.2f} model_s={model_seconds:.2f}"
+            )
 
         if val_sampler is not None and (step == 1 or step % val_every == 0):
             val_result = evaluate_model(
@@ -823,6 +833,7 @@ def run_possm_training(
         value_mlp_hidden_size=config.value_mlp_hidden_size,
         ffn_hidden_size=int(config.ffn_hidden_size),
         dropout=float(config.dropout),
+        use_token_norm=bool(config.use_token_norm),
         temporal_backbone_type=str(config.temporal_backbone_type),
         temporal_gru_hidden_size=config.temporal_gru_hidden_size,
         temporal_gru_num_layers=int(config.temporal_gru_num_layers),

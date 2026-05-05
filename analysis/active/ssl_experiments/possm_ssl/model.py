@@ -62,8 +62,16 @@ class ResidualFeedForwardBlock(nn.Module):
 
 
 class ResidualCrossAttentionBlock(nn.Module):
-    def __init__(self, dim: int, *, num_heads: int, dropout: float) -> None:
+    def __init__(
+        self,
+        dim: int,
+        *,
+        num_heads: int,
+        dropout: float,
+        normalize_context: bool = True,
+    ) -> None:
         super().__init__()
+        self.normalize_context = bool(normalize_context)
         self.query_norm = nn.LayerNorm(int(dim))
         self.context_norm = nn.LayerNorm(int(dim))
         self.attn = nn.MultiheadAttention(
@@ -75,10 +83,11 @@ class ResidualCrossAttentionBlock(nn.Module):
         self.dropout = nn.Dropout(float(dropout))
 
     def forward(self, query: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
+        normalized_context = self.context_norm(context) if self.normalize_context else context
         attn_out, _ = self.attn(
             self.query_norm(query),
-            self.context_norm(context),
-            self.context_norm(context),
+            normalized_context,
+            normalized_context,
             need_weights=False,
         )
         return query + self.dropout(attn_out)
@@ -113,6 +122,7 @@ class POSSMEncoder(nn.Module):
         value_mlp_hidden_size: int | None = None,
         ffn_hidden_size: int = 256,
         dropout: float = 0.1,
+        use_token_norm: bool = True,
         feature_mode: str = "tx_sbp",
     ) -> None:
         super().__init__()
@@ -130,13 +140,15 @@ class POSSMEncoder(nn.Module):
             encoder_type=str(value_encoder_type),
             hidden_dim=value_mlp_hidden_size,
         )
-        self.token_norm = nn.LayerNorm(self.model_dim)
+        self.use_token_norm = bool(use_token_norm)
+        self.token_norm = nn.LayerNorm(self.model_dim) if self.use_token_norm else nn.Identity()
         self.latents = nn.Parameter(torch.randn(self.latent_count, self.model_dim) * 0.02)
 
         self.cross_attention = ResidualCrossAttentionBlock(
             self.model_dim,
             num_heads=1,
             dropout=float(dropout),
+            normalize_context=self.use_token_norm,
         )
         self.cross_ffn = ResidualFeedForwardBlock(
             self.model_dim,
@@ -379,6 +391,7 @@ class POSSMReconstructionModel(nn.Module):
         value_mlp_hidden_size: int | None = None,
         ffn_hidden_size: int = 256,
         dropout: float = 0.1,
+        use_token_norm: bool = True,
         temporal_backbone_type: str = "gru",
         temporal_gru_hidden_size: int | None = None,
         temporal_gru_num_layers: int = 1,
@@ -401,6 +414,7 @@ class POSSMReconstructionModel(nn.Module):
             value_mlp_hidden_size=value_mlp_hidden_size,
             ffn_hidden_size=int(ffn_hidden_size),
             dropout=float(dropout),
+            use_token_norm=bool(use_token_norm),
             feature_mode=str(feature_mode),
         )
         self.temporal_backbone_type = str(temporal_backbone_type)
