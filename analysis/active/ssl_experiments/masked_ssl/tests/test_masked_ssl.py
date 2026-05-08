@@ -24,6 +24,7 @@ from masked_ssl.cache import (
     CacheAccessConfig,
     _apply_gaussian_smoothing,
     _compute_session_feature_stats,
+    load_precomputed_session_feature_stats_into_cache_context,
     prepare_cache_context,
     sample_base_segment,
 )
@@ -50,6 +51,7 @@ from masked_ssl.sweeps import resolve_cache_candidates_for_sigma
 from masked_ssl.training import recover_ssl_run_state_from_checkpoint
 from s5 import BidirectionalS5SequenceBackbone, S5SequenceBackbone, reverse_padded_sequence
 from build_smoothed_cache import build_smoothed_cache
+from recompute_session_feature_stats import recompute_session_feature_stats
 
 
 def _make_model(
@@ -659,6 +661,54 @@ class MaskedSSLTests(unittest.TestCase):
             )
             self.assertTrue(summary["dry_run"])
             self.assertFalse(dst_root.exists())
+
+    def test_recompute_session_feature_stats_writes_loader_compatible_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            cache_root = tmp_path / "cache_v1"
+            output_path = tmp_path / "session_stats.pt"
+            _write_tiny_pretrain_cache(cache_root, dataset="toyset")
+
+            result = recompute_session_feature_stats(
+                cache_root=cache_root,
+                output_path=output_path,
+                feature_mode="tx_sbp",
+                boundary_key_mode="session",
+                datasets=("toyset",),
+                tx_dim=2,
+                sbp_dim=2,
+                segment_bins=3,
+                seed=7,
+                examples_per_shard=1,
+                excluded_datasets=(),
+                overwrite=False,
+            )
+
+            self.assertTrue(output_path.exists())
+            self.assertEqual(int(result["session_count"]), 2)
+            payload = torch.load(output_path, map_location="cpu")
+            self.assertIn("session_feature_stats", payload)
+            self.assertIn("metadata", payload)
+            self.assertEqual(payload["metadata"]["feature_mode"], "tx_sbp")
+            self.assertEqual(payload["metadata"]["full_dim"], 4)
+            self.assertEqual(payload["metadata"]["requested_datasets"], ["toyset"])
+
+            cache_context = CacheAccessConfig(
+                mode="drive_direct",
+                excluded_datasets=(),
+                feature_mode="tx_sbp",
+                tx_dim=2,
+                sbp_dim=2,
+                segment_bins=3,
+                use_normalization=True,
+            )
+            context = prepare_cache_context(cache_candidates=[cache_root], config=cache_context)
+            loaded = load_precomputed_session_feature_stats_into_cache_context(
+                cache_context=context,
+                stats_path=output_path,
+            )
+            self.assertEqual(int(loaded["session_count"]), 2)
+            self.assertEqual(len(context.session_feature_stats), 2)
 
     def test_sample_mask_indices_one_span_is_contiguous_and_matches_target_count(self) -> None:
         random.seed(0)
