@@ -6,6 +6,7 @@ import copy
 import json
 import math
 import time
+from collections import Counter
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -186,6 +187,10 @@ def _edit_distance(reference: list[int], hypothesis: list[int]) -> int:
     return previous[-1]
 
 
+def _top_counter_items(counter: Counter[int], *, top_k: int = 10) -> list[list[int]]:
+    return [[int(item), int(count)] for item, count in counter.most_common(top_k)]
+
+
 def evaluate_possm_phoneme_metrics(
     *,
     model: POSSMPhonemeModel,
@@ -198,6 +203,11 @@ def evaluate_possm_phoneme_metrics(
     total_targets = 0
     total_edit_distance = 0
     total_reference_tokens = 0
+    total_predicted_tokens = 0
+    total_frames = 0
+    total_blank_frames = 0
+    reference_counter: Counter[int] = Counter()
+    prediction_counter: Counter[int] = Counter()
     with torch.no_grad():
         for batch in loader:
             x = batch["x"].to(device)
@@ -219,11 +229,20 @@ def evaluate_possm_phoneme_metrics(
                 outputs["token_lengths"],
                 blank_index=blank_index,
             )
+            frame_ids = outputs["logits"].argmax(dim=-1)
             for row_idx, prediction in enumerate(predictions):
                 reference_length = int(label_lengths[row_idx].item())
                 reference = labels[row_idx, :reference_length].tolist()
+                token_length = int(outputs["token_lengths"][row_idx].item())
                 total_edit_distance += _edit_distance(reference, prediction)
                 total_reference_tokens += len(reference)
+                total_predicted_tokens += len(prediction)
+                total_frames += token_length
+                total_blank_frames += int(
+                    (frame_ids[row_idx, :token_length] == int(blank_index)).sum().item()
+                )
+                reference_counter.update(int(token) for token in reference)
+                prediction_counter.update(int(token) for token in prediction)
     if total_targets <= 0:
         raise ValueError("Validation target count is zero; cannot compute val_ctc_bpphone.")
     if total_reference_tokens <= 0:
@@ -231,6 +250,18 @@ def evaluate_possm_phoneme_metrics(
     return {
         "val_ctc_bpphone": float(total_loss_sum / total_targets / math.log(2.0)),
         "val_phoneme_error_rate": float(total_edit_distance / total_reference_tokens),
+        "collapse_diagnostics": {
+            "total_reference_tokens": int(total_reference_tokens),
+            "total_predicted_tokens": int(total_predicted_tokens),
+            "predicted_to_reference_token_ratio": float(total_predicted_tokens / total_reference_tokens),
+            "blank_frame_rate": (
+                float(total_blank_frames / total_frames)
+                if total_frames > 0
+                else float("nan")
+            ),
+            "reference_top_ids": _top_counter_items(reference_counter),
+            "prediction_top_ids": _top_counter_items(prediction_counter),
+        },
     }
 
 
@@ -318,7 +349,8 @@ def recover_possm_stage1_sequence_components(
         if key.startswith("temporal_backbone.")
     }
     if not temporal_state:
-        if "temporal_backbone_type" in checkpoint_cfg:
+        temporal_backbone_type = str(checkpoint_cfg.get("temporal_backbone_type", "identity"))
+        if temporal_backbone_type != "identity":
             raise KeyError(
                 "Stage-1 POSSM checkpoint declares a temporal backbone but contains no "
                 "'temporal_backbone.*' weights."
@@ -735,6 +767,8 @@ def run_possm_phoneme_finetuning(
             "best_step": int(best_step),
             "model_num_parameters": int(final_metrics["model_num_parameters"]),
             "encoder_num_parameters": int(final_metrics["encoder_num_parameters"]),
+            "collapse_diagnostics": final_metrics.get("collapse_diagnostics"),
+            "best_collapse_diagnostics": best_metrics.get("collapse_diagnostics"),
         },
     }
     summary_path.write_text(json.dumps(summary, indent=2))
