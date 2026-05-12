@@ -15,6 +15,7 @@ from typing import Any
 import torch
 from torch.utils.data import DataLoader
 
+from masked_ssl.cache import load_cache_smoothing_provenance, resolve_boundary_key
 from masked_ssl.probe import (
     CanonicalSequenceDataset,
     DownstreamProbeConfig,
@@ -46,15 +47,43 @@ class POSSMFinetuneConfig:
     max_grad_norm: float = 1.0
     checkpoint_every_steps: int = 200
     progress_every_steps: int = 25
+    session_adapter_enabled: bool = True
+    input_smoothing_sigma_bins: float = 0.0
+    input_smoothing_kernel_size: int = 100
+    input_smoothing_threshold: float = 0.01
+    white_noise_sd: float = 0.0
+    constant_offset_sd: float = 0.0
     gru_hidden_size: int = 768
     gru_num_layers: int = 5
     gru_dropout: float = 0.4
+    # Backward-compatible aliases for old notebooks/checkpoints that briefly used
+    # Willett-style pre-GRU temporal patching names for the POSSM output conv.
+    temporal_patch_kernel_size: int | None = None
+    temporal_patch_stride: int | None = None
     conv_hidden_size: int | None = None
-    conv_kernel_size: int = 14
-    conv_stride: int = 4
+    conv_kernel_size: int | None = None
+    conv_stride: int | None = None
     conv_dropout: float = 0.1
 
     def __post_init__(self) -> None:
+        if self.conv_kernel_size is None:
+            self.conv_kernel_size = (
+                int(self.temporal_patch_kernel_size)
+                if self.temporal_patch_kernel_size is not None
+                else 14
+            )
+        else:
+            self.conv_kernel_size = int(self.conv_kernel_size)
+        if self.conv_stride is None:
+            self.conv_stride = (
+                int(self.temporal_patch_stride)
+                if self.temporal_patch_stride is not None
+                else 4
+            )
+        else:
+            self.conv_stride = int(self.conv_stride)
+        self.temporal_patch_kernel_size = int(self.conv_kernel_size)
+        self.temporal_patch_stride = int(self.conv_stride)
         if self.mode not in {"probe_frozen", "finetune_full"}:
             raise ValueError("mode must be one of {'probe_frozen', 'finetune_full'}")
         if self.feature_mode is not None and self.feature_mode not in {"tx_only", "tx_sbp"}:
@@ -84,6 +113,14 @@ class POSSMFinetuneConfig:
             raise ValueError("checkpoint_every_steps must be positive")
         if int(self.progress_every_steps) <= 0:
             raise ValueError("progress_every_steps must be positive")
+        if float(self.input_smoothing_sigma_bins) < 0.0:
+            raise ValueError("input_smoothing_sigma_bins must be non-negative")
+        if int(self.input_smoothing_kernel_size) <= 0:
+            raise ValueError("input_smoothing_kernel_size must be positive")
+        if not (0.0 <= float(self.input_smoothing_threshold) < 1.0):
+            raise ValueError("input_smoothing_threshold must be in [0, 1)")
+        if float(self.white_noise_sd) < 0.0 or float(self.constant_offset_sd) < 0.0:
+            raise ValueError("input augmentation standard deviations must be non-negative")
         if int(self.gru_hidden_size) <= 0 or int(self.gru_num_layers) <= 0:
             raise ValueError("GRU sizes must be positive")
         if not (0.0 <= float(self.gru_dropout) < 1.0):
@@ -138,10 +175,120 @@ def _set_train_mode(
         model.train()
         return
     model.eval()
+    if model.session_adapter_enabled:
+        model.session_input_adapter.train()
     model.gru.train()
     model.conv.train()
     model.conv_dropout.train()
     model.classifier.train()
+
+
+def _stage2_decoder_train_modules(
+    model: POSSMPhonemeModel,
+    *,
+    session_adapter_enabled: bool,
+) -> tuple[torch.nn.Module, ...]:
+    modules: list[torch.nn.Module] = []
+    if bool(session_adapter_enabled):
+        modules.append(model.session_input_adapter)
+    modules.extend((model.gru, model.conv, model.classifier))
+    return tuple(modules)
+
+
+def _willett_gaussian_kernel_1d(
+    *,
+    sigma_bins: float,
+    kernel_size: int,
+    threshold: float,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    sigma = float(sigma_bins)
+    if sigma <= 0.0:
+        return torch.ones((1,), device=device, dtype=dtype)
+    kernel_size = int(kernel_size)
+    if kernel_size <= 0:
+        raise ValueError("kernel_size must be positive")
+    center = int(kernel_size // 2)
+    positions = torch.arange(kernel_size, device=device, dtype=dtype) - float(center)
+    kernel = torch.exp(-0.5 * (positions / sigma).pow(2))
+    kernel = kernel / kernel.sum().clamp_min(1e-8)
+    keep = kernel > float(threshold)
+    if not bool(keep.any().item()):
+        keep[center] = True
+    kept_positions = torch.nonzero(keep, as_tuple=False).squeeze(1)
+    start = int(kept_positions.min().item())
+    stop = int(kept_positions.max().item()) + 1
+    kernel = kernel[start:stop]
+    if kernel.numel() % 2 == 0:
+        # Keep SAME-length convolution simple and centered if non-default settings create an even kernel.
+        kernel = torch.cat([kernel, kernel.new_zeros((1,))], dim=0)
+    return kernel / kernel.sum().clamp_min(1e-8)
+
+
+def _sequence_mask_from_lengths(
+    lengths: torch.Tensor,
+    max_time: int,
+) -> torch.Tensor:
+    return torch.arange(max_time, device=lengths.device).unsqueeze(0) < lengths.unsqueeze(1)
+
+
+def _smooth_batch_like_willett(
+    x: torch.Tensor,
+    input_lengths: torch.Tensor,
+    *,
+    sigma_bins: float,
+    kernel_size: int,
+    threshold: float,
+) -> torch.Tensor:
+    if float(sigma_bins) <= 0.0 or int(x.shape[1]) <= 1:
+        return x
+    kernel = _willett_gaussian_kernel_1d(
+        sigma_bins=float(sigma_bins),
+        kernel_size=int(kernel_size),
+        threshold=float(threshold),
+        device=x.device,
+        dtype=x.dtype,
+    )
+    channels = int(x.shape[-1])
+    weight = kernel.view(1, 1, -1).expand(channels, 1, -1)
+    smoothed = torch.nn.functional.conv1d(
+        x.transpose(1, 2),
+        weight,
+        padding=int(kernel.numel() // 2),
+        groups=channels,
+    ).transpose(1, 2)
+    valid = _sequence_mask_from_lengths(input_lengths.to(x.device), int(x.shape[1]))
+    return smoothed * valid.unsqueeze(-1).to(smoothed.dtype)
+
+
+def _prepare_stage2_inputs(
+    x: torch.Tensor,
+    input_lengths: torch.Tensor,
+    *,
+    config: POSSMFinetuneConfig,
+    is_training: bool,
+) -> torch.Tensor:
+    transformed = x
+    if is_training and float(config.white_noise_sd) > 0.0:
+        transformed = transformed + torch.randn(
+            transformed.shape,
+            device=transformed.device,
+            dtype=transformed.dtype,
+        ) * float(config.white_noise_sd)
+    if is_training and float(config.constant_offset_sd) > 0.0:
+        transformed = transformed + torch.randn(
+            (int(transformed.shape[0]), 1, int(transformed.shape[2])),
+            device=transformed.device,
+            dtype=transformed.dtype,
+        ) * float(config.constant_offset_sd)
+    return _smooth_batch_like_willett(
+        transformed,
+        input_lengths,
+        sigma_bins=float(config.input_smoothing_sigma_bins),
+        kernel_size=int(config.input_smoothing_kernel_size),
+        threshold=float(config.input_smoothing_threshold),
+    )
 
 
 def _ctc_greedy_decode(
@@ -197,6 +344,7 @@ def evaluate_possm_phoneme_metrics(
     loader: DataLoader,
     device: torch.device,
     blank_index: int,
+    input_transform_config: POSSMFinetuneConfig | None = None,
 ) -> dict[str, Any]:
     model.eval()
     total_loss_sum = 0.0
@@ -212,6 +360,13 @@ def evaluate_possm_phoneme_metrics(
         for batch in loader:
             x = batch["x"].to(device)
             input_lengths = batch["input_lengths"].to(device)
+            if input_transform_config is not None:
+                x = _prepare_stage2_inputs(
+                    x,
+                    input_lengths,
+                    config=input_transform_config,
+                    is_training=False,
+                )
             labels = batch["labels"].to(device)
             label_lengths = batch["label_lengths"].to(device)
             outputs = model(x, input_lengths, session_ids=batch["boundary_keys"])
@@ -407,6 +562,25 @@ def _build_problem(
     )
 
 
+def _session_adapter_keys_for_rows(
+    rows: list[Any] | tuple[Any, ...],
+    *,
+    dataset: str,
+    boundary_key_mode: str,
+) -> tuple[str, ...]:
+    return tuple(
+        dict.fromkeys(
+            resolve_boundary_key(
+                dataset=str(dataset),
+                session_id=str(row.session_id),
+                subject_id=row.subject_id,
+                boundary_key_mode=str(boundary_key_mode),
+            )
+            for row in rows
+        )
+    )
+
+
 def _checkpoint_payload(
     *,
     model: POSSMPhonemeModel,
@@ -427,6 +601,10 @@ def _checkpoint_payload(
         "feature_mode": str(problem["feature_mode"]),
         "data_mode": str(metrics.get("data_mode", resolved_config.data_mode)),
         "dataset": str(problem["dataset"]),
+        "cache_root": str(problem["cache_root"]),
+        "cache_smoothing_provenance": problem.get("cache_smoothing_provenance"),
+        "session_adapter_enabled": bool(model.session_adapter_enabled),
+        "session_adapter_keys": list(model.session_input_adapter.session_keys),
         "encoder_state": model.base_encoder.state_dict(),
         "model_state": model.state_dict(),
         "vocab": problem["vocab"],
@@ -492,6 +670,17 @@ def run_possm_phoneme_finetuning(
         feature_mode=effective_feature_mode,
         boundary_key_mode=effective_boundary_key_mode,
     )
+    cache_smoothing_provenance = load_cache_smoothing_provenance(
+        Path(problem["cache_root"]),
+        dataset=str(problem["dataset"]),
+    )
+    if float(effective_config.input_smoothing_sigma_bins) > 0.0 and cache_smoothing_provenance:
+        raise ValueError(
+            "POSSM stage-2 online smoothing was requested, but the selected cache root "
+            "already declares pre-smoothed features. Use the raw cache root for "
+            "Willett-style normalize -> augment -> smooth stage-2 training."
+        )
+    problem["cache_smoothing_provenance"] = cache_smoothing_provenance
 
     if effective_data_mode == "normalized":
         target_stats_mode = "global" if len(problem["target_session_ids"]) == 1 else "per_session"
@@ -530,6 +719,11 @@ def run_possm_phoneme_finetuning(
     )
 
     vocab = dict(problem["vocab"])
+    session_adapter_keys = _session_adapter_keys_for_rows(
+        [*problem["target_train_rows"], *problem["target_val_rows"]],
+        dataset=str(problem.get("dataset", effective_config.dataset)),
+        boundary_key_mode=str(problem.get("boundary_key_mode", effective_boundary_key_mode)),
+    )
     model = POSSMPhonemeModel(
         base_encoder=copy.deepcopy(base_encoder),
         pre_decoder_backbone=copy.deepcopy(pre_decoder_backbone),
@@ -541,6 +735,8 @@ def run_possm_phoneme_finetuning(
         conv_kernel_size=int(effective_config.conv_kernel_size),
         conv_stride=int(effective_config.conv_stride),
         conv_dropout=float(effective_config.conv_dropout),
+        session_adapter_keys=session_adapter_keys,
+        session_adapter_enabled=bool(effective_config.session_adapter_enabled),
     )
 
     train_encoder = str(effective_config.mode) == "finetune_full"
@@ -549,6 +745,8 @@ def run_possm_phoneme_finetuning(
     if model.pre_decoder_backbone is not None:
         for parameter in model.pre_decoder_backbone.parameters():
             parameter.requires_grad = bool(train_encoder)
+    for parameter in model.session_input_adapter.parameters():
+        parameter.requires_grad = bool(effective_config.session_adapter_enabled)
     for parameter in model.gru.parameters():
         parameter.requires_grad = True
     for parameter in model.conv.parameters():
@@ -561,7 +759,10 @@ def run_possm_phoneme_finetuning(
         {
             "params": [
                 param
-                for module in (model.gru, model.conv, model.classifier)
+                for module in _stage2_decoder_train_modules(
+                    model,
+                    session_adapter_enabled=bool(effective_config.session_adapter_enabled),
+                )
                 for param in module.parameters()
                 if param.requires_grad
             ],
@@ -624,6 +825,7 @@ def run_possm_phoneme_finetuning(
             loader=val_loader,
             device=resolved_device,
             blank_index=int(problem["vocab"]["blank_index"]),
+            input_transform_config=effective_config,
         )
         metrics["model_num_parameters"] = _count_trainable_parameters(model)
         metrics["encoder_num_parameters"] = _count_trainable_sequence_encoder_parameters(model)
@@ -673,6 +875,12 @@ def run_possm_phoneme_finetuning(
                 _set_train_mode(model, train_encoder=False)
             x = batch["x"].to(resolved_device)
             input_lengths = batch["input_lengths"].to(resolved_device)
+            x = _prepare_stage2_inputs(
+                x,
+                input_lengths,
+                config=effective_config,
+                is_training=True,
+            )
             labels = batch["labels"].to(resolved_device)
             label_lengths = batch["label_lengths"].to(resolved_device)
 
@@ -724,6 +932,7 @@ def run_possm_phoneme_finetuning(
             loader=val_loader,
             device=resolved_device,
             blank_index=int(problem["vocab"]["blank_index"]),
+            input_transform_config=effective_config,
         )
         final_metrics["model_num_parameters"] = _count_trainable_parameters(model)
         final_metrics["encoder_num_parameters"] = _count_trainable_sequence_encoder_parameters(model)
@@ -758,6 +967,10 @@ def run_possm_phoneme_finetuning(
         "data_mode": effective_data_mode,
         "boundary_key_mode": effective_boundary_key_mode,
         "dataset": str(effective_config.dataset),
+        "cache_root": str(problem["cache_root"]),
+        "cache_smoothing_provenance": problem.get("cache_smoothing_provenance"),
+        "session_adapter_enabled": bool(effective_config.session_adapter_enabled),
+        "session_adapter_keys": list(session_adapter_keys),
         "steps": int(steps),
         "metrics": {
             "val_ctc_bpphone": float(final_metrics["val_ctc_bpphone"]),

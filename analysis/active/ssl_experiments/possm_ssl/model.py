@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
@@ -491,6 +492,83 @@ def causal_conv_output_lengths(lengths: torch.Tensor, stride: int) -> torch.Tens
     return torch.where(positive, output, torch.zeros_like(output))
 
 
+class SessionFeatureAffine(nn.Module):
+    """Per-session per-feature affine initialized as an exact identity map."""
+
+    def __init__(self, input_dim: int) -> None:
+        super().__init__()
+        self.input_dim = int(input_dim)
+        self.scale = nn.Parameter(torch.ones(self.input_dim))
+        self.bias = nn.Parameter(torch.zeros(self.input_dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x * self.scale.view(1, -1) + self.bias.view(1, -1)
+
+
+class SessionInputAdapterBank(nn.Module):
+    """Per-session per-feature affine bank for residual session drift."""
+
+    def __init__(self, session_keys: tuple[str, ...] | list[str], input_dim: int) -> None:
+        super().__init__()
+        self.input_dim = int(input_dim)
+        if self.input_dim <= 0:
+            raise ValueError("input_dim must be positive")
+        unique_keys = tuple(dict.fromkeys(str(key) for key in session_keys))
+        self.session_keys = unique_keys
+        self._name_map = {
+            session_key: self._module_key(session_key)
+            for session_key in unique_keys
+        }
+        if len(set(self._name_map.values())) != len(self._name_map):
+            raise ValueError("Session adapter module-key collision; boundary keys must be unique.")
+        self.default_layer = self._identity_feature_affine(self.input_dim)
+        self.layers = nn.ModuleDict(
+            {
+                module_key: self._identity_feature_affine(self.input_dim)
+                for module_key in self._name_map.values()
+            }
+        )
+
+    @staticmethod
+    def _module_key(session_key: str) -> str:
+        digest = hashlib.sha1(str(session_key).encode("utf-8")).hexdigest()
+        return f"adapter_{digest}"
+
+    @staticmethod
+    def _identity_feature_affine(input_dim: int) -> SessionFeatureAffine:
+        return SessionFeatureAffine(int(input_dim))
+
+    def _layer_for_key(self, session_key: str) -> SessionFeatureAffine:
+        module_key = self._name_map.get(str(session_key))
+        if module_key is None:
+            return self.default_layer
+        return self.layers[module_key]
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        session_ids: list[str] | tuple[str, ...] | None,
+    ) -> torch.Tensor:
+        if x.ndim != 3:
+            raise ValueError(f"Expected x to have shape [B, T, D], got {tuple(x.shape)}")
+        if int(x.shape[-1]) != self.input_dim:
+            raise ValueError(
+                f"Expected last input dimension {self.input_dim}, got {int(x.shape[-1])}"
+            )
+        if session_ids is None:
+            raise ValueError("session_ids/boundary_keys are required when session adapter is enabled.")
+        if len(session_ids) != int(x.shape[0]):
+            raise ValueError(
+                "session_ids/boundary_keys length must match batch size: "
+                f"got {len(session_ids)} keys for batch size {int(x.shape[0])}."
+            )
+        adapted = [
+            self._layer_for_key(str(session_key))(x[row_idx])
+            for row_idx, session_key in enumerate(session_ids)
+        ]
+        return torch.stack(adapted, dim=0)
+
+
 class POSSMPhonemeModel(nn.Module):
     def __init__(
         self,
@@ -501,10 +579,14 @@ class POSSMPhonemeModel(nn.Module):
         gru_hidden_size: int = 768,
         gru_num_layers: int = 5,
         gru_dropout: float = 0.4,
+        temporal_patch_kernel_size: int | None = None,
+        temporal_patch_stride: int | None = None,
         conv_hidden_size: int | None = None,
-        conv_kernel_size: int = 14,
-        conv_stride: int = 4,
+        conv_kernel_size: int | None = None,
+        conv_stride: int | None = None,
         conv_dropout: float = 0.1,
+        session_adapter_keys: tuple[str, ...] = (),
+        session_adapter_enabled: bool = True,
     ) -> None:
         super().__init__()
         self.base_encoder = base_encoder
@@ -512,11 +594,26 @@ class POSSMPhonemeModel(nn.Module):
         self.vocab_size = int(vocab_size)
         self.gru_hidden_size = int(gru_hidden_size)
         self.gru_num_layers = int(gru_num_layers)
+        self.session_adapter_enabled = bool(session_adapter_enabled)
+        self.session_input_adapter = SessionInputAdapterBank(
+            tuple(session_adapter_keys),
+            input_dim=int(base_encoder.input_dim),
+        )
         self.conv_hidden_size = (
             int(conv_hidden_size) if conv_hidden_size is not None else int(gru_hidden_size)
         )
-        self.conv_kernel_size = int(conv_kernel_size)
-        self.conv_stride = int(conv_stride)
+        self.conv_kernel_size = (
+            int(conv_kernel_size)
+            if conv_kernel_size is not None
+            else (int(temporal_patch_kernel_size) if temporal_patch_kernel_size is not None else 14)
+        )
+        self.conv_stride = (
+            int(conv_stride)
+            if conv_stride is not None
+            else (int(temporal_patch_stride) if temporal_patch_stride is not None else 4)
+        )
+        if self.conv_kernel_size <= 0 or self.conv_stride <= 0:
+            raise ValueError("conv kernel size and stride must be positive")
         self.conv_dropout_rate = float(conv_dropout)
 
         encoder_output_size = (
@@ -524,9 +621,11 @@ class POSSMPhonemeModel(nn.Module):
             if self.pre_decoder_backbone is not None
             else int(base_encoder.hidden_size)
         )
+        self.sequence_input_size = int(encoder_output_size)
+        self.gru_input_size = self.sequence_input_size
         effective_gru_dropout = float(gru_dropout) if int(gru_num_layers) > 1 else 0.0
         self.gru = nn.GRU(
-            input_size=encoder_output_size,
+            input_size=self.gru_input_size,
             hidden_size=self.gru_hidden_size,
             num_layers=self.gru_num_layers,
             dropout=effective_gru_dropout,
@@ -558,7 +657,12 @@ class POSSMPhonemeModel(nn.Module):
         *,
         session_ids: list[str] | tuple[str, ...] | None = None,
     ) -> dict[str, torch.Tensor]:
-        encoder_outputs = self.base_encoder.encode(x, input_lengths, session_ids)
+        adapted_input = (
+            self.session_input_adapter(x, session_ids)
+            if self.session_adapter_enabled
+            else x
+        )
+        encoder_outputs = self.base_encoder.encode(adapted_input, input_lengths, session_ids)
         encoder_hidden = encoder_outputs.hidden
         if self.pre_decoder_backbone is not None:
             encoder_hidden = self.pre_decoder_backbone(
@@ -587,6 +691,7 @@ class POSSMPhonemeModel(nn.Module):
         output_lengths = causal_conv_output_lengths(encoder_outputs.token_lengths, self.conv_stride)
         logits = self.classifier(conv_hidden)
         return {
+            "adapted_input": adapted_input,
             "encoder_hidden": encoder_outputs.hidden,
             "sequence_hidden": encoder_hidden,
             "encoder_lengths": encoder_outputs.token_lengths,

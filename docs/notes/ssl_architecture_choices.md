@@ -10,6 +10,7 @@ It is intentionally incremental. Each section should capture the current state o
 - training regime: self-supervised pretraining followed by downstream transfer / decoding experiments
 - current inspirations:
   - [`BIT_architecture_notes.md`](../paper_notes/BIT_architecture_notes.md)
+  - [`bit_to_s5_faithful_adaptation.md`](./bit_to_s5_faithful_adaptation.md)
   - [`cortical_ssm_architecture_notes.md`](../paper_notes/cortical_ssm_architecture_notes.md)
   - [`POSSM_architecture_notes.md`](../paper_notes/POSSM_architecture_notes.md)
 

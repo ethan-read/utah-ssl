@@ -11,3 +11,5 @@ Notes on relevant published papers live in `docs/paper_notes`.
 The dataset for this work exists both locally and on Google Drive.
 
 A short inventory of the important cache roots and precomputed session-stats artifacts lives in `docs/notes/cache_and_stats_inventory.md`. Check it before changing notebook cache paths or normalization settings.
+
+The Willett speechBCI reference code is cloned locally at `external/speechBCI` for architecture and training-recipe comparisons.

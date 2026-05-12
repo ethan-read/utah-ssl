@@ -21,12 +21,16 @@ for path in (REPO_ROOT, EXPERIMENTS_DIR):
 from possm_ssl.model import (
     POSSMPhonemeModel,
     POSSMReconstructionModel,
+    SessionInputAdapterBank,
     causal_conv_output_lengths,
     register_temporal_backbone,
 )
 from possm_ssl.phoneme_finetune import (
     POSSMFinetuneConfig,
+    _prepare_stage2_inputs,
     _set_train_mode,
+    _stage2_decoder_train_modules,
+    _willett_gaussian_kernel_1d,
     recover_possm_stage1_encoder,
     recover_possm_stage1_sequence_components,
     run_possm_phoneme_finetuning,
@@ -702,10 +706,61 @@ class POSSMSSLTests(unittest.TestCase):
         self.assertEqual(int(outputs.tokens.shape[2]), 5)
         self.assertFalse(torch.isnan(outputs.tokens).any().item())
 
-    def test_causal_conv_output_lengths_match_stride_rule(self) -> None:
-        lengths = torch.tensor([1, 2, 3, 4, 5, 8], dtype=torch.long)
-        expected = torch.tensor([1, 1, 1, 1, 2, 2], dtype=torch.long)
-        self.assertTrue(torch.equal(causal_conv_output_lengths(lengths, stride=4), expected))
+    def test_causal_conv_output_lengths_match_left_padded_stride_rule(self) -> None:
+        lengths = torch.tensor([0, 1, 13, 14, 15, 18, 80], dtype=torch.long)
+        expected = torch.tensor([0, 1, 4, 4, 4, 5, 20], dtype=torch.long)
+        actual = causal_conv_output_lengths(lengths, stride=4)
+        self.assertTrue(torch.equal(actual, expected))
+
+    def test_session_input_adapter_bank_initializes_to_identity_feature_affine(self) -> None:
+        adapter = SessionInputAdapterBank(("day.1", "day/2"), input_dim=3)
+        reversed_adapter = SessionInputAdapterBank(("day/2", "day.1"), input_dim=3)
+        self.assertEqual(set(adapter.layers.keys()), set(reversed_adapter.layers.keys()))
+        for layer in [adapter.default_layer, *adapter.layers.values()]:
+            self.assertTrue(torch.allclose(layer.scale, torch.ones(3)))
+            self.assertTrue(torch.allclose(layer.bias, torch.zeros(3)))
+        x = torch.tensor(
+            [
+                [[-2.0, 0.0, 2.0], [1.0, -1.0, 0.5]],
+                [[3.0, -3.0, 1.0], [0.0, 2.0, -2.0]],
+            ],
+            dtype=torch.float32,
+        )
+        actual = adapter(x, ["day.1", "unknown-day"])
+        self.assertTrue(torch.allclose(actual, x))
+        with self.assertRaisesRegex(ValueError, "length must match batch size"):
+            adapter(x, ["day.1"])
+
+    def test_willett_style_stage2_input_transform_smooths_after_augmentation(self) -> None:
+        torch.manual_seed(7)
+        x = torch.zeros(2, 8, 3)
+        lengths = torch.tensor([8, 5], dtype=torch.long)
+        config = POSSMFinetuneConfig(
+            input_smoothing_sigma_bins=2.0,
+            input_smoothing_kernel_size=100,
+            input_smoothing_threshold=0.01,
+            white_noise_sd=1.0,
+            constant_offset_sd=0.2,
+        )
+        train_x = _prepare_stage2_inputs(x, lengths, config=config, is_training=True)
+        eval_x = _prepare_stage2_inputs(x, lengths, config=config, is_training=False)
+        self.assertEqual(tuple(train_x.shape), tuple(x.shape))
+        self.assertEqual(tuple(eval_x.shape), tuple(x.shape))
+        self.assertFalse(torch.allclose(train_x, torch.zeros_like(train_x)))
+        self.assertTrue(torch.allclose(eval_x, torch.zeros_like(eval_x)))
+        self.assertTrue(torch.allclose(train_x[1, 5:], torch.zeros_like(train_x[1, 5:])))
+
+    def test_willett_gaussian_kernel_matches_sigma2_threshold_width(self) -> None:
+        kernel = _willett_gaussian_kernel_1d(
+            sigma_bins=2.0,
+            kernel_size=100,
+            threshold=0.01,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+        self.assertEqual(int(kernel.numel()), 9)
+        self.assertAlmostEqual(float(kernel.sum().item()), 1.0, places=6)
+        self.assertTrue(torch.allclose(kernel, torch.flip(kernel, dims=[0])))
 
     def test_recover_stage1_encoder_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -850,7 +905,7 @@ class POSSMSSLTests(unittest.TestCase):
         self.assertEqual(expected_offset, 1)
         self.assertTrue(torch.allclose(batch["x"][0], expected_x))
 
-    def test_probe_frozen_keeps_conv_dropout_in_train_mode(self) -> None:
+    def test_possm_phoneme_model_post_gru_conv_shapes(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             base_encoder = recover_possm_stage1_encoder(
                 checkpoint_path=_make_stage1_checkpoint(Path(tmpdir)),
@@ -861,17 +916,102 @@ class POSSMSSLTests(unittest.TestCase):
                 gru_hidden_size=8,
                 gru_num_layers=2,
                 gru_dropout=0.0,
-                conv_hidden_size=8,
                 conv_kernel_size=3,
                 conv_stride=2,
-                conv_dropout=0.2,
+            )
+            x = torch.randn(2, 8, 5)
+            lengths = torch.tensor([8, 7], dtype=torch.long)
+            outputs = model(x, lengths, session_ids=["a", "b"])
+            self.assertEqual(int(model.gru.weight_ih_l0.shape[1]), base_encoder.hidden_size)
+            self.assertEqual(tuple(outputs["gru_hidden"].shape), (2, 8, 8))
+            self.assertEqual(tuple(outputs["conv_hidden"].shape), (2, 4, 8))
+            self.assertEqual(tuple(outputs["logits"].shape), (2, 4, 3))
+            self.assertTrue(torch.equal(outputs["token_lengths"], torch.tensor([4, 4])))
+            self.assertEqual(tuple(outputs["adapted_input"].shape), (2, 8, 5))
+
+    def test_possm_phoneme_model_requires_session_ids_when_adapter_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_encoder = recover_possm_stage1_encoder(
+                checkpoint_path=_make_stage1_checkpoint(Path(tmpdir)),
+            )[0]
+            model = POSSMPhonemeModel(
+                base_encoder=base_encoder,
+                vocab_size=3,
+                gru_hidden_size=8,
+                gru_num_layers=1,
+                gru_dropout=0.0,
+                conv_kernel_size=3,
+                conv_stride=1,
+                session_adapter_enabled=True,
+            )
+            with self.assertRaisesRegex(ValueError, "required when session adapter is enabled"):
+                model(torch.randn(1, 5, 5), torch.tensor([5], dtype=torch.long))
+
+    def test_possm_phoneme_model_can_disable_session_adapter(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_encoder = recover_possm_stage1_encoder(
+                checkpoint_path=_make_stage1_checkpoint(Path(tmpdir)),
+            )[0]
+            model = POSSMPhonemeModel(
+                base_encoder=base_encoder,
+                vocab_size=3,
+                gru_hidden_size=8,
+                gru_num_layers=1,
+                gru_dropout=0.0,
+                conv_kernel_size=3,
+                conv_stride=1,
+                session_adapter_enabled=False,
+            )
+            x = torch.randn(1, 5, 5)
+            outputs = model(x, torch.tensor([5], dtype=torch.long))
+            self.assertTrue(torch.equal(outputs["adapted_input"], x))
+
+    def test_probe_frozen_keeps_decoder_in_train_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_encoder = recover_possm_stage1_encoder(
+                checkpoint_path=_make_stage1_checkpoint(Path(tmpdir)),
+            )[0]
+            model = POSSMPhonemeModel(
+                base_encoder=base_encoder,
+                vocab_size=3,
+                gru_hidden_size=8,
+                gru_num_layers=2,
+                gru_dropout=0.0,
+                conv_kernel_size=3,
+                conv_stride=2,
             )
             _set_train_mode(model, train_encoder=False)
             self.assertFalse(model.base_encoder.training)
+            self.assertTrue(model.session_input_adapter.training)
             self.assertTrue(model.gru.training)
             self.assertTrue(model.conv.training)
             self.assertTrue(model.conv_dropout.training)
             self.assertTrue(model.classifier.training)
+
+    def test_stage2_decoder_train_modules_include_post_gru_conv(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_encoder = recover_possm_stage1_encoder(
+                checkpoint_path=_make_stage1_checkpoint(Path(tmpdir)),
+            )[0]
+            model = POSSMPhonemeModel(
+                base_encoder=base_encoder,
+                vocab_size=3,
+                gru_hidden_size=8,
+                gru_num_layers=2,
+                gru_dropout=0.0,
+                conv_kernel_size=3,
+                conv_stride=2,
+                session_adapter_enabled=True,
+            )
+            modules = _stage2_decoder_train_modules(model, session_adapter_enabled=True)
+            module_param_ids = {
+                id(param)
+                for module in modules
+                for param in module.parameters()
+            }
+            conv_param_ids = {id(param) for param in model.conv.parameters()}
+            self.assertTrue(conv_param_ids)
+            self.assertTrue(conv_param_ids.issubset(module_param_ids))
 
     def test_run_possm_phoneme_finetuning_writes_checkpoints(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -894,13 +1034,14 @@ class POSSMSSLTests(unittest.TestCase):
                     learning_rate=1e-3,
                     encoder_learning_rate=3e-4,
                     checkpoint_every_steps=1,
+                    input_smoothing_sigma_bins=2.0,
+                    white_noise_sd=1.0,
+                    constant_offset_sd=0.2,
                     gru_hidden_size=8,
                     gru_num_layers=2,
                     gru_dropout=0.0,
-                    conv_hidden_size=8,
                     conv_kernel_size=3,
-                    conv_stride=2,
-                    conv_dropout=0.0,
+                    conv_stride=1,
                 ),
                 device=torch.device("cpu"),
             )
@@ -914,7 +1055,19 @@ class POSSMSSLTests(unittest.TestCase):
             self.assertTrue(
                 any(key.startswith("pre_decoder_backbone.") for key in payload["model_state"].keys())
             )
+            self.assertEqual(int(payload["config"]["conv_kernel_size"]), 3)
+            self.assertEqual(int(payload["config"]["conv_stride"]), 1)
+            self.assertAlmostEqual(float(payload["config"]["input_smoothing_sigma_bins"]), 2.0)
+            self.assertAlmostEqual(float(payload["config"]["white_noise_sd"]), 1.0)
+            self.assertAlmostEqual(float(payload["config"]["constant_offset_sd"]), 0.2)
+            self.assertEqual(str(payload["cache_root"]), str(tmp_path))
+            self.assertTrue(bool(payload["config"]["session_adapter_enabled"]))
+            self.assertTrue(bool(payload["session_adapter_keys"]))
+            self.assertTrue(
+                any(key.startswith("session_input_adapter.") for key in payload["model_state"].keys())
+            )
             self.assertEqual(int(payload["model_state"]["gru.weight_ih_l0"].shape[1]), 7)
+            self.assertTrue(any(key.startswith("conv.") for key in payload["model_state"].keys()))
 
 
 if __name__ == "__main__":

@@ -1,0 +1,102 @@
+%% Filename: kuz.sty
+%%
+%% Author: KUZ - based on the IASTED template
+%% Date: 2015
+%%
+%% INSTRUCTIONS FOR USE OF THE STYLE FILE.
+%%
+%% In order for KUZ to publish your paper, the final manuscript submitted
+%% should not contain any fixed-resolution bitmap fonts (type 3).
+%%
+%% Using the "latex" and "pdflatex" to create a pdf file directly should achieve the same effect.
+%%
+%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\usepackage{times}							% use time new roman font
+
+%%Section Definition
+%ex (normal) = 1.58157mm
+%em (normal)= 3.514462mm
+%ex (large) = 
+
+%Title - 14.09984, bold
+%section - 11,75pt, bold
+%subsection - 10pt, bold
+%subsubsection - 10pt, bold
+
+
+\renewcommand\section{\@startsection {section}{1}{\z@}{-6.80077mm}{3.95393mm}{\reset@font\large\bf}}
+\renewcommand\subsection{\@startsection{subsection}{2}{\z@}{-6.40536mm}{2.68866mm}{\reset@font\bf}}
+\renewcommand\subsubsection{\@startsection{subsubsection}{3}{\z@}{-6.40536mm}{2.68866mm}{\reset@font\bf}}
+
+\renewcommand\thesection{\@arabic\c@section}
+\renewcommand\thesubsection{\@arabic\c@section.\@arabic\c@subsection}
+
+%\usepackage[labelfont=bf]{caption}
+%\captionsetup[table]{name=Tab.}
+
+%%Title Definition
+\def\@maketitle{\vspace{4mm}  %.5in
+            {\bf\Large\centering \@title \par}
+            \vskip 3.514462mm %1em
+            {\normalsize\centering
+                \begin{tabular}[t]{c}\@author
+                \end{tabular}\par}
+                \vfil
+                \vspace{6.32628mm}}  %4ex
+
+%%Tables and Figures
+\long\def\@makecaption#1#2{%
+   \vskip 10\p@
+   \setbox\@tempboxa\hbox{#1. #2}%
+   \ifdim \wd\@tempboxa >\hsize
+       #1. #2\par
+     \else
+       \hbox to\hsize{\hfil\box\@tempboxa\hfil}%
+   \fi
+   \vskip 10\p@}
+
+\def\thefigure{\@arabic\c@figure}
+
+\def\fps@figure{tbp}
+\def\ftype@figure{1}
+\def\ext@figure{lof}
+\def\fnum@figure{Fig.~\thefigure}
+\def\figure{\@float{figure}}
+\let\endfigure\end@float
+\@namedef{figure*}{\@dblfloat{figure}}
+\@namedef{endfigure*}{\end@dblfloat}
+
+\def\thetable{\@arabic\c@table}
+
+\def\fps@table{tbp}
+\def\ftype@table{2}
+\def\ext@table{lot}
+\def\fnum@table{Tab.~\thetable}
+\def\table{\@float{table}}
+\let\endtable\end@float
+\@namedef{table*}{\@dblfloat{table}}
+\@namedef{endtable*}{\end@dblfloat}
+
+
+%%Layout
+\pagestyle{empty}                         %%%% No page Numbering
+
+\paperheight 297mm
+\paperwidth 210mm
+ 
+\textheight     252mm
+\columnsep      10mm  %0.5in
+\textwidth      168mm
+\voffset		-1in
+\topmargin      22mm
+\headheight     0.0mm
+\headsep        0.0mm
+\hoffset		-5.4mm
+%\marginparwidth  -10.4mm
+\parindent      3ex
+%%\parskip        10pt   old instructions said add a blank line, but it's better to save space.
+\def\baselinestretch{1}
+\flushbottom

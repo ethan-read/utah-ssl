@@ -1,0 +1,75 @@
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%% KUZ CONFERRENCE
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%% SAMPLE LaTeX SOURCE (with no warranty)
+\documentclass[twocolumn,letterpaper,10pt]{article}
+\usepackage{meicogsci}
+\usepackage{graphicx}				% include graphics
+\usepackage[utf8]{inputenc}  				% for czech diacritics (used mainly in names)
+%\usepackage[latin2]{inputenc}				% if utf8 is not working correctly
+\usepackage[round,authoryear]{natbib}
+%\usepackage[slovak]{babel}					% change english titles to czech
+%\usepackage{slovak}							% in case of compiling with cslatex use this line instead the one above 
+\usepackage[labelfont=bf]{caption}			% figure captions in bold
+\usepackage[colorlinks=false]{hyperref} 	% hyperref support
+
+\usepackage{lipsum}
+\usepackage{titlesec}
+
+% \makeatletter
+% \def\convertto#1#2{\strip@pt\dimexpr #2*65536/\number\dimexpr 1#1}
+% \makeatother
+
+\setlength{\bibsep}{4pt plus 0.3ex}
+\titlespacing*{\section} {0pt}{4ex}{2ex}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%% THE BEGINNING
+\begin{document}
+
+\date{}
+\title{Instructions for Preparing Submissions for MEi:CogSci Conference}
+
+\author{
+\vspace{1ex}
+% \and
+% \vspace{1ex}
+% \textbf{another author (from a different institution)}\\
+% Different institution\\
+% Different institution's address\\
+% someone@other.institution.com \\
+}
+
+\maketitle 
+
+\thispagestyle{empty}
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%% INTRO
+\section{Introduction}
+
+Supported by recent progress in brain-to-text decoding \citep{willett2023,bit2026}, brain-computer interfaces (BCIs) are approaching practical speech restoration. The Utah array is especially relevant because it records individual spikes from cortex, giving it the temporal precision needed for speech decoding. Recent work showed that attempted speech can be decoded into text with strong performance \citep{willett2023}, and BIT extended that result with large-scale self-supervised pretraining on Utah array data \citep{bit2026}. 
+
+This project asks whether state-space models can provide a better encoder for the same problem. Compared with transformers, SSMs may be more natural for neural time series because they represent the data as a dynamical system evolving over time. If they work well, they could offer both computational efficiency and a clearer view of speech-related neural dynamics, including whether particular latent states track preparation, articulation, or pauses. 
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%% METHODS
+\section{Data \& Methods}
+
+
+All data comes from publicly available Utah array recordings from human motor cortex \citep{willett2023}. I will use a two-stage pipeline: self-supervised pretraining on pooled unlabeled recordings, followed by supervised fine-tuning on attempted-speech data from two paralyzed patients, one seen during pretraining and one held out. 
+
+The self-supervised stage will compare contrastive objectives with signal reconstruction. Contrastive training should group nearby neural segments into stable representations, while reconstruction should force the encoder to preserve signal detail. For the speech-decoding stage, I will attach a phoneme decoder and train with Connectionist Temporal Classification (CTC) loss, which allows variable-length phoneme sequences to be learned from neural time series without frame-level alignment. I will evaluate S5 and Mamba-style state-space encoders against this baseline using phoneme error rate, with a small language model used only after decoding to convert phonemes into words. 
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%% RESULTS
+\section{Hypotheses \& Discussion}
+
+If the SSM encoder matches or exceeds the transformer baseline, it would suggest that speech-related Utah array activity is better modeled as a latent dynamical system than as a token-like sequence. If it does not, the result would still be informative because it would indicate that the available single-subject data are insufficient for the inductive bias that SSMs bring, despite their success on other long-sequence problems \citep{mamba2023}. In either case, the study would help determine whether these models are only accurate decoders or also useful tools for understanding the structure of speech-related neural activity.
+
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%% BIBLIOGRAPHY
+% APA style
+\bibliographystyle{apalike}
+\bibliography{references}
+
+%% the literature goes to references.bib in bibtex format
+%% use pdflatex to compile
+
+\end{document}

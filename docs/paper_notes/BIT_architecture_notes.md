@@ -258,6 +258,17 @@ The paper says prompt design varies depending on whether neural embeddings are t
 - a distinct neural modality
 - an audio modality
 
+Figure 3B gives the concrete prompt formats used for the two interpretations:
+
+- neural modality:
+  - `<neural_activity>#</neural_activity>`
+  - `decode the above neural activity into an English sentence:`
+- audio modality:
+  - `<|audio_bos|>#<|audio_eos|>`
+  - `transcribe the above audio into an English sentence:`
+
+Here `#` is the placeholder location where the projected neural tokens are inserted.
+
 ### Audio-LLM Versus Text-LLM Modes
 
 The paper evaluates both text-based LLMs and audio-based LLMs.
@@ -488,3 +499,60 @@ The model is architecturally notable less because of any single novel block and 
 - phoneme-aware intermediate supervision
 - LLM-based sentence decoding
 - explicit contrastive neural-text alignment
+
+## Evidence Versus Inference
+
+This section separates what the paper states directly from what seems likely but is not fully explicit.
+
+### Subject-Specific Layers
+
+Directly stated in the paper:
+
+- Figure 1 caption says the SSL reconstruction stage uses `subject-specific linear read-in and read-out layers`
+- the training-details section says total transformer parameter count rises when including `subject-specific patch embedding modules and linear decoders`
+
+Reasonable inference:
+
+- the transformer encoder is shared, while at least some boundary layers around input/output are subject-specific
+- a subject-specific input-side adaptation likely persists beyond SSL pretraining, since the paper says the masking module is removed for phoneme fine-tuning but does not say the subject-specific read-in is removed
+
+Not confirmed from the paper:
+
+- whether the phoneme `CTC` output layer itself is subject-specific
+- whether the exact same subject-specific boundary layers are kept unchanged across all later training stages
+- the exact implementation details of the `subject-specific patch embedding modules`
+
+### Phoneme Fine-Tuning Head
+
+Directly stated in the paper:
+
+- after SSL pretraining, transformer outputs are passed through `a linear layer` to generate logits over phonemes, blank, and silence
+- the phoneme stage uses `CTC` loss
+- phoneme logits are not passed into the LLM; the encoder representations are
+
+Reasonable inference:
+
+- the SSL reconstruction read-out head is replaced during phoneme fine-tuning, because phoneme decoding requires label logits rather than reconstruction of continuous neural features
+
+Not confirmed from the paper:
+
+- whether the phoneme linear layer is shared across subjects or instantiated separately per subject
+
+### Stage Persistence Across Training
+
+Directly stated in the paper:
+
+- SSL stage: masked reconstruction with `MSE`
+- phoneme stage: `CTC` fine-tuning with a linear phoneme classifier
+- sentence stage: cross-entropy next-token prediction plus contrastive alignment
+- the masking module is removed after SSL pretraining
+
+Reasonable inference:
+
+- the encoder is carried forward across stages
+- the SSL reconstruction head is specific to pretraining and is replaced once the task changes
+- the phoneme-tuned encoder is then reused for the sentence-level LLM stage
+
+Not confirmed from the paper:
+
+- a full component-by-component list of exactly which non-LLM boundary layers are frozen, reused, reinitialized, or replaced at each transition
