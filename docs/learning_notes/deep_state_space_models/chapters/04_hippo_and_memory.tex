@@ -1,0 +1,322 @@
+\chapter{HiPPO And Memory}
+\label{ch:hippo-and-memory}
+
+\section{Why HiPPO Appears In SSM Papers}
+
+S4 did not begin from a random recurrent matrix. A central part of its success came from
+initializing the state dynamics with matrices derived from HiPPO: High-order Polynomial
+Projection Operators \citep{gu2020hippo}. HiPPO is a theory of online memory. It asks:
+
+\[
+  \text{How can a finite-dimensional state store useful information about an entire past signal?}
+\]
+
+This is exactly the question long-sequence models face. A neural time series may contain
+relevant context spread across hundreds or thousands of time steps. A state vector cannot
+store the raw past exactly unless it grows with sequence length, so it must store a
+compressed summary. HiPPO gives a principled way to define such summaries.
+
+The goal of this chapter is not to reproduce every HiPPO derivation. The original paper
+develops a general framework involving measures, orthogonal polynomials, and projection
+dynamics. For understanding S4 and S5, the most important idea is simpler:
+
+\[
+  \text{HiPPO initializes a recurrent state to track polynomial coefficients of the past.}
+\]
+
+Those coefficients form a compact approximation of the input history. The resulting
+state matrices have a spectrum of timescales that is much better suited to long memory
+than a generic random matrix.
+
+\section{The Online Memory Problem}
+
+Suppose a scalar signal $u(t)$ arrives over time. At time $t$, the full history is the
+function
+\[
+  u_{\leq t}: \tau \mapsto u(\tau), \qquad 0 \leq \tau \leq t.
+\]
+Storing this full function is impossible with a fixed-size vector. Instead, we maintain a
+state
+\[
+  \vx(t) \in \R^N
+\]
+that summarizes the history. The update should be online: when a new input arrives, we
+update $\vx(t)$ without replaying the whole past.
+
+This is the same abstract problem solved by an RNN hidden state. The difference is that
+HiPPO specifies what the state should mean. Rather than letting a random recurrent matrix
+learn memory from scratch, HiPPO defines $\vx(t)$ as coefficients of a projection of the
+past signal onto a chosen basis.
+
+The compression problem can be written informally as
+\[
+  u_{\leq t}(\tau)
+  \approx
+  \sum_{n=0}^{N-1} x_n(t)\,p_n(\tau;t),
+\]
+where $p_n$ are basis functions over the past interval and $x_n(t)$ are the coefficients
+stored in the state.
+
+\section{Projection Onto A Basis}
+
+A basis lets us approximate a function by a finite list of coefficients. In ordinary
+Euclidean geometry, projecting a vector onto an orthonormal basis gives coordinates:
+\[
+  \vv \approx \sum_{n=0}^{N-1} c_n \ve_n.
+\]
+For functions, the same idea uses inner products:
+\[
+  c_n = \langle f, p_n\rangle.
+\]
+If the basis functions $p_n$ are orthonormal under the chosen inner product, then the
+coefficients $c_n$ give the best approximation to $f$ in the span of the first $N$ basis
+functions.
+
+HiPPO applies this idea to the input history. At time $t$, the state stores coefficients
+of a projection of the past signal. The basis is usually built from orthogonal
+polynomials, especially Legendre polynomials.
+
+\section{A Quick Reminder On Orthogonality}
+
+Two vectors are orthogonal if their dot product is zero. Two functions are orthogonal if
+their inner product is zero:
+\[
+  \langle f,g\rangle
+  =
+  \int f(\tau)g(\tau)w(\tau)\,d\tau.
+\]
+The weight function $w(\tau)$ and interval of integration define the geometry. Different
+choices produce different families of orthogonal polynomials.
+
+Legendre polynomials are orthogonal on an interval with a uniform weight. The first few
+on $[-1,1]$ are
+\[
+  P_0(x)=1,\qquad
+  P_1(x)=x,\qquad
+  P_2(x)=\frac{1}{2}(3x^2-1).
+\]
+Higher-order polynomials capture finer variation. If we project a signal onto the first
+$N$ Legendre polynomials, low-order coefficients capture coarse trends and high-order
+coefficients capture more detailed shape.
+
+This gives a useful mental picture of HiPPO memory:
+\[
+  \vx(t)
+  =
+  \text{coefficients of a polynomial approximation to recent history}.
+\]
+
+\section{Why The Basis Changes Over Time}
+
+The online memory problem is harder than a fixed projection problem because the interval
+of history changes as time advances. At time $t$, the past is $[0,t]$. At time $t+\Delta$,
+the past is $[0,t+\Delta]$. If we care more about recent history, the effective window or
+weighting may also shift over time.
+
+HiPPO handles this by deriving differential equations for how the projection coefficients
+should change as new data arrive and as the underlying measure over history evolves.
+Those coefficient dynamics have the state space form
+\[
+  \frac{d}{dt}\vx(t) = \mA(t)\vx(t)+\mB(t)u(t),
+\]
+with particular matrices determined by the polynomial family and measure.
+
+For the most important variants used in SSM initialization, this can be turned into
+time-invariant or nearly time-invariant dynamics after a change of variables. That is
+what makes the connection to S4 possible.
+
+\section{Legendre Memory Intuition}
+
+The Legendre version of HiPPO is easiest to understand geometrically. Imagine always
+keeping a polynomial approximation to the recent past. The constant coefficient stores
+something like the average level. The linear coefficient stores something like the trend.
+Quadratic and higher coefficients store curvature and finer temporal structure.
+
+As a new input arrives, all coefficients must update:
+
+\begin{itemize}
+  \item the newest value must be inserted into the memory;
+  \item older information must be shifted or rescaled because the time interval has
+  changed;
+  \item the polynomial approximation must remain the best projection under the chosen
+  measure.
+\end{itemize}
+
+This produces a structured recurrent update. It is not arbitrary recurrence. It is the
+update required to keep the polynomial approximation correct as time moves forward.
+
+\section{Why This Helps Long Memory}
+
+Random recurrent matrices do not automatically preserve useful information over long
+horizons. They may forget too quickly, explode, or represent the past in a poorly
+conditioned way. HiPPO gives a deliberately constructed memory system.
+
+The benefit is not that polynomial projection is the only good way to remember. The
+benefit is that it gives the model a strong starting point:
+\[
+  \text{state dimensions correspond to organized timescales and basis components}.
+\]
+When used as an initialization for a learnable SSM, the model does not have to discover
+long memory from scratch. It starts from dynamics that already know how to compress
+history.
+
+For long-range sequence modeling, this matters. A model that begins with only short
+timescale modes may never learn long dependencies well. HiPPO-derived matrices provide
+a spectrum of modes that can represent both coarse and fine structure over long contexts.
+
+\section{HiPPO As An SSM Initialization}
+
+The key output of HiPPO for S4 is a state matrix $\mA$ and input matrix $\mB$. These
+matrices define continuous-time dynamics:
+\[
+  \frac{d}{dt}\vx(t)=\mA\vx(t)+\mB u(t).
+\]
+The state $\vx(t)$ has an interpretation as projection coefficients. Then, as in
+Chapter~\ref{ch:state-space-models}, the continuous system can be discretized and used
+as a sequence layer.
+
+In a deep SSM, the HiPPO matrices are not necessarily frozen. They are usually used to
+initialize learnable parameters. Training can adapt them to the task. This is analogous
+to initializing a convolutional filter bank with a useful signal-processing transform,
+then allowing gradient descent to tune it.
+
+S4 uses a particular HiPPO-inspired matrix as the starting point, then applies additional
+structure so the resulting long convolution kernel can be computed efficiently. S5 keeps
+the broad idea of S4-style initialization but simplifies the state parameterization.
+
+\section{The HiPPO Matrix Shape}
+
+The exact entries of the HiPPO matrix are not essential on a first pass, but it is useful
+to know what kind of object it is. For the Legendre translated variant often discussed
+around S4, $\mA$ is a structured lower-triangular matrix with entries determined by the
+polynomial orders. It is not a generic learned dense matrix.
+
+At a high level:
+
+\begin{itemize}
+  \item lower-order state coordinates track coarse components of the past;
+  \item higher-order coordinates track finer components;
+  \item the matrix couples these coordinates in the way required by online projection;
+  \item the resulting dynamics have stable memory behavior across many timescales.
+\end{itemize}
+
+The original HiPPO paper defines several variants. They differ in the measure used to
+weight the past. Some variants emphasize the entire history; others emphasize recent
+history. For S4, the important fact is that HiPPO supplies a principled state matrix
+whose memory properties are far better than an arbitrary initialization.
+
+\section{Measures And Weighting The Past}
+
+The word ``measure'' in HiPPO can sound abstract, but the modeling idea is intuitive.
+When summarizing the past, we must decide which parts matter most. A uniform measure over
+the whole past treats all times equally. A recency-weighted measure gives more importance
+to recent inputs. A sliding-window-like measure focuses on a finite recent interval.
+
+Different measures lead to different projection dynamics. This affects what the memory
+state represents:
+\[
+\begin{array}{lll}
+\text{whole-history weighting} & \rightarrow & \text{global summary of all previous input}, \\
+\text{recency weighting} & \rightarrow & \text{stronger memory of recent input}, \\
+\text{windowed weighting} & \rightarrow & \text{compressed representation of a recent interval}.
+\end{array}
+\]
+
+For deep learning, the exact measure is less important than the fact that HiPPO turns a
+choice about memory into concrete recurrent matrices.
+
+\section{What HiPPO Does Not Solve}
+
+HiPPO is not a full sequence model by itself. It solves an initialization and memory
+representation problem. Several other problems remain:
+
+\begin{itemize}
+  \item How do we compute the resulting long convolution kernel efficiently?
+  \item How do we parameterize the state matrix so it remains stable during training?
+  \item How do we mix many input and output channels?
+  \item How do we add nonlinear feature transformations around the linear memory?
+  \item How do we scale the method on GPUs?
+\end{itemize}
+
+S4 answers these questions with structured state matrices and efficient kernel
+computation. S5 answers them with a simpler diagonal/MIMO formulation and parallel scan.
+Mamba changes the problem again by making the dynamics input-dependent.
+
+\section{Connection To Neural Time Series}
+
+For Utah array data, the signal is continuous in time but observed in bins. Speech motor
+cortex activity has temporal structure across multiple scales: fast changes around
+movement onset, slower context across phonemes or syllables, and session-level nuisance
+variation. A useful encoder needs memory, but not just one memory timescale.
+
+HiPPO-style initialization is attractive because it gives an SSM a structured set of
+memory modes before task-specific training. In principle, some modes can track rapid
+local changes while others retain slower context. Whether this helps a particular SSL
+objective is empirical, but the architectural motivation is clear.
+
+This also explains why SSMs are not merely ``RNNs with different branding.'' The point is
+not just to use recurrence. The point is to use a recurrence whose dynamics are designed
+to represent long histories and whose structure can be exploited computationally.
+
+\section{A Minimal Worked Picture}
+
+Suppose we approximate the recent past using three coefficients:
+\[
+  u_{\leq t}(\tau)
+  \approx
+  x_0(t)P_0(\tau)
+  +
+  x_1(t)P_1(\tau)
+  +
+  x_2(t)P_2(\tau).
+\]
+Very roughly:
+
+\begin{itemize}
+  \item $x_0(t)$ captures average level;
+  \item $x_1(t)$ captures trend;
+  \item $x_2(t)$ captures curvature.
+\end{itemize}
+
+When a new input arrives, the coefficients change. The update is not simply
+``replace the oldest value.'' It must adjust the whole polynomial approximation. HiPPO
+derives the continuous-time update that performs this coefficient maintenance online.
+
+Increasing the state size $N$ adds more basis functions and therefore more detailed
+memory. In an SSM layer, $N$ controls how rich this latent memory can be.
+
+\section{What To Remember}
+
+\begin{itemize}
+  \item HiPPO is a framework for online compression of a signal history.
+  \item The state stores coefficients of a projection of the past onto basis functions.
+  \item Orthogonal polynomial bases, especially Legendre bases, give organized memory
+  coordinates.
+  \item HiPPO-derived matrices initialize SSMs with useful long-memory dynamics.
+  \item The exact HiPPO derivation is less important at first than the memory principle:
+  maintain a finite-dimensional approximation of the past as new inputs arrive.
+  \item S4 builds on HiPPO but also needs additional structure for efficient long-kernel
+  computation.
+\end{itemize}
+
+\section{Exercises}
+
+\begin{enumerate}
+  \item In your own words, explain the difference between storing the raw past and
+  storing projection coefficients of the past.
+  \item Why might a polynomial basis be useful for compressing a temporal signal?
+  \item What kind of information would you expect low-order polynomial coefficients to
+  store? What about high-order coefficients?
+  \item Explain why a good recurrent initialization matters for long-context modeling.
+  \item HiPPO gives a useful memory state, but not a complete deep sequence model. List
+  two additional ingredients needed to turn it into an S4-style layer.
+\end{enumerate}
+
+\section{Prepares You For}
+
+S4 uses structured versions of HiPPO-inspired state matrices to get both long memory and
+efficient computation. The next chapter explains how S4 turns the SSM kernel
+\[
+  \mK_i=\mC\bar{\mA}^i\bar{\mB}
+\]
+into a practical deep-learning layer for long sequences.

@@ -1,0 +1,505 @@
+\chapter{Convolutions For Sequences}
+\label{ch:convolutions-for-sequences}
+
+\section{Why Start With Convolutions?}
+
+Modern state space models are often introduced as alternatives to RNNs and transformers,
+but the cleanest entry point is convolution. S4, S5, and related models can all be read as
+ways to construct long, structured sequence filters. Before worrying about HiPPO matrices,
+diagonal state transitions, or selective scans, we should be comfortable with this simpler
+idea:
+\[
+  \text{a sequence model can be a learned filter applied across time.}
+\]
+
+You already know the transformer view: each token representation is updated by mixing
+information from other positions. You also know the RNN view: a hidden state carries a
+summary forward one step at a time. The convolutional view is different. It says that the
+output at time $t$ can be computed from a fixed local pattern around $t$, using the same
+weights at every time. This weight sharing is what makes convolution useful, and it is
+also what gives us the first bridge to state space models.
+
+The CNN vocabulary in this chapter is standard; see \citet{goodfellow2016deep} and the
+CS231n notes \citep{cs231n} for the broader image-modeling treatment. Here we immediately
+specialize it to one-dimensional temporal sequences, because that is the setting needed
+for deep SSMs and for neural time series.
+
+\section{Sequences, Channels, And Shapes}
+
+Let an input sequence be
+\[
+  \vu_1,\vu_2,\ldots,\vu_L,
+  \qquad
+  \vu_t \in \R^{C_{\mathrm{in}}},
+\]
+where $L$ is the sequence length and $C_{\mathrm{in}}$ is the number of input channels.
+For neural data, a channel might be a spike-count feature, a threshold-crossing feature,
+or a spike-band-power feature. For language, it might be one coordinate of an embedding.
+For audio, it might be one feature in a spectrogram frame.
+
+A one-dimensional convolutional layer maps this sequence to
+\[
+  \vy_1,\vy_2,\ldots,\vy_{L'},
+  \qquad
+  \vy_t \in \R^{C_{\mathrm{out}}},
+\]
+where $C_{\mathrm{out}}$ is the number of output channels and $L'$ depends on padding,
+stride, and kernel size. In deep-learning libraries, a batch of temporal data is often
+stored as one of the following:
+\[
+  (B, L, C)
+  \quad \text{or} \quad
+  (B, C, L),
+\]
+where $B$ is batch size. The math is the same either way, but being explicit about the
+time axis prevents many implementation mistakes.
+
+\section{Convolution Versus Cross-Correlation}
+
+Textbooks define discrete convolution between scalar sequences $u$ and $k$ as
+\[
+  (k \conv u)_t = \sum_i k_i u_{t-i}.
+\]
+The index $t-i$ means the kernel is flipped relative to the input. Many deep-learning
+libraries actually implement cross-correlation:
+\[
+  (k \star u)_t = \sum_i k_i u_{t+i}.
+\]
+The distinction matters in signal processing, but it is usually not important for learned
+CNNs because the kernel values are trainable. If the model can learn $k_0,k_1,k_2$, it can
+also learn the reversed ordering. In these notes, we will use the causal sequence-modeling
+convention
+\begin{equation}
+  \vy_t = \sum_{i=0}^{K-1} \mK_i \vu_{t-i}.
+  \label{eq:causal-conv-basic}
+\end{equation}
+This is a true past-looking filter: $\vy_t$ depends on $\vu_t,\vu_{t-1},\ldots,\vu_{t-K+1}$
+and not on future inputs.
+
+The kernel slice $\mK_i$ is a matrix
+\[
+  \mK_i \in \R^{C_{\mathrm{out}} \times C_{\mathrm{in}}},
+\]
+so \eqref{eq:causal-conv-basic} means
+\[
+  \vy_t[c_{\mathrm{out}}]
+  =
+  \sum_{i=0}^{K-1}
+  \sum_{c_{\mathrm{in}}=1}^{C_{\mathrm{in}}}
+  \mK_i[c_{\mathrm{out}},c_{\mathrm{in}}]\,
+  \vu_{t-i}[c_{\mathrm{in}}].
+\]
+This is the multi-channel version of a finite impulse-response filter. The layer uses
+the same kernel matrices at every time $t$, which is the temporal weight-sharing
+assumption.
+
+\section{Causality}
+
+For offline image classification, a convolution can use pixels on both sides of a location.
+For a causal decoder, that would be future leakage. A causal model must produce the output
+at time $t$ using only information available at or before $t$:
+\[
+  \vy_t = f(\vu_1,\ldots,\vu_t).
+\]
+Equation \eqref{eq:causal-conv-basic} satisfies this by construction. A centered
+convolution such as
+\[
+  \vy_t = \mK_{-1}\vu_{t-1} + \mK_0\vu_t + \mK_{1}\vu_{t+1}
+\]
+does not. It may be perfectly appropriate for offline smoothing or bidirectional
+representation learning, but it is not causal.
+
+This distinction will stay important throughout the notes. S5 and Mamba can both be run
+causally. Some training objectives or architectural wrappers can still accidentally leak
+future information if masking, patching, padding, or normalization is handled carelessly.
+
+\section{Padding And Boundary Effects}
+
+The formula
+\[
+  \vy_t = \sum_{i=0}^{K-1} \mK_i \vu_{t-i}
+\]
+refers to inputs such as $\vu_0,\vu_{-1}$ near the beginning of the sequence. A padding
+rule defines what happens there.
+
+\paragraph{Valid convolution.}
+Only compute outputs when the full window exists. For a causal kernel of length $K$, this
+starts at $t=K$. There is no artificial boundary value, but the output sequence is shorter.
+
+\paragraph{Zero padding.}
+Set out-of-range inputs to zero. This preserves length, but early outputs see many zeros.
+That is often fine, but the model can learn boundary artifacts if the sequence start has
+special meaning.
+
+\paragraph{Replication or reflection padding.}
+Use repeated or reflected boundary values. These are common in image processing, less
+central for causal sequence modeling, and often inappropriate for online decoding because
+reflection can use future values.
+
+For causal sequence models, the usual length-preserving choice is left zero padding:
+\[
+  \vu_t = 0 \quad \text{for } t \leq 0.
+\]
+Then $\vy_1$ is computed from mostly padding and $\vu_1$, while later positions see a full
+history window. In long sequences the boundary region is usually negligible, but in short
+segments or patch-based training it can be a real source of distribution shift.
+
+\section{Stride And Downsampling}
+
+Stride means the layer does not produce an output at every input time. With stride $s$,
+one common causal convention is
+\[
+  \vy_j = \sum_{i=0}^{K-1} \mK_i \vu_{js-i}.
+\]
+If $s=2$, the layer emits one output for every two input steps. Stride is therefore both
+a computational choice and a modeling choice: it reduces temporal resolution.
+
+For image CNNs, stride is often a spatial downsampling tool. For temporal neural data, it
+also changes the time scale of the representation. If bins are $20$ ms wide, stride $5$
+means each output step advances by $100$ ms. That may be useful for some high-level
+features, but it can be too coarse for precise speech timing.
+
+Stride should not be confused with kernel size. A kernel of size $K=5$ with stride $1$
+looks at five time bins and advances by one bin. A kernel of size $K=5$ with stride $5$
+looks at five time bins and advances by five bins. Both have the same local window, but
+the second throws away intermediate output positions.
+
+\section{Receptive Field}
+
+The receptive field of an output position is the set of input positions that can affect
+it. For a single causal convolution with kernel size $K$ and stride $1$, the receptive
+field of $\vy_t$ is
+\[
+  \{\vu_t,\vu_{t-1},\ldots,\vu_{t-K+1}\},
+\]
+so its size is $K$.
+
+Stacking convolutional layers increases the receptive field. Suppose we stack $N$ causal
+convolutions, each with kernel size $K$ and stride $1$. Then the final output at time $t$
+depends on
+\[
+  1 + N(K-1)
+\]
+input positions. For example, five layers of kernel size $3$ see
+\[
+  1 + 5(3-1) = 11
+\]
+positions. This linear growth is a limitation if we need long context.
+
+This is one reason long-sequence models become interesting. A transformer can access all
+previous tokens in one layer under causal attention, but with quadratic attention cost in
+sequence length. A plain CNN is cheap and parallel, but a shallow one sees only local
+context. Deep SSMs try to get long effective memory with linear or near-linear cost.
+
+\section{Dilated Convolution}
+
+Dilated convolution expands receptive field without increasing kernel size. A causal
+dilated convolution with dilation $d$ is
+\[
+  \vy_t = \sum_{i=0}^{K-1} \mK_i \vu_{t-di}.
+\]
+If $d=1$, this is the ordinary causal convolution. If $d=4$ and $K=3$, the output uses
+$\vu_t$, $\vu_{t-4}$, and $\vu_{t-8}$.
+
+Stacking layers with increasing dilation can grow the receptive field quickly. A common
+pattern is
+\[
+  d = 1,2,4,8,\ldots.
+\]
+This gives a large context using few layers, and is one reason dilated temporal CNNs have
+been successful in audio and sequence modeling.
+
+The tradeoff is that dilation samples the past on a sparse grid inside each layer. Later
+layers can combine information across these grids, but the architecture still imposes a
+particular multiscale pattern. State space models will take a different route: they use a
+recurrence to generate a long dense filter, often with smoothly decaying and oscillatory
+modes.
+
+\section{Channel Mixing}
+
+The scalar convolution formula hides an important issue: how do features interact across
+channels? In a standard multi-channel convolution, every output channel can use every
+input channel at every kernel offset:
+\[
+  \mK_i \in \R^{C_{\mathrm{out}} \times C_{\mathrm{in}}}.
+\]
+The number of parameters is
+\[
+  K C_{\mathrm{in}} C_{\mathrm{out}}.
+\]
+This is expressive, but expensive when both channel counts are large.
+
+\subsection{Pointwise Convolution}
+
+A pointwise convolution is a kernel of size $1$:
+\[
+  \vy_t = \mW \vu_t,
+  \qquad
+  \mW \in \R^{C_{\mathrm{out}} \times C_{\mathrm{in}}}.
+\]
+It mixes channels but does not mix time. In sequence models, pointwise layers are often
+used before or after a temporal operation. For example, a block might project from model
+width $H$ to an expanded hidden width, run a temporal operation, then project back.
+
+\subsection{Depthwise Convolution}
+
+A depthwise convolution applies a separate temporal filter to each channel:
+\[
+  y_t[c] = \sum_{i=0}^{K-1} k_i[c]\,u_{t-i}[c].
+\]
+There is temporal mixing within each channel, but no channel mixing. The parameter count
+is only $K C_{\mathrm{in}}$ if $C_{\mathrm{out}}=C_{\mathrm{in}}$.
+
+Depthwise convolution is often paired with pointwise convolution:
+\[
+  \text{channel mixing} \rightarrow \text{depthwise temporal mixing} \rightarrow
+  \text{channel mixing}.
+\]
+This factorization is less expressive than a full convolution but much cheaper. Mamba
+uses a small local convolution inside its block, and this kind of separation between
+local temporal processing and channel projection is a recurring design pattern.
+
+\subsection{Grouped Convolution}
+
+Grouped convolution lies between full and depthwise convolution. Channels are partitioned
+into groups, and convolution is full within each group but not across groups. This reduces
+parameter count and computation while allowing more channel interaction than a purely
+depthwise operation.
+
+\section{Convolution As A Matrix}
+
+For a finite sequence, convolution can be written as multiplication by a structured
+matrix. In the scalar causal case with kernel $(k_0,k_1,k_2)$ and left zero padding,
+\[
+\begin{bmatrix}
+y_1 \\
+y_2 \\
+y_3 \\
+y_4
+\end{bmatrix}
+=
+\begin{bmatrix}
+k_0 & 0   & 0   & 0 \\
+k_1 & k_0 & 0   & 0 \\
+k_2 & k_1 & k_0 & 0 \\
+0   & k_2 & k_1 & k_0
+\end{bmatrix}
+\begin{bmatrix}
+u_1 \\
+u_2 \\
+u_3 \\
+u_4
+\end{bmatrix}.
+\]
+This is a lower-triangular Toeplitz matrix: each diagonal is constant. The lower-triangular
+structure is causality. The constant diagonals are time invariance.
+
+This matrix view is useful for three reasons.
+
+\begin{enumerate}
+  \item It makes convolution look like a linear layer with heavy weight sharing.
+  \item It shows why convolution is parallel over time: all outputs are part of one
+  structured matrix-vector product.
+  \item It prepares us for SSMs, where the same kind of Toeplitz convolution matrix can
+  be generated from recurrence parameters rather than learned directly.
+\end{enumerate}
+
+Of course, deep-learning libraries do not literally build this large matrix for ordinary
+small convolutions. They use specialized kernels. But mathematically, the structured
+matrix picture is accurate.
+
+\section{Finite Impulse Response Filters}
+
+A causal convolution with kernel length $K$ is a finite impulse-response filter, usually
+abbreviated FIR. To see this, imagine a scalar input sequence that is zero everywhere
+except at time $1$:
+\[
+  u_1 = 1,
+  \qquad
+  u_t = 0 \text{ for } t \neq 1.
+\]
+For a causal convolution,
+\[
+  y_1 = k_0,\quad
+  y_2 = k_1,\quad
+  \ldots,\quad
+  y_K = k_{K-1},
+\]
+and then the response becomes zero. The kernel is exactly the impulse response.
+
+This language matters because linear state space models produce impulse responses too.
+The difference is that an SSM impulse response can be very long, even infinite in
+principle, while being parameterized compactly by state matrices.
+
+\section{Convolution And Parallelism}
+
+A vanilla RNN computes
+\[
+  \vh_t = f(\vh_{t-1}, \vu_t).
+\]
+This creates a sequential dependency: to compute $\vh_t$, we first need $\vh_{t-1}$.
+That does not mean RNNs cannot be optimized, but it does limit straightforward parallelism
+over time.
+
+A convolution computes
+\[
+  \vy_t = \sum_{i=0}^{K-1} \mK_i \vu_{t-i}.
+\]
+Once the input sequence and kernel are known, every $\vy_t$ can be computed independently
+of every other $\vy_{t'}$. The outputs share weights, but they do not depend on one
+another. This is why CNNs train efficiently on long sequences.
+
+The catch is memory length. A small convolution has a short receptive field. A large
+convolution can have a long receptive field, but a directly learned dense kernel of length
+$L$ has many parameters and can be expensive. The S4/S5 idea is to get the benefits of
+long convolution while using a structured parameterization inherited from dynamical
+systems.
+
+\section{FFT Convolution}
+
+There is another reason convolution is computationally special: long convolutions can be
+accelerated using the Fourier transform. The convolution theorem says, informally,
+\[
+  \mathcal{F}(k \conv u) = \mathcal{F}(k) \odot \mathcal{F}(u),
+\]
+where $\odot$ is elementwise multiplication. So a long convolution can be computed by:
+\[
+  \text{FFT} \rightarrow \text{elementwise multiply} \rightarrow \text{inverse FFT}.
+\]
+For very long kernels, this can be much cheaper than directly summing over every offset.
+
+This is one reason the convolutional view of SSMs is valuable. If an SSM can produce a
+long kernel $\mK_0,\ldots,\mK_{L-1}$, then training can sometimes use fast convolution
+methods instead of stepping the recurrence one time step at a time. S4 famously leans on
+this distinction: recurrent for online generation, convolutional for parallel training.
+
+There are details we are postponing. FFT convolution requires care with padding because
+the discrete Fourier transform naturally computes circular convolution. To get ordinary
+linear convolution, one pads the sequences before transforming. The key idea for now is
+only that convolution has global algorithms that exploit structure.
+
+\section{Convolutional Sequence Blocks}
+
+A single linear convolution is usually not enough. Neural sequence models use convolution
+inside nonlinear blocks. A simple temporal CNN block might look like
+\[
+  \vu_{1:L}
+  \rightarrow
+  \text{LayerNorm}
+  \rightarrow
+  \text{causal convolution}
+  \rightarrow
+  \text{nonlinearity}
+  \rightarrow
+  \text{pointwise projection}
+  \rightarrow
+  \text{residual addition}.
+\]
+The exact normalization and activation choices vary. The important point is that the
+temporal operation is embedded in a deep residual architecture, just as attention is
+embedded in transformer blocks and SSM layers are embedded in S4/S5/Mamba blocks.
+
+A residual block typically has the schematic form
+\[
+  \vz_{1:L}^{(n+1)}
+  =
+  \vz_{1:L}^{(n)}
+  +
+  F_{\theta}^{(n)}(\vz_{1:L}^{(n)}),
+\]
+where $F_{\theta}^{(n)}$ contains the temporal mixing operation plus channel mixing and
+nonlinearities. This residual structure is not unique to CNNs, but it is essential for
+deep sequence models because it stabilizes optimization and lets layers refine rather
+than completely replace representations.
+
+\section{CNNs, RNNs, And Transformers}
+
+It is useful to compare the three familiar sequence-modeling patterns before introducing
+SSMs.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{llll}
+\toprule
+Model family & Temporal mixing & Parallel over time? & Context pattern \\
+\midrule
+CNN & fixed kernel & yes & local or dilated \\
+RNN & hidden recurrence & no, in ordinary form & compressed past state \\
+Transformer & attention weights & yes, during training & direct pairwise access \\
+\bottomrule
+\end{tabular}
+\caption{A simplified comparison of common sequence-modeling mechanisms.}
+\label{tab:cnn-rnn-transformer}
+\end{table}
+
+CNNs are efficient because the same local filter is applied everywhere. RNNs are naturally
+online because they update a state one step at a time. Transformers are flexible because
+attention weights depend on the content of the sequence, but causal self-attention over
+length $L$ has an $L \times L$ interaction pattern.
+
+Deep SSMs occupy a middle ground. Like RNNs, they maintain a state and can be run online.
+Like CNNs, linear time-invariant SSMs can be expressed as convolutions and trained in
+parallel. Like neither plain CNNs nor plain RNNs, modern SSMs use carefully structured
+state matrices to produce long, stable filters.
+
+\section{The Bridge To State Space Models}
+
+The most important equation in this chapter is still the causal convolution:
+\[
+  \vy_t = \sum_{i=0}^{K-1} \mK_i \vu_{t-i}.
+\]
+For an ordinary CNN, the matrices $\mK_i$ are learned directly as free parameters. If
+$K=7$, the model learns seven kernel slices. If $K=1024$, direct learning becomes much
+heavier.
+
+A linear state space model instead defines a recurrence
+\[
+  \vx_t = \mA \vx_{t-1} + \mB \vu_t,
+  \qquad
+  \vy_t = \mC \vx_t + \mD \vu_t.
+\]
+If we unroll this recurrence, we get a convolution-like expression:
+\[
+  \vy_t
+  =
+  \mD\vu_t
+  +
+  \sum_{i=0}^{t-1} \mC \mA^i \mB \vu_{t-i}.
+\]
+The kernel is no longer directly learned as arbitrary matrices. It is generated by
+\[
+  \mK_i = \mC \mA^i \mB.
+\]
+This is the central bridge. A CNN says, ``learn the filter.'' An SSM says, ``learn a
+dynamical system whose impulse response is the filter.'' S4, S5, and Mamba differ in how
+they parameterize this dynamical system, how they compute it efficiently, and whether the
+parameters are fixed across time or depend on the input.
+
+\section{What To Remember}
+
+\begin{itemize}
+  \item A temporal convolution is a shared filter applied across sequence positions.
+  \item Causal convolution only uses present and past inputs.
+  \item Kernel size, stride, dilation, and depth determine the receptive field.
+  \item Full, depthwise, grouped, and pointwise convolutions make different tradeoffs
+  between temporal mixing and channel mixing.
+  \item Convolution can be represented as multiplication by a structured Toeplitz matrix.
+  \item A finite convolution kernel is an impulse response.
+  \item SSMs generate convolution kernels from recurrence parameters, which is why this
+  chapter is the right starting point for S4 and S5.
+\end{itemize}
+
+\section{Exercises}
+
+\begin{enumerate}
+  \item For a stack of four causal convolutions with kernel size $5$, stride $1$, and no
+  dilation, compute the receptive field size.
+  \item Write the Toeplitz matrix for a scalar causal convolution with kernel
+  $(k_0,k_1,k_2,k_3)$ applied to a length-$5$ input sequence with left zero padding.
+  \item Suppose neural data are binned at $20$ ms. What time span is covered by a causal
+  convolution with kernel size $9$? What changes if the dilation is $2$?
+  \item Explain in words why a causal convolution is parallel during training but still
+  respects online decoding constraints.
+  \item Compare a learned CNN kernel $\mK_i$ with an SSM-generated kernel
+  $\mC\mA^i\mB$. What is gained and what is constrained by the SSM parameterization?
+\end{enumerate}

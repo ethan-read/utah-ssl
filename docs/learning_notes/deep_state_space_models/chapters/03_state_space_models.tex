@@ -1,0 +1,443 @@
+\chapter{State Space Models}
+\label{ch:state-space-models}
+
+\section{What Is A State Space Model?}
+
+A state space model describes a system by separating its internal state from its observed
+input and output. The state is not just another feature vector. It is the model's memory
+of the past, updated through a dynamical rule.
+
+In continuous time, the standard linear state space model is
+\begin{equation}
+  \frac{d}{dt}\vx(t) = \mA \vx(t) + \mB \vu(t),
+  \qquad
+  \vy(t) = \mC \vx(t) + \mD \vu(t).
+  \label{eq:continuous-ssm}
+\end{equation}
+Here $\vu(t)$ is the input signal, $\vx(t)$ is the latent state, and $\vy(t)$ is the
+output signal. The matrices have the same conceptual roles as in the discrete recurrence
+from Chapter~\ref{ch:linear-systems-and-filters}:
+\[
+  \mA: \text{state dynamics},\quad
+  \mB: \text{input write-in},\quad
+  \mC: \text{state read-out},\quad
+  \mD: \text{direct input-output path}.
+\]
+
+In control theory, this notation is used to model physical systems. In deep learning, we
+use the same notation to build sequence layers. The state does not have to correspond to
+literal physical variables. It is a learned memory representation.
+
+\section{Why Continuous Time?}
+
+Neural networks usually operate on discrete sequences:
+\[
+  \vu_1,\ldots,\vu_L.
+\]
+So it is fair to ask why SSM papers start from continuous-time equations. There are three
+main reasons.
+
+\paragraph{Sampling rate should be a parameter.}
+Many signals come from continuous processes sampled at some interval. Neural recordings,
+audio, sensor streams, and trajectories all have a physical sampling interval. A
+continuous-time model can be discretized at different step sizes $\Delta$.
+
+\paragraph{Stability is cleaner in continuous time.}
+For the continuous system
+\[
+  \frac{d}{dt}\vx(t)=\mA\vx(t),
+\]
+stability is controlled by the real parts of eigenvalues of $\mA$. Negative real part
+means decay. This is often easier to parameterize before converting to discrete time.
+
+\paragraph{S4 and HiPPO are naturally continuous.}
+The HiPPO theory behind S4 begins as an online continuous-time memory problem. The
+continuous formulation is not just decoration; it is part of where the S4 initialization
+comes from.
+
+After discretization, however, the model used in a neural network is an ordinary discrete
+sequence layer.
+
+\section{Solving The Continuous Linear System}
+
+To discretize \eqref{eq:continuous-ssm}, first understand the solution over one time
+interval. Assume the input $\vu(t)$ is held constant over the interval $[t, t+\Delta)$.
+This assumption is called zero-order hold. It matches the common situation where a
+sampled input value represents the signal value for one bin.
+
+The solution of
+\[
+  \frac{d}{dt}\vx(t)=\mA\vx(t)
+\]
+over a time step $\Delta$ is
+\[
+  \vx(t+\Delta)=e^{\Delta \mA}\vx(t),
+\]
+where $e^{\Delta \mA}$ is the matrix exponential. This is the matrix analogue of the
+scalar solution
+\[
+  x(t+\Delta)=e^{\Delta a}x(t).
+\]
+
+With a constant input over the interval, the solution becomes
+\[
+  \vx(t+\Delta)
+  =
+  e^{\Delta \mA}\vx(t)
+  +
+  \left(\int_0^\Delta e^{\tau \mA}\,d\tau\right)\mB\vu(t).
+\]
+This formula gives the exact discrete update under zero-order hold.
+
+\section{Discretization}
+
+The discretized SSM has the form
+\begin{equation}
+  \vx_t = \bar{\mA}\vx_{t-1} + \bar{\mB}\vu_t,
+  \qquad
+  \vy_t = \mC\vx_t + \mD\vu_t.
+  \label{eq:discretized-ssm}
+\end{equation}
+The barred matrices are discrete-time versions of the continuous parameters. Under
+zero-order hold,
+\begin{equation}
+  \bar{\mA} = e^{\Delta \mA},
+  \qquad
+  \bar{\mB}
+  =
+  \left(\int_0^\Delta e^{\tau \mA}\,d\tau\right)\mB.
+  \label{eq:zoh-discretization}
+\end{equation}
+If $\mA$ is invertible, the second expression can be written as
+\[
+  \bar{\mB}
+  =
+  \mA^{-1}(e^{\Delta \mA}-\mI)\mB.
+\]
+The integral form is more general and conceptually safer.
+
+The output matrices $\mC$ and $\mD$ are often left unchanged by discretization in the
+standard setup. The dynamics and input write-in need conversion because they describe
+how the state evolves over a time interval.
+
+\section{Step Size}
+
+The step size $\Delta$ determines how much continuous time passes between two sequence
+positions. If neural data are binned every $20$ ms, then a physically literal choice is
+\[
+  \Delta = 0.02 \text{ seconds}.
+\]
+In neural network SSM layers, $\Delta$ is often learned or parameterized per channel or
+per state dimension. Then it becomes more than a sampling constant: it controls the
+timescale of the learned dynamics.
+
+For a scalar continuous system
+\[
+  \frac{d}{dt}x(t)=a x(t),
+\]
+discretization gives
+\[
+  \bar{a}=e^{\Delta a}.
+\]
+If $a<0$, then $0<\bar{a}<1$. Larger $\Delta$ makes $\bar{a}$ smaller, meaning faster
+decay per discrete step. Smaller $\Delta$ keeps $\bar{a}$ closer to $1$, meaning slower
+decay per step.
+
+This is why learned step sizes are powerful. They let different channels or modes operate
+at different effective temporal scales.
+
+\section{Continuous And Discrete Stability}
+
+For the continuous autonomous system
+\[
+  \frac{d}{dt}\vx(t)=\mA\vx(t),
+\]
+a mode with eigenvalue $\lambda$ evolves like
+\[
+  e^{\lambda t}.
+\]
+If $\RePart(\lambda)<0$, it decays. If $\RePart(\lambda)>0$, it grows. If
+$\RePart(\lambda)=0$, it persists in magnitude and may oscillate.
+
+After discretization,
+\[
+  \bar{\lambda}=e^{\Delta \lambda}.
+\]
+The magnitude is
+\[
+  |\bar{\lambda}| = |e^{\Delta \lambda}| = e^{\Delta \RePart(\lambda)}.
+\]
+So
+\[
+  \RePart(\lambda)<0
+  \quad \Longleftrightarrow \quad
+  |\bar{\lambda}|<1.
+\]
+This exactly connects the continuous-time stability condition to the discrete-time unit
+circle condition from Chapter~\ref{ch:linear-systems-and-filters}.
+
+\section{Recurrent Mode}
+
+Once discretized, the SSM can be run as a recurrence:
+\[
+  \vx_t = \bar{\mA}\vx_{t-1} + \bar{\mB}\vu_t,
+  \qquad
+  \vy_t = \mC\vx_t + \mD\vu_t.
+\]
+This is the recurrent mode. It is natural for online inference because we only need to
+store the current state $\vx_{t-1}$ and the new input $\vu_t$.
+
+For a causal neural decoder, recurrent mode is conceptually attractive:
+\[
+  \text{new neural bin} \rightarrow \text{update state} \rightarrow \text{emit current representation}.
+\]
+There is no need to revisit the whole history.
+
+The downside is training parallelism. A naive recurrence computes step $t$ after step
+$t-1$, just like a vanilla RNN. SSMs become especially useful when we exploit additional
+structure to train them in parallel.
+
+\section{Convolution Mode}
+
+If $\bar{\mA},\bar{\mB},\mC,\mD$ are fixed across time, the discretized SSM is linear and
+time invariant. As in Chapter~\ref{ch:linear-systems-and-filters}, unrolling gives
+\[
+  \vy_t
+  =
+  \mD\vu_t
+  +
+  \sum_{i=0}^{t-1}
+  \mC\bar{\mA}^i\bar{\mB}\vu_{t-i}.
+\]
+Define the SSM convolution kernel
+\begin{equation}
+  \mK_i = \mC\bar{\mA}^i\bar{\mB}.
+  \label{eq:discrete-ssm-kernel}
+\end{equation}
+Then the layer can be evaluated as a causal convolution:
+\[
+  \vy_t = \mD\vu_t + \sum_{i=0}^{t-1}\mK_i\vu_{t-i}.
+\]
+
+This is convolution mode. It exposes parallelism over sequence positions. The layer can
+be trained like a convolutional sequence model, even though it also has a recurrent
+interpretation.
+
+The central computational challenge is producing or applying the kernel efficiently. A
+generic dense $\bar{\mA}$ makes $\bar{\mA}^i$ expensive for long sequences and large state
+sizes. S4 and S5 are largely about choosing structures for $\bar{\mA}$ that make this
+tractable.
+
+\section{The Role Of The Direct Term}
+
+The matrix $\mD$ gives a direct path from current input to current output:
+\[
+  \vy_t = \mC\vx_t + \mD\vu_t.
+\]
+In convolution language, this is an instantaneous kernel component. Depending on indexing
+convention, it may be combined with $\mK_0$ or treated separately.
+
+The direct term is useful because the state path may be best at modeling temporal context,
+while the direct term preserves immediate information. Many deep architectures also have
+residual connections around the whole SSM block, giving another direct route for current
+features.
+
+\section{SISO And MIMO}
+
+A single-input single-output SSM has
+\[
+  \vu_t \in \R,\qquad \vy_t \in \R.
+\]
+Then $\mB$ is a column vector, $\mC$ is a row vector, and $\mK_i$ is scalar.
+
+A multi-input multi-output SSM has
+\[
+  \vu_t \in \R^{C_{\mathrm{in}}},
+  \qquad
+  \vy_t \in \R^{C_{\mathrm{out}}},
+\]
+and $\mK_i$ is a matrix:
+\[
+  \mK_i \in \R^{C_{\mathrm{out}} \times C_{\mathrm{in}}}.
+\]
+This is the natural form for modern sequence models, where every time step has many
+features.
+
+S4 often uses SISO SSMs in parallel across channels, followed by separate channel-mixing
+layers. S5 emphasizes MIMO SSMs more directly. This is one of the practical simplifications
+that makes S5 easier to reason about as a neural network layer.
+
+\section{State Size, Model Width, And Channels}
+
+SSM notation can be confusing because there are several dimensions:
+\[
+\begin{array}{ll}
+L & \text{sequence length}, \\
+C_{\mathrm{in}} & \text{input channel count}, \\
+C_{\mathrm{out}} & \text{output channel count}, \\
+H & \text{model width in a deep network}, \\
+N & \text{SSM state size}.
+\end{array}
+\]
+The state size $N$ controls the dimension of the latent dynamical memory. The model width
+$H$ is the feature width passed between blocks. In many architectures,
+$C_{\mathrm{in}}=C_{\mathrm{out}}=H$ inside the backbone, but $N$ may be different.
+
+This distinction matters for capacity. Increasing $H$ gives the network more feature
+channels. Increasing $N$ gives each SSM more dynamical memory. The two changes are not
+equivalent.
+
+\section{A Deep SSM Layer Is Not Just The SSM}
+
+The bare SSM recurrence is linear. A practical deep SSM block usually wraps it with other
+operations:
+\[
+  \vz
+  \rightarrow
+  \text{normalization}
+  \rightarrow
+  \text{input projection}
+  \rightarrow
+  \text{SSM temporal mixing}
+  \rightarrow
+  \text{nonlinearity or gate}
+  \rightarrow
+  \text{output projection}
+  \rightarrow
+  \text{residual addition}.
+\]
+Different papers choose different wrappers, but this pattern is the right mental model.
+The SSM supplies long-range temporal mixing. The surrounding neural network supplies
+feature mixing, nonlinearity, and optimization stability.
+
+This also explains why a linear SSM can be useful in a nonlinear model. A transformer
+attention operation is not the whole transformer block either. It is one structured
+mixing operation inside a larger residual architecture.
+
+\section{Why Structure Is Needed}
+
+The formula
+\[
+  \mK_i = \mC\bar{\mA}^i\bar{\mB}
+\]
+looks simple, but a naive implementation has problems.
+
+\paragraph{Computing long kernels can be expensive.}
+If $\bar{\mA}$ is dense, repeatedly multiplying by $\bar{\mA}$ across a long sequence can
+be costly.
+
+\paragraph{Training dense dynamics can be unstable.}
+The eigenvalues of $\bar{\mA}$ control memory. Bad parameterization can lead to exploding,
+vanishing, or poorly conditioned dynamics.
+
+\paragraph{Long memory needs good initialization.}
+Random matrices do not automatically produce a useful spectrum of timescales. For long
+sequences, the model needs modes that cover both short and long temporal dependencies.
+
+\paragraph{Parallelism requires exploitable algebra.}
+The convolution view is only computationally valuable if the kernel can be generated or
+applied efficiently. S4 uses special matrix structure. S5 simplifies toward diagonal
+structure and parallel scan. Mamba uses selective scan rather than fixed convolution.
+
+\section{SSMs Versus RNNs}
+
+The recurrence
+\[
+  \vx_t = \bar{\mA}\vx_{t-1}+\bar{\mB}\vu_t
+\]
+resembles a vanilla RNN, but there are crucial differences.
+
+A standard RNN has nonlinear state updates:
+\[
+  \vh_t = \tanh(\mW_h\vh_{t-1}+\mW_u\vu_t).
+\]
+This nonlinearity makes the recurrence expressive, but it also prevents a simple
+convolutional representation.
+
+A linear time-invariant SSM has a linear state update. That sounds less expressive, but
+it allows the recurrent and convolutional views to coexist:
+\[
+  \text{linear recurrence}
+  \quad \Longleftrightarrow \quad
+  \text{causal convolution}.
+\]
+The nonlinearity is moved outside the temporal recurrence and placed in the surrounding
+deep block. This design is one of the reasons SSM layers can train efficiently on long
+sequences.
+
+\section{SSMs Versus CNNs}
+
+An ordinary causal CNN learns kernel slices directly:
+\[
+  \mK_0,\ldots,\mK_{K-1}.
+\]
+An SSM generates them:
+\[
+  \mK_i = \mC\bar{\mA}^i\bar{\mB}.
+\]
+This gives the SSM a compact way to represent long filters. The price is that the kernel
+must have the structure induced by the state dynamics.
+
+So the comparison is:
+\[
+\begin{array}{lll}
+\text{CNN} & \text{free finite kernel} & \text{simple, local unless very large}, \\
+\text{SSM} & \text{structured long kernel} & \text{compact, dynamical, stability-sensitive}.
+\end{array}
+\]
+This is the practical reason to study SSMs after CNNs.
+
+\section{SSMs Versus Transformers}
+
+Transformers use content-dependent pairwise interactions:
+\[
+  \text{attention weight from } t \text{ to } s
+  =
+  \softmax(q_t^\top k_s).
+\]
+This gives direct access from one position to another, and the access pattern changes
+with the input content. That flexibility is powerful.
+
+Linear time-invariant SSMs do not have this kind of content-dependent routing. The same
+kernel is applied regardless of the input values. Their advantage is different: they can
+model long temporal filters with linear scaling and recurrent online operation.
+
+Mamba can be understood as an attempt to recover some of the content-dependent behavior
+of attention while keeping the linear-time recurrent structure of SSMs. It does this by
+making some SSM parameters input-dependent.
+
+\section{What To Remember}
+
+\begin{itemize}
+  \item A state space model separates input, latent state, and output.
+  \item Continuous-time SSMs are discretized before being used on sampled sequences.
+  \item Zero-order hold gives
+  $\bar{\mA}=e^{\Delta\mA}$ and
+  $\bar{\mB}=(\int_0^\Delta e^{\tau\mA}d\tau)\mB$.
+  \item Continuous stability uses negative real eigenvalue parts; discrete stability uses
+  eigenvalues inside the unit circle.
+  \item A discretized linear time-invariant SSM can run in recurrent mode or convolution
+  mode.
+  \item The convolution kernel is $\mK_i=\mC\bar{\mA}^i\bar{\mB}$.
+  \item S4 and S5 are mostly about making this kernel expressive, stable, and efficient.
+\end{itemize}
+
+\section{Exercises}
+
+\begin{enumerate}
+  \item For the scalar continuous system $\dot{x}(t)=-2x(t)$, compute the discrete
+  multiplier $\bar{a}$ when $\Delta=0.1$.
+  \item If a continuous eigenvalue is $\lambda=-1+3i$, what is the magnitude of the
+  corresponding discrete eigenvalue after step size $\Delta$?
+  \item Explain why zero-order hold is a reasonable assumption for binned neural data.
+  \item In your own words, distinguish state size $N$ from model width $H$.
+  \item Starting from \eqref{eq:discretized-ssm}, unroll the recurrence for three steps
+  and identify $\mK_0,\mK_1,\mK_2$.
+\end{enumerate}
+
+\section{Prepares You For}
+
+The next chapter explains why modern SSMs needed special initializations and structured
+state matrices to store long histories without becoming unstable or computationally
+expensive. That brings us to HiPPO: a principled way to initialize recurrent memory for
+long sequence modeling.

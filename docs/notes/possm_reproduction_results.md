@@ -126,6 +126,76 @@ Interpretation:
 - the model actually became more deletion-heavy
 - the previous pretrained run with the earlier stage-2 settings remains the stronger reference point so far
 
+### 2026-05-12 Lower-Dropout / 3000-Step Stage-2 Run
+
+The latest inspected run returned to the `kernel_size=14`, `stride=4` post-GRU emission head, kept the session adapter off, and reduced GRU dropout relative to the previous strong run.
+
+Run:
+
+- notebook: `analysis/active/ssl_experiments/s6_possm_maskedreconstruction.ipynb`
+- stage-1 checkpoint: `possm_stage1_tx_only_normalized_20260512T101159Z/checkpoint_best.pt`
+- stage-2 run: `possm_stage2_finetune_full_tx_only_20260512T143912Z`
+- mode: `finetune_full`
+- feature/data/boundary: `tx_only`, normalized, session boundary keys
+- stage-2 cache: raw `cache_v1`, with online Gaussian smoothing after augmentation
+- session adapter: off
+- steps: `3000`
+- validation cadence: every `100` steps
+- batch size: `32`
+- decoder learning rate: `2e-4`
+- encoder learning rate: `3e-5`
+- weight decay: `1e-3`
+- online smoothing: `sigma_bins=2.0`, `kernel_size=100`, `threshold=0.01`
+- training augmentations: `white_noise_sd=0.1`, `constant_offset_sd=0.05`
+- decoder: `5`-layer GRU, hidden size `768`, GRU dropout `0.2`
+- post-GRU emission conv: `kernel_size=14`, `stride=4`, dropout `0.1`
+
+Validation trajectory:
+
+- step `100`: PER `1.000`, prediction/reference token ratio `0.000`, blank frame rate `1.000`
+- step `1000`: PER `0.664`, ratio `0.526`, blank `0.747`
+- step `1600`: PER `0.607`, ratio `0.789`, blank `0.629`
+- step `2000`: PER `0.575`, ratio `0.762`, blank `0.610`
+- step `2500`: PER `0.548`, ratio `0.861`, blank `0.564`
+- step `2700`: PER `0.539`, ratio `0.831`, blank `0.599`
+- step `2900`: validation CTC `2.795` bits/phoneme, PER `0.529`, ratio `0.808`, blank `0.607`
+- step `3000`: validation CTC `2.837` bits/phoneme, PER `0.523`, ratio `0.808`, blank `0.566`
+
+The best validation CTC was at step `2900`, but the best observed PER was the final step `3000`. This is the strongest POSSM stage-2 PER observed so far in these notes.
+
+Prediction diagnostics on `4` validation batches from the saved best-checkpoint path:
+
+- mean decoded prediction length: `21.3` phonemes
+- mean target length: `26.1` phonemes
+- mean prediction / target length ratio: `0.820`
+- median prediction / target length ratio: `0.802`
+- diagnostic blank frame rate: `0.566`
+- mean logit frames: `72.1`
+
+Most common predicted phoneme IDs in the diagnostic sample:
+
+- `40`, `3`, `31`, `17`, `10`, `23`, `21`, `6`, `22`, `2`
+
+Most common target phoneme IDs in the same sample:
+
+- `40`, `31`, `3`, `23`, `17`, `28`, `29`, `9`, `18`, `21`
+
+Interpretation:
+
+- reducing GRU dropout from `0.3` to `0.2` while training for `3000` steps improved PER and kept length calibration roughly in the good range
+- the model is still deletion-biased, but the collapse is much less severe than the reduced-stride run
+- full-validation prediction/reference ratio stayed near `0.81` late in training, while blank rate fell into the mid/high `0.5` range
+- validation CTC and PER are not perfectly aligned; checkpoint selection by CTC may not always select the best PER checkpoint
+- the next comparison should separate the effects of longer training and lower dropout, since both changed relative to the earlier `2000`-step, `gru_dropout=0.3` run
+
+Follow-up continuation:
+
+- a warm continuation from the step-`3000` final checkpoint to step `4000` produced a slightly better PER checkpoint/final result, around `0.517`
+- the improvement was small relative to the step-`3000` PER of `0.523`
+- validation CTC did not improve; it moved from `2.837` at step `3000` to about `2.99` at step `4000`, with intermediate continued checkpoints mostly in the high `2.8` to low `3.0` range
+- train CTC continued to fall strongly during the extension, from roughly `2.27` near step `3000` to roughly `1.54` at step `4000`
+- this looks like emerging overfitting: the extra training can occasionally find a slightly lower PER point, but the average continued checkpoint is not clearly better than the pre-extension run, and the train/validation CTC gap widens
+
 ## Current Interpretation
 
 The reconstruction-pretrained POSSM initialization appears to help CTC fine-tuning materially:
@@ -141,7 +211,7 @@ This suggests the reproduction is now on a plausible path. The result is not yet
 
 Willett's `speechBCI` decoder applies Gaussian smoothing inside the training input transform, after normalization and after training-time input augmentations such as white noise and constant offsets. The local reference code lives at `external/speechBCI`; the relevant functions are `NeuralDecoder/neuralDecoder/neuralSequenceDecoder.py::gaussSmooth` and `_datasetLayerTransform`.
 
-Current POSSM runs instead use a pre-smoothed cache (`cache_v1_smoothed_sigma2p0`) and keep runtime smoothing disabled. The cache is built by `analysis/active/ssl_experiments/build_smoothed_cache.py`, which calls `masked_ssl.cache._apply_gaussian_smoothing`. That implementation applies an analytic sigma-bin Gaussian with reflect padding to feature arrays before training and records smoothing provenance in dataset metadata.
+Earlier POSSM reconstruction runs used a pre-smoothed cache (`cache_v1_smoothed_sigma2p0`) and kept runtime smoothing disabled. The cache is built by `analysis/active/ssl_experiments/build_smoothed_cache.py`, which calls `masked_ssl.cache._apply_gaussian_smoothing`. That implementation applies an analytic sigma-bin Gaussian with reflect padding to feature arrays before training and records smoothing provenance in dataset metadata.
 
 Important nuance: Willett smooths after adding noise/offset. If POSSM uses a pre-smoothed cache, then any future training-time white-noise or constant-offset augmentation would not be smoothed unless we explicitly smooth after augmentation. That is a small but real difference from the Willett training recipe.
 

@@ -1,0 +1,77 @@
+\documentclass[11pt,letterpaper]{report}
+
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{mathtools}
+\usepackage{bm}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{graphicx}
+\usepackage[round,authoryear]{natbib}
+\usepackage[colorlinks=true,linkcolor=blue,citecolor=blue,urlcolor=blue]{hyperref}
+
+\setlist[itemize]{topsep=0.25em,itemsep=0.15em}
+\setlist[enumerate]{topsep=0.25em,itemsep=0.15em}
+
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\C}{\mathbb{C}}
+\newcommand{\N}{\mathbb{N}}
+\newcommand{\vx}{\bm{x}}
+\newcommand{\vu}{\bm{u}}
+\newcommand{\vy}{\bm{y}}
+\newcommand{\vh}{\bm{h}}
+\newcommand{\vv}{\bm{v}}
+\newcommand{\vz}{\bm{z}}
+\newcommand{\vtheta}{\bm{\theta}}
+\newcommand{\mA}{\bm{A}}
+\newcommand{\mB}{\bm{B}}
+\newcommand{\mC}{\bm{C}}
+\newcommand{\mD}{\bm{D}}
+\newcommand{\mI}{\bm{I}}
+\newcommand{\mK}{\bm{K}}
+\newcommand{\seq}{1{:}L}
+\newcommand{\conv}{\ast}
+\DeclareMathOperator{\diag}{diag}
+\DeclareMathOperator{\softmax}{softmax}
+\DeclareMathOperator{\RePart}{Re}
+
+\title{Deep State Space Models: From Convolutions to S4, S5, and Mamba}
+\author{Ethan Read}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\tableofcontents
+
+\chapter*{Preface}
+\addcontentsline{toc}{chapter}{Preface}
+
+These notes are written for a reader who already understands ordinary RNNs, transformers,
+backpropagation, regularization, and standard deep-learning training practice. The goal is
+to rebuild the missing bridge from convolutional sequence models to modern deep state space
+models: S4 \citep{gu2022s4}, S5 \citep{smith2023s5}, and Mamba \citep{gu2023mamba}.
+
+The intended level is graduate-style: enough linear algebra, signal-processing language,
+and implementation detail to read the original papers directly, while keeping derivations
+in service of model understanding. The final chapter connects the architecture ideas back
+to self-supervised Utah array sequence modeling.
+
+\input{chapters/01_convolutions_for_sequences}
+\input{chapters/02_linear_systems_and_filters}
+\input{chapters/03_state_space_models}
+\input{chapters/04_hippo_and_memory}
+\input{chapters/05_s4}
+\input{chapters/06_s5}
+\input{chapters/07_mamba}
+\input{chapters/08_comparison_and_project_relevance}
+
+\bibliographystyle{apalike}
+\bibliography{references}
+
+\end{document}

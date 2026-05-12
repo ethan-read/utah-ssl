@@ -1,0 +1,40 @@
+\chapter{Mamba}
+\label{ch:mamba}
+
+\section*{Purpose}
+\addcontentsline{toc}{section}{Purpose}
+
+This chapter explains Mamba as a selective state space model: still linear-time and
+recurrent in spirit, but no longer a fixed linear time-invariant convolution.
+
+\section*{Assumed Background}
+\addcontentsline{toc}{section}{Assumed Background}
+
+The reader understands SSMs, convolutional training for time-invariant systems, and the
+transformer idea of content-dependent routing through attention.
+
+\section*{Key Concepts To Define}
+\addcontentsline{toc}{section}{Key Concepts To Define}
+
+\begin{itemize}
+  \item Selection as input-dependent SSM parameters.
+  \item Why fixed LTI convolution cannot implement content-based routing.
+  \item Input-dependent $\mB$, $\mC$, and step size $\Delta$.
+  \item Why selectivity breaks ordinary convolution mode.
+  \item Hardware-aware parallel scan.
+  \item The Mamba block: projection, local convolution, selective scan, gating, and output projection.
+  \item Differences between attention, S4/S5, and Mamba for long sequences.
+\end{itemize}
+
+\section*{Primary Sources}
+\addcontentsline{toc}{section}{Primary Sources}
+
+The main source is \citet{gu2023mamba}. The optional follow-up is Mamba-2 and structured
+state space duality \citep{dao2024mamba2}, which can be introduced after the original
+Mamba chapter is solid.
+
+\section*{Prepares You For}
+\addcontentsline{toc}{section}{Prepares You For}
+
+The final comparison chapter places Mamba alongside CNNs, RNNs, transformers, S4, and S5,
+with special attention to Utah array self-supervised learning.

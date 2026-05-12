@@ -1,0 +1,385 @@
+\chapter{S5}
+\label{ch:s5}
+
+\section{Why S5 Exists}
+
+S4 showed that structured state space layers could model long sequences effectively, but
+it came with significant machinery: normal-plus-low-rank matrices, complex kernel
+generation, Cauchy computations, and a fairly intricate implementation. S5, short for
+Simplified State Space Layers, keeps the core SSM idea while simplifying the architecture
+and computation \citep{smith2023s5}.
+
+At a high level, S5 makes three important moves:
+
+\begin{itemize}
+  \item use diagonal state matrices rather than S4's more elaborate NPLR form;
+  \item use multi-input multi-output SSMs rather than many independent SISO filters;
+  \item use parallel scan to evaluate the recurrence efficiently.
+\end{itemize}
+
+This makes S5 a particularly good model to understand after S4. It preserves the
+state-space perspective, but many pieces become easier to reason about.
+
+\section{The S5 Recurrence}
+
+The discrete SSM recurrence is still the starting point:
+\[
+  \vx_t = \bar{\mA}\vx_{t-1} + \bar{\mB}\vu_t,
+  \qquad
+  \vy_t = \mC\vx_t + \mD\vu_t.
+\]
+S5 uses a diagonal state transition:
+\[
+  \bar{\mA} = \diag(\bar{\lambda}_1,\ldots,\bar{\lambda}_N).
+\]
+Then each state coordinate evolves independently before the readout:
+\[
+  x_t[j] = \bar{\lambda}_j x_{t-1}[j] + (\bar{\mB}\vu_t)[j].
+\]
+The coordinates interact through $\bar{\mB}$ and $\mC$, not through a dense transition
+matrix. This is much simpler than a generic dense $\bar{\mA}$.
+
+The kernel is still
+\[
+  \mK_i = \mC\bar{\mA}^i\bar{\mB}.
+\]
+With diagonal $\bar{\mA}$,
+\[
+  \bar{\mA}^i
+  =
+  \diag(\bar{\lambda}_1^i,\ldots,\bar{\lambda}_N^i),
+\]
+so the kernel is a mixture of independent exponential modes.
+
+\section{Diagonal Does Not Mean Trivial}
+
+It is tempting to think a diagonal state matrix is too simple. But diagonal dynamics can
+still be expressive when combined with input and output mixing.
+
+The input matrix $\bar{\mB}$ maps the input vector into all state coordinates:
+\[
+  \bar{\mB}\vu_t \in \C^N.
+\]
+The output matrix $\mC$ mixes all state coordinates back into output channels:
+\[
+  \mC\vx_t \in \R^{C_{\mathrm{out}}}.
+\]
+So each output channel can depend on many state modes, and each input channel can excite
+many state modes. The state modes themselves are independent, but the layer as a whole
+can still mix channels richly.
+
+This is the same principle that makes diagonalization useful in linear systems. In the
+right basis, dynamics are independent modes; input and output projections determine how
+those modes are used.
+
+\section{Complex Diagonal Modes}
+
+S5 commonly uses complex diagonal modes. Each eigenvalue-like parameter can be written as
+\[
+  \lambda_j = \alpha_j + i\omega_j.
+\]
+In continuous time, stability requires
+\[
+  \RePart(\lambda_j)=\alpha_j < 0.
+\]
+After discretization with step size $\Delta$, the discrete eigenvalue is
+\[
+  \bar{\lambda}_j = e^{\Delta \lambda_j}.
+\]
+Its magnitude is
+\[
+  |\bar{\lambda}_j| = e^{\Delta \alpha_j},
+\]
+so negative real part gives a magnitude below $1$. The imaginary part $\omega_j$ controls
+oscillation.
+
+Thus, S5's diagonal state can represent a bank of decaying oscillatory filters:
+\[
+  \bar{\lambda}_j^t
+  =
+  e^{\Delta \alpha_j t} e^{i\Delta\omega_j t}.
+\]
+This is a powerful basis for temporal modeling.
+
+\section{MIMO State Space Layers}
+
+One of S5's main changes from S4 is the move toward multi-input multi-output SSMs. Instead
+of treating channels as many independent SISO filters, S5 allows a single SSM layer to map
+multiple input channels to multiple output channels:
+\[
+  \vu_t \in \R^{H},
+  \qquad
+  \vy_t \in \R^{H},
+  \qquad
+  \vx_t \in \C^N.
+\]
+Here $H$ is model width and $N$ is state size.
+
+The parameter shapes are
+\[
+  \bar{\mB}\in\C^{N\times H},
+  \qquad
+  \mC\in\C^{H\times N}.
+\]
+The resulting kernel has shape
+\[
+  \mK_i\in\R^{H\times H}
+\]
+after taking the real-valued output convention. So at each lag $i$, the layer can map all
+input channels to all output channels.
+
+This MIMO view is appealing because it makes the SSM layer feel more like a standard
+sequence block over model-width features rather than a collection of independent scalar
+filters plus separate mixing.
+
+\section{Discretization And Learned Timescales}
+
+Like S4, S5 can start from continuous-time parameters and discretize them. For diagonal
+$\mA$, discretization is especially simple:
+\[
+  \bar{\lambda}_j = e^{\Delta_j \lambda_j}.
+\]
+The step size $\Delta_j$ may be learned or parameterized. This gives each mode its own
+effective timescale.
+
+The input matrix also needs discretization. For a scalar diagonal mode,
+\[
+  \bar{B}_j
+  =
+  \left(\int_0^{\Delta_j} e^{\tau\lambda_j}d\tau\right)B_j
+  =
+  \frac{e^{\Delta_j\lambda_j}-1}{\lambda_j}B_j
+\]
+when $\lambda_j\neq 0$. The exact implementation may use numerically stable variants,
+but the idea is the same as Chapter~\ref{ch:state-space-models}: continuous dynamics are
+converted into discrete sequence updates.
+
+\section{Parallel Scan}
+
+S5 emphasizes parallel scan as a way to evaluate the recurrence efficiently. To understand
+scan, start with a recurrence of the form
+\[
+  \vx_t = \mA_t\vx_{t-1}+\vb_t.
+\]
+For S5 with fixed diagonal $\bar{\mA}$,
+\[
+  \mA_t=\bar{\mA},
+  \qquad
+  \vb_t=\bar{\mB}\vu_t.
+\]
+
+Each time step defines an affine map:
+\[
+  F_t(\vx)=\mA_t\vx+\vb_t.
+\]
+Composing two adjacent updates gives
+\[
+  F_2(F_1(\vx))
+  =
+  \mA_2\mA_1\vx + \mA_2\vb_1+\vb_2.
+\]
+So the composition of two affine maps is another affine map:
+\[
+  (\mA_2,\vb_2)\circ(\mA_1,\vb_1)
+  =
+  (\mA_2\mA_1,\; \mA_2\vb_1+\vb_2).
+\]
+
+This composition is associative. Associativity means we can compute all prefix
+compositions with a parallel scan algorithm. That gives the same result as stepping
+through the recurrence, but with much more parallelism on suitable hardware.
+
+This matters because it gives S5 another path to efficient training. Instead of explicitly
+forming a long convolution kernel, one can evaluate the recurrence through an associative
+parallel prefix operation.
+
+\section{Scan Versus Convolution}
+
+For a time-invariant linear SSM, recurrent mode and convolution mode are mathematically
+equivalent. S4 leans heavily on generating and applying the convolution kernel. S5's
+parallel scan view emphasizes efficient recurrence evaluation.
+
+The distinction is practical:
+
+\[
+\begin{array}{lll}
+\text{Convolution mode} &:& \text{construct or apply } \mK_i=\mC\bar{\mA}^i\bar{\mB}, \\
+\text{Scan mode} &:& \text{parallelize the recurrence updates directly}.
+\end{array}
+\]
+
+Both exploit structure. Convolution exploits time invariance and fast filtering. Scan
+exploits associativity of recurrence composition. Mamba will also rely heavily on scan,
+because its input-dependent dynamics break the fixed convolution kernel.
+
+\section{Initialization From S4 And HiPPO}
+
+S5 simplifies S4, but it does not discard the long-memory initialization story. It can use
+initializations derived from S4/HiPPO-style dynamics. The goal is still to start with a
+useful spectrum of modes rather than random short-memory behavior.
+
+Conceptually:
+
+\[
+  \text{HiPPO/S4 initialization}
+  \rightarrow
+  \text{diagonalized modes}
+  \rightarrow
+  \text{S5 diagonal SSM}.
+\]
+
+The practical result is that S5 begins with modes covering a range of timescales. Training
+then adapts those modes, along with $\bar{\mB}$, $\mC$, step sizes, and surrounding neural
+network parameters.
+
+\section{The S5 Block}
+
+A simplified S5 block has the same broad structure as other residual sequence blocks:
+\[
+  \vz
+  \rightarrow
+  \text{normalization}
+  \rightarrow
+  \text{linear projection}
+  \rightarrow
+  \text{S5 temporal mixing}
+  \rightarrow
+  \text{nonlinearity or gate}
+  \rightarrow
+  \text{linear projection}
+  \rightarrow
+  \text{residual addition}.
+\]
+Implementation details vary, but this is the right conceptual structure.
+
+The S5 temporal mixing step is the diagonal MIMO SSM. The rest of the block supplies
+feature mixing, nonlinearity, regularization, and stable deep optimization.
+
+\section{State Size And Model Width}
+
+S5 makes the distinction between state size and model width especially important.
+
+\[
+\begin{array}{ll}
+H & \text{number of feature channels passed between blocks}, \\
+N & \text{number of SSM state modes}.
+\end{array}
+\]
+
+Increasing $H$ gives the network more representation channels. Increasing $N$ gives the
+SSM more temporal modes. In a diagonal SSM, each state coordinate is one mode, so $N$ is
+directly tied to the richness of the temporal filter bank.
+
+For neural time series, this distinction is practically important. A model might need
+enough width to represent neural features and enough state size to capture dynamics
+across speech-relevant timescales. These are related but not identical forms of capacity.
+
+\section{S5 Compared With S4}
+
+The cleanest comparison is:
+
+\[
+\begin{array}{lll}
+\text{S4} &:& \text{NPLR structure, SISO emphasis, specialized kernel computation}, \\
+\text{S5} &:& \text{diagonal structure, MIMO emphasis, parallel scan}.
+\end{array}
+\]
+
+S4 is closer to the full structured HiPPO matrix story. S5 is simpler and often easier to
+implement and adapt. The simplification is not free: diagonal dynamics are a stronger
+restriction than NPLR dynamics. But the MIMO formulation and learnable projections can
+recover substantial expressivity in practice.
+
+For many applied projects, S5 is attractive because it provides the core SSM advantages
+without requiring the full S4 implementation stack.
+
+\section{Why S5 Is Interesting For Neural Data}
+
+Neural time series are not token sequences in the language-modeling sense. They are
+continuous, noisy, dynamical signals. SSMs are a natural inductive bias because they model
+temporal evolution through latent state.
+
+S5 is especially appealing for this setting because:
+
+\begin{itemize}
+  \item it is causal by construction when run left to right;
+  \item it can maintain fixed-size recurrent state for online decoding;
+  \item diagonal modes provide interpretable timescale and oscillation structure;
+  \item MIMO input/output maps can mix many neural channels;
+  \item parallel scan makes training more practical than naive recurrence.
+\end{itemize}
+
+This does not guarantee good downstream decoding. The local project notes already show
+that SSL objective design, nuisance structure, normalization, and evaluation matter a
+great deal. But architecturally, S5 is a reasonable backbone to test for causal neural
+sequence modeling.
+
+\section{Limitations}
+
+S5 also has limitations.
+
+\paragraph{Fixed dynamics.}
+Like S4, a standard S5 layer is linear time invariant inside the temporal core. The same
+dynamics apply regardless of input content. This is efficient, but less flexible than
+attention's content-dependent routing.
+
+\paragraph{Diagonal state transition.}
+Diagonal dynamics are simple and efficient, but they restrict interactions between state
+modes. Mode interaction must happen through input/output projections and nonlinear
+stacking across layers.
+
+\paragraph{Objective dependence.}
+A good SSM backbone does not by itself solve self-supervised learning. If an objective can
+be solved through local recording-context shortcuts or by predicting a trivial normalized
+mean, S5 may learn unhelpful representations.
+
+\section{A Reading Strategy For The S5 Paper}
+
+When reading \citet{smith2023s5}, separate the ideas into four layers:
+
+\begin{enumerate}
+  \item The simplification layer: replace S4's harder structured matrices with diagonal
+  state dynamics.
+  \item The channel layer: use MIMO SSMs for richer input-output mixing.
+  \item The algorithm layer: use parallel scan to evaluate recurrences efficiently.
+  \item The architecture layer: place S5 inside a deep residual sequence model.
+\end{enumerate}
+
+If an equation feels hard, ask which of these layers it belongs to. That usually makes the
+paper easier to navigate.
+
+\section{What To Remember}
+
+\begin{itemize}
+  \item S5 is a simplified state space sequence layer built after S4.
+  \item It uses diagonal state transitions, often with complex-valued modes.
+  \item Diagonal modes represent decays and oscillations.
+  \item MIMO $\bar{\mB}$ and $\mC$ matrices let the layer mix many input and output
+  channels.
+  \item Parallel scan evaluates recurrence updates efficiently using associativity.
+  \item S5 preserves the recurrent/convolutional SSM spirit while reducing S4's
+  implementation complexity.
+  \item For neural sequence modeling, S5 is attractive because it is causal, efficient,
+  and organized around latent dynamics.
+\end{itemize}
+
+\section{Exercises}
+
+\begin{enumerate}
+  \item For diagonal $\bar{\mA}=\diag(\lambda_1,\lambda_2)$, write
+  $\bar{\mA}^i$ explicitly.
+  \item Explain why diagonal state dynamics can still produce rich outputs when paired
+  with dense $\bar{\mB}$ and $\mC$ matrices.
+  \item Show that composing affine recurrence updates
+  $(\mA_2,\vb_2)\circ(\mA_1,\vb_1)$ gives
+  $(\mA_2\mA_1,\mA_2\vb_1+\vb_2)$.
+  \item In your own words, compare convolution mode and scan mode.
+  \item Why might fixed LTI dynamics be limiting for tasks that require content-dependent
+  selection?
+\end{enumerate}
+
+\section{Prepares You For}
+
+Mamba modifies the SSM idea by making the dynamics selective, meaning some SSM parameters
+depend on the current input. This gives up the fixed convolution kernel but keeps an
+efficient scan-based recurrent computation.

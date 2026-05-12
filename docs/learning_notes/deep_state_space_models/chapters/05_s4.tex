@@ -1,0 +1,435 @@
+\chapter{S4}
+\label{ch:s4}
+
+\section{What Problem Did S4 Solve?}
+
+S4, the Structured State Space sequence model, made state space layers competitive for
+long-range deep sequence modeling \citep{gu2022s4}. Its contribution was not simply
+``use an SSM.'' The basic SSM equations are old. The contribution was to combine:
+
+\begin{itemize}
+  \item HiPPO-inspired long-memory initialization;
+  \item a structured parameterization of the state matrix;
+  \item efficient computation of long convolution kernels;
+  \item a deep residual neural-network block around the SSM layer.
+\end{itemize}
+
+The central computational goal is familiar from previous chapters. Given a discretized
+SSM,
+\[
+  \vx_t = \bar{\mA}\vx_{t-1}+\bar{\mB}\vu_t,
+  \qquad
+  \vy_t = \mC\vx_t+\mD\vu_t,
+\]
+we want to apply the convolution kernel
+\[
+  \mK_i = \mC\bar{\mA}^i\bar{\mB}
+\]
+over very long sequences. S4 asks: how can this be expressive, stable, and fast?
+
+\section{Why Ordinary SSMs Are Not Enough}
+
+A generic dense state matrix $\mA\in\R^{N\times N}$ creates several problems.
+
+\paragraph{Kernel generation is expensive.}
+Computing $\mC\bar{\mA}^i\bar{\mB}$ for many lags $i$ can require repeated dense matrix
+multiplications. For long sequences, this is too slow.
+
+\paragraph{Training can be unstable.}
+The eigenvalues of $\bar{\mA}$ control the memory. If they drift outside the unit circle,
+the recurrence can explode. If they move too far inside, memory vanishes.
+
+\paragraph{Random initialization is poor for long memory.}
+Long-context tasks need a useful range of timescales from the start. HiPPO helps, but the
+raw HiPPO matrices also need to be represented in a computationally tractable way.
+
+\paragraph{Naive recurrence loses parallelism.}
+Running the recurrence step by step is natural for inference, but it gives up the training
+parallelism that makes convolutions and transformers attractive.
+
+S4 is best understood as an answer to these four problems at once.
+
+\section{The S4 Layer At A High Level}
+
+An S4 layer maps an input sequence to an output sequence by:
+
+\begin{enumerate}
+  \item parameterizing a continuous-time SSM;
+  \item discretizing it using a step size $\Delta$;
+  \item generating a long causal convolution kernel from the discretized SSM;
+  \item applying that kernel to the sequence;
+  \item adding nonlinearities, channel mixing, and residual connections around it.
+\end{enumerate}
+
+At the temporal-mixing core, S4 is still an LTI system:
+\[
+  \vy_t = \sum_{i=0}^{t-1}\mK_i\vu_{t-i}.
+\]
+The novelty is how $\mK_i$ is parameterized and computed.
+
+\section{SISO SSMs In S4}
+
+The simplest S4 presentation uses single-input single-output SSMs. For one channel:
+\[
+  u_t \in \R,\qquad y_t \in \R,
+\]
+and
+\[
+  \vx_t \in \R^N.
+\]
+The kernel is scalar:
+\[
+  K_i = \mC\bar{\mA}^i\bar{\mB}.
+\]
+
+For a multi-channel neural network, S4 can use separate SISO SSMs across channels, with
+pointwise projections or other mixing layers before and after the SSM operation. So one
+should not picture the whole network as scalar. Rather, the SSM temporal filter itself is
+often channelwise, while channel interactions are handled by surrounding linear layers.
+
+This design choice will matter when we compare S4 with S5. S5 moves toward a more direct
+multi-input multi-output SSM formulation.
+
+\section{HiPPO Initialization In S4}
+
+S4 begins from a HiPPO-inspired continuous-time matrix. From the previous chapter, the
+purpose of HiPPO is to initialize a state that can compress long histories using
+polynomial projection dynamics. This gives the SSM a good memory structure before
+training.
+
+The rough pipeline is:
+\[
+  \text{HiPPO continuous dynamics}
+  \rightarrow
+  \text{structured SSM parameterization}
+  \rightarrow
+  \text{discretized convolution kernel}.
+\]
+
+This is important because S4's long-memory behavior is not just a consequence of using a
+large state. It comes from initializing and parameterizing the state matrix so that it
+has useful modes across many timescales.
+
+\section{Normal Matrices}
+
+To understand S4's structure, first recall diagonalization. If
+\[
+  \mA = \mV\bm{\Lambda}\mV^{-1},
+\]
+then powers of $\mA$ are easy in the eigenbasis:
+\[
+  \mA^i = \mV\bm{\Lambda}^i\mV^{-1}.
+\]
+The problem is that an arbitrary diagonalization can be numerically poorly conditioned.
+If $\mV^{-1}$ is unstable, the computation may be fragile.
+
+A normal matrix is a complex matrix satisfying
+\[
+  \mA^*\mA = \mA\mA^*,
+\]
+where $\mA^*$ is the conjugate transpose. Normal matrices are especially nice because
+they can be diagonalized by a unitary matrix:
+\[
+  \mA = \mV\bm{\Lambda}\mV^*.
+\]
+Unitary matrices preserve norms, which makes this representation much better conditioned.
+
+Diagonal matrices are the simplest normal matrices. Symmetric real matrices and Hermitian
+complex matrices are also normal. S4 exploits the fact that certain HiPPO-related
+matrices can be represented as a normal part plus a low-rank correction.
+
+\section{Normal Plus Low-Rank Structure}
+
+S4 uses a structured state matrix often described as normal plus low-rank, or NPLR:
+\[
+  \mA = \mA_{\mathrm{normal}} - \mP\mQ^*,
+\]
+where $\mA_{\mathrm{normal}}$ is normal and $\mP\mQ^*$ is low-rank. The exact signs and
+forms depend on the convention, but the idea is:
+
+\[
+  \text{HiPPO-like matrix}
+  =
+  \text{diagonalizable normal matrix}
+  +
+  \text{small low-rank correction}.
+\]
+
+This is the central S4 algebraic trick. The normal part gives efficient diagonalization.
+The low-rank correction preserves the useful HiPPO memory structure. Together, they make
+it possible to compute long convolution kernels efficiently without throwing away the
+long-memory initialization.
+
+On a first reading, you do not need to derive the NPLR decomposition. What matters is the
+modeling role:
+
+\begin{itemize}
+  \item diagonal or normal dynamics are computationally convenient;
+  \item raw HiPPO dynamics are memory-useful but not directly convenient;
+  \item NPLR structure lets S4 keep both advantages.
+\end{itemize}
+
+\section{Complex Diagonal Dynamics}
+
+After transforming into a convenient basis, S4 works with complex-valued diagonal or
+almost-diagonal dynamics. A diagonal state matrix has entries
+\[
+  \lambda_1,\ldots,\lambda_N.
+\]
+The kernel contains terms like
+\[
+  \lambda_j^i.
+\]
+As Chapter~\ref{ch:linear-systems-and-filters} discussed, complex eigenvalues represent
+decaying oscillatory modes:
+\[
+  \lambda_j = r_j e^{i\omega_j}
+  \quad \Rightarrow \quad
+  \lambda_j^i = r_j^i e^{i\omega_j i}.
+\]
+
+This makes S4 filters rich. A long kernel can mix many decays and oscillations. In signal
+terms, the layer can learn filters with a broad range of temporal and frequency responses.
+
+The model output remains real-valued. Complex arithmetic is a convenient internal
+parameterization, not a claim that the data are complex.
+
+\section{Generating The Convolution Kernel}
+
+For a sequence of length $L$, S4 needs the kernel
+\[
+  K_0,K_1,\ldots,K_{L-1}.
+\]
+In a scalar SISO case,
+\[
+  K_i = \mC\bar{\mA}^i\bar{\mB}.
+\]
+If $\bar{\mA}$ is diagonal,
+\[
+  \bar{\mA} = \diag(\bar{\lambda}_1,\ldots,\bar{\lambda}_N),
+\]
+then
+\[
+  K_i
+  =
+  \sum_{j=1}^{N}
+  C_j B_j \bar{\lambda}_j^i.
+\]
+So the kernel is a sum of exponentials. This is already much easier than powering a dense
+matrix.
+
+S4's full NPLR case is more complicated, but the same broad idea remains: exploit the
+structured state matrix to compute the long kernel quickly.
+
+\section{The Cauchy Kernel Idea}
+
+The S4 paper emphasizes efficient computation through Cauchy kernels. The details are
+technical, but the conceptual path is manageable.
+
+Rather than compute every time-domain coefficient $K_i$ by repeated powers, one can work
+with the generating function or frequency-domain representation of the SSM. For diagonal
+dynamics, terms of the form
+\[
+  \frac{1}{\omega - \lambda_j}
+\]
+appear when evaluating the transfer function at frequency-like points $\omega$. A matrix
+with entries of this reciprocal-difference form is called a Cauchy matrix.
+
+So the high-level statement is:
+
+\[
+  \text{SSM transfer-function evaluation}
+  \quad \leadsto \quad
+  \text{structured Cauchy matrix computation}.
+\]
+
+Efficient Cauchy multiplication lets S4 generate the convolution kernel or its frequency
+representation much faster than a naive dense approach. For learning S4 conceptually, it
+is enough to know that this is the specialized numerical routine that makes the structured
+SSM practical at long sequence lengths.
+
+\section{Convolutional Training}
+
+During training, S4 usually uses convolution mode. For an input sequence $u_{1:L}$, it
+computes a kernel $K_{0:L-1}$ and applies
+\[
+  y_t = \sum_{i=0}^{t-1} K_i u_{t-i}.
+\]
+This can be done in parallel over the sequence, often using FFT-based convolution or
+related efficient methods.
+
+This is a major advantage over a naive RNN-style recurrence. The underlying model has a
+state-space interpretation, but training does not have to process one time step after
+another.
+
+The computational pattern is:
+\[
+  \text{generate long kernel}
+  \rightarrow
+  \text{apply causal convolution}
+  \rightarrow
+  \text{use ordinary backpropagation}.
+\]
+
+\section{Recurrent Inference}
+
+The same S4 layer can also be run recurrently:
+\[
+  \vx_t = \bar{\mA}\vx_{t-1}+\bar{\mB}u_t,
+  \qquad
+  y_t=\mC\vx_t+\mD u_t.
+\]
+This is useful for online inference or autoregressive generation. Instead of storing the
+whole past sequence, the model stores the current state $\vx_t$.
+
+This duality is one of the most attractive features of LTI SSMs:
+\[
+  \text{parallel convolution for training}
+  \quad \text{and} \quad
+  \text{recurrent state update for deployment}.
+\]
+
+Transformers have a different deployment story: causal attention can cache previous keys
+and values, but memory grows with context length. An SSM recurrent state has fixed size.
+
+\section{Discretization In S4}
+
+S4 parameterizes continuous-time dynamics and then discretizes them. As in
+Chapter~\ref{ch:state-space-models}, discretization depends on a step size $\Delta$:
+\[
+  \bar{\mA} = e^{\Delta\mA},
+  \qquad
+  \bar{\mB}
+  =
+  \left(\int_0^\Delta e^{\tau\mA}\,d\tau\right)\mB.
+\]
+
+The step size can be learned. This gives the layer control over effective timescales.
+Different channels can learn different discretizations, allowing the network to adapt the
+continuous dynamics to the sampled sequence.
+
+For practical understanding, remember:
+
+\[
+  \Delta
+  \text{ controls how continuous memory modes appear at discrete sequence steps.}
+\]
+
+\section{The S4 Block}
+
+The SSM kernel is only the temporal core. A deep S4 model wraps this core in a residual
+block. A simplified block is:
+\[
+  \vz
+  \rightarrow
+  \text{normalization}
+  \rightarrow
+  \text{linear projection}
+  \rightarrow
+  \text{S4 temporal convolution}
+  \rightarrow
+  \text{activation and dropout}
+  \rightarrow
+  \text{linear projection}
+  \rightarrow
+  \text{residual addition}.
+\]
+
+Exact details vary across implementations. Some versions use gating, different
+normalization placements, or additional feed-forward layers. The important design is the
+same as in transformers: the specialized sequence operation is one component inside a
+deep residual network.
+
+This matters because the bare SSM is linear. Nonlinear modeling power comes from stacking
+blocks with activations, gates, projections, and residual paths.
+
+\section{What S4 Learns}
+
+S4 learns the parameters that determine the convolution kernel. Depending on the
+implementation, these include:
+
+\begin{itemize}
+  \item eigenvalue-like parameters controlling decay and oscillation;
+  \item input and output vectors analogous to $\mB$ and $\mC$;
+  \item step sizes $\Delta$;
+  \item direct terms and surrounding channel-mixing projections.
+\end{itemize}
+
+The learned kernel can be very long. But unlike a CNN kernel, it is not an arbitrary list
+of free parameters. It is generated by a structured dynamical system. That structure is
+the inductive bias that gives S4 its efficiency and long-memory behavior.
+
+\section{Why S4 Was Important}
+
+S4 showed that state space layers could compete with attention and other sequence models
+on difficult long-range benchmarks. The key lesson was not just empirical. It changed the
+architectural picture:
+
+\[
+  \text{recurrence}
+  \neq
+  \text{slow RNN training by necessity}.
+\]
+
+A carefully structured recurrent model can expose a convolutional form for training while
+retaining a recurrent form for inference. This is the foundation on which S5 and later
+models build.
+
+\section{Limitations And Complexity}
+
+S4 is powerful, but it is not simple. Its implementation involves complex-valued
+parameters, special matrix structure, discretization details, and specialized kernel
+computation. These details make it less straightforward than a standard convolution or
+vanilla RNN.
+
+This complexity motivated simplified variants. S5 keeps the state-space approach but
+removes some of S4's harder machinery by using diagonal state matrices and a parallel
+scan formulation. Mamba later changes the emphasis again by adding input-dependent
+selectivity.
+
+\section{A Reading Strategy For The S4 Paper}
+
+When reading \citet{gu2022s4}, it helps to separate the paper into layers:
+
+\begin{enumerate}
+  \item The modeling layer: an SSM defines a long convolution kernel.
+  \item The memory layer: HiPPO gives a strong long-memory initialization.
+  \item The algebra layer: NPLR structure makes the matrix tractable.
+  \item The numerical layer: Cauchy kernel computation makes long convolution efficient.
+  \item The neural-network layer: S4 is placed inside deep residual blocks.
+\end{enumerate}
+
+Trying to understand all five layers at once is difficult. The paper becomes much easier
+once you can identify which layer a given equation belongs to.
+
+\section{What To Remember}
+
+\begin{itemize}
+  \item S4 is a structured state space layer for long sequence modeling.
+  \item It uses HiPPO-inspired dynamics to initialize long memory.
+  \item The SSM kernel is still $\mK_i=\mC\bar{\mA}^i\bar{\mB}$.
+  \item S4 uses normal-plus-low-rank structure to keep HiPPO-like dynamics tractable.
+  \item Complex modes represent decays and oscillations.
+  \item Training can use convolution mode; online inference can use recurrent mode.
+  \item The S4 layer is embedded inside a nonlinear residual block.
+  \item S4's power comes with implementation complexity, motivating S5.
+\end{itemize}
+
+\section{Exercises}
+
+\begin{enumerate}
+  \item Explain why a generic dense $\mA$ is problematic for long-sequence SSMs.
+  \item In your own words, what does NPLR structure buy us?
+  \item Why are complex eigenvalues natural for temporal filters?
+  \item Describe the difference between S4's convolutional training mode and recurrent
+  inference mode.
+  \item When reading the S4 paper, identify whether a difficult equation belongs mainly
+  to memory initialization, matrix structure, numerical kernel computation, or the neural
+  block design.
+\end{enumerate}
+
+\section{Prepares You For}
+
+S5 keeps the state-space viewpoint but simplifies the parameterization and changes the
+multi-channel treatment. The next chapter explains how S5 moves from S4's more elaborate
+NPLR machinery toward diagonal state matrices, MIMO SSMs, and parallel scan.
