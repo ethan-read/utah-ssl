@@ -15,6 +15,7 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+import traceback
 
 import torch
 
@@ -128,6 +129,12 @@ def install_stdout_progress_hook() -> None:
         if event == "phoneme_train_report":
             train_loss = _fmt(payload.get("train_ctc_bpphone"))
             print(f"[stage2 train] step={step} train_ctc_bpphone={train_loss} elapsed_s={elapsed}", flush=True)
+        elif event == "phoneme_resume":
+            checkpoint_path = payload.get("resumed_from_checkpoint")
+            print(
+                f"[stage2 resume] step={step} from={checkpoint_path} elapsed_s={elapsed}",
+                flush=True,
+            )
         elif event == "phoneme_val_report":
             collapse = dict(payload.get("collapse_diagnostics") or {})
             print(
@@ -153,6 +160,73 @@ def resolve_stage1_checkpoint(args: argparse.Namespace) -> Path:
     return resolve_possm_checkpoint_path(output_root=Path(args.stage1_output_root))
 
 
+def load_json(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {}
+    if not isinstance(payload, dict):
+        raise TypeError(f"Expected JSON object in {path}, got {type(payload).__name__}")
+    return payload
+
+
+def write_text_atomic(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.tmp")
+    tmp_path.write_text(text)
+    tmp_path.replace(path)
+
+
+def write_json(path: Path, payload: dict[str, Any]) -> None:
+    write_text_atomic(path, json.dumps(payload, indent=2))
+
+
+def load_saved_result_row(variant_name: str, payload: dict[str, Any]) -> dict[str, Any] | None:
+    row = payload.get("row")
+    if isinstance(row, dict):
+        return dict(row)
+    summary = payload.get("summary")
+    if isinstance(summary, dict):
+        restored = flatten_summary_row(variant_name=variant_name, summary=summary)
+        if payload.get("elapsed_seconds") is not None:
+            restored["elapsed_seconds"] = payload.get("elapsed_seconds")
+        return restored
+    if payload.get("run_name") is not None:
+        return dict(payload)
+    return None
+
+
+def make_logger(log_path: Path):
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def _log(message: str) -> None:
+        stamp = datetime.now(timezone.utc).isoformat()
+        line = f"[{stamp}] {message}"
+        print(line, flush=True)
+        with log_path.open("a") as handle:
+            handle.write(line + "\n")
+
+    return _log
+
+
+def write_results_csv(csv_path: Path, rows: list[dict[str, Any]]) -> None:
+    if not rows:
+        return
+    fieldnames: list[str] = []
+    for row in rows:
+        for key in row:
+            if key not in fieldnames:
+                fieldnames.append(key)
+    tmp_path = csv_path.with_name(f".{csv_path.name}.tmp")
+    with tmp_path.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    tmp_path.replace(csv_path)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--stage1-checkpoint", type=Path, default=None)
@@ -160,6 +234,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stage2-cache-root", type=Path, default=DEFAULT_STAGE2_CACHE_ROOT)
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT / "phoneme_finetune")
     parser.add_argument("--sweep-name", default=None)
+    parser.add_argument(
+        "--resume",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Resume from an existing sweep directory and variant checkpoints when possible.",
+    )
+    parser.add_argument(
+        "--continue-on-error",
+        action="store_true",
+        help="Keep running remaining variants if one variant fails.",
+    )
     parser.add_argument(
         "--variant",
         action="append",
@@ -223,62 +308,157 @@ def main() -> None:
     sweep_name = args.sweep_name or f"stage2_hparam_sweep_{timestamp_utc()}"
     sweep_dir = Path(args.output_root) / "sweeps" / sweep_name
     sweep_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = sweep_dir / "sweep_manifest.json"
+    state_path = sweep_dir / "sweep_state.json"
+    csv_path = sweep_dir / "sweep_results.csv"
+    results_json_path = sweep_dir / "sweep_results.json"
+    sweep_log_path = sweep_dir / "sweep.log"
+    log = make_logger(sweep_log_path)
 
-    manifest: dict[str, Any] = {
-        "sweep_name": sweep_name,
-        "created_utc": datetime.now(timezone.utc).isoformat(),
-        "device": str(device),
-        "stage1_checkpoint": str(stage1_checkpoint),
-        "stage2_cache_root": str(stage2_cache_root),
-        "output_root": str(args.output_root),
-        "base_config": asdict(base),
-        "selected_variants": selected_names,
-        "variants": {name: asdict(variants[name]) for name in selected_names},
-        "results": [],
-    }
-    (sweep_dir / "sweep_manifest.json").write_text(json.dumps(manifest, indent=2))
+    if args.resume and manifest_path.exists():
+        manifest = load_json(manifest_path)
+    else:
+        manifest = {}
+    manifest.update(
+        {
+            "sweep_name": sweep_name,
+            "created_utc": str(manifest.get("created_utc", datetime.now(timezone.utc).isoformat())),
+            "updated_utc": datetime.now(timezone.utc).isoformat(),
+            "device": str(device),
+            "stage1_checkpoint": str(stage1_checkpoint),
+            "stage2_cache_root": str(stage2_cache_root),
+            "output_root": str(args.output_root),
+            "base_config": asdict(base),
+            "selected_variants": selected_names,
+            "variants": {name: asdict(variants[name]) for name in selected_names},
+        }
+    )
+    results_by_variant = dict(manifest.get("results_by_variant") or {})
+    normalized_results_by_variant: dict[str, dict[str, Any]] = {}
+    for variant_name in selected_names:
+        payload = results_by_variant.get(variant_name)
+        if not isinstance(payload, dict):
+            continue
+        row = load_saved_result_row(variant_name, payload)
+        if row is None:
+            continue
+        normalized_results_by_variant[variant_name] = {
+            "row": row,
+            "summary": payload.get("summary"),
+            "elapsed_seconds": row.get("elapsed_seconds"),
+            "completed_utc": payload.get("completed_utc"),
+        }
+    results_by_variant = normalized_results_by_variant
+    manifest["results_by_variant"] = results_by_variant
+    manifest["results"] = [results_by_variant[name] for name in selected_names if name in results_by_variant]
 
-    print("stage1 checkpoint:", stage1_checkpoint)
-    print("stage2 cache root:", stage2_cache_root)
-    print("sweep dir:", sweep_dir)
-    print("device:", device)
-    print("variants:", ", ".join(selected_names))
+    if args.resume and state_path.exists():
+        sweep_state = load_json(state_path)
+    else:
+        sweep_state = {}
+    sweep_state.update(
+        {
+            "sweep_name": sweep_name,
+            "created_utc": str(sweep_state.get("created_utc", datetime.now(timezone.utc).isoformat())),
+            "updated_utc": datetime.now(timezone.utc).isoformat(),
+            "selected_variants": selected_names,
+            "status_by_variant": dict(sweep_state.get("status_by_variant") or {}),
+            "last_error_by_variant": dict(sweep_state.get("last_error_by_variant") or {}),
+        }
+    )
+    write_json(manifest_path, manifest)
+    write_json(state_path, sweep_state)
+
+    log(f"stage1 checkpoint: {stage1_checkpoint}")
+    log(f"stage2 cache root: {stage2_cache_root}")
+    log(f"sweep dir: {sweep_dir}")
+    log(f"device: {device}")
+    log(f"variants: {', '.join(selected_names)}")
+    log(f"resume enabled: {bool(args.resume)}")
 
     install_stdout_progress_hook()
 
-    rows: list[dict[str, Any]] = []
+    rows_by_variant: dict[str, dict[str, Any]] = {
+        str(name): dict(results_by_variant[name]["row"])
+        for name in selected_names
+        if name in results_by_variant and isinstance(results_by_variant[name].get("row"), dict)
+    }
     for variant_name in selected_names:
+        if args.resume and variant_name in rows_by_variant:
+            log(f"skipping completed variant: {variant_name}")
+            sweep_state["status_by_variant"][variant_name] = "completed"
+            sweep_state["updated_utc"] = datetime.now(timezone.utc).isoformat()
+            write_json(state_path, sweep_state)
+            continue
+
         config = variants[variant_name]
         variant_output_root = Path(args.output_root) / sweep_name / variant_name
         variant_output_root.mkdir(parents=True, exist_ok=True)
-        print(f"\n=== Running variant: {variant_name} ===", flush=True)
+        sweep_state["status_by_variant"][variant_name] = "running"
+        sweep_state["updated_utc"] = datetime.now(timezone.utc).isoformat()
+        write_json(state_path, sweep_state)
+        log(f"starting variant: {variant_name}")
         print(json.dumps(asdict(config), indent=2), flush=True)
+
         t0 = time.time()
-        summary = run_possm_phoneme_finetuning(
-            checkpoint_path=stage1_checkpoint,
-            cache_root=stage2_cache_root,
-            output_root=variant_output_root,
-            config=config,
-            device=device,
-        )
+        try:
+            summary = run_possm_phoneme_finetuning(
+                checkpoint_path=stage1_checkpoint,
+                cache_root=stage2_cache_root,
+                output_root=variant_output_root,
+                config=config,
+                device=device,
+                run_name="run",
+                resume_from_latest=bool(args.resume),
+            )
+        except Exception as exc:
+            sweep_state["status_by_variant"][variant_name] = "failed"
+            sweep_state["updated_utc"] = datetime.now(timezone.utc).isoformat()
+            sweep_state["last_error_by_variant"][variant_name] = {
+                "error": str(exc),
+                "traceback": traceback.format_exc(),
+                "failed_utc": datetime.now(timezone.utc).isoformat(),
+            }
+            write_json(state_path, sweep_state)
+            log(f"variant failed: {variant_name} error={exc}")
+            if not args.continue_on_error:
+                raise
+            continue
+
         elapsed_s = round(time.time() - t0, 3)
         row = flatten_summary_row(variant_name=variant_name, summary=summary)
         row["elapsed_seconds"] = elapsed_s
-        rows.append(row)
-        manifest["results"].append({"variant": variant_name, "elapsed_seconds": elapsed_s, "summary": summary})
-        (sweep_dir / "sweep_manifest.json").write_text(json.dumps(manifest, indent=2))
+        rows_by_variant[variant_name] = dict(row)
+        results_by_variant[variant_name] = {
+            "row": row,
+            "summary": summary,
+            "elapsed_seconds": elapsed_s,
+            "completed_utc": datetime.now(timezone.utc).isoformat(),
+        }
+        manifest["updated_utc"] = datetime.now(timezone.utc).isoformat()
+        manifest["results_by_variant"] = results_by_variant
+        manifest["results"] = [results_by_variant[name] for name in selected_names if name in results_by_variant]
+        write_json(manifest_path, manifest)
+
+        sweep_state["status_by_variant"][variant_name] = "completed"
+        sweep_state["last_error_by_variant"].pop(variant_name, None)
+        sweep_state["updated_utc"] = datetime.now(timezone.utc).isoformat()
+        write_json(state_path, sweep_state)
+        log(f"variant completed: {variant_name}")
         print("variant result:", json.dumps(row, indent=2), flush=True)
 
-    csv_path = sweep_dir / "sweep_results.csv"
-    if rows:
-        with csv_path.open("w", newline="") as handle:
-            writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
-            writer.writeheader()
-            writer.writerows(rows)
-    (sweep_dir / "sweep_results.json").write_text(json.dumps(rows, indent=2))
-    print("\nwrote:", sweep_dir / "sweep_manifest.json")
-    print("wrote:", sweep_dir / "sweep_results.json")
-    print("wrote:", csv_path)
+        ordered_rows = [rows_by_variant[name] for name in selected_names if name in rows_by_variant]
+        write_results_csv(csv_path, ordered_rows)
+        write_text_atomic(results_json_path, json.dumps(ordered_rows, indent=2))
+
+    ordered_rows = [rows_by_variant[name] for name in selected_names if name in rows_by_variant]
+    write_results_csv(csv_path, ordered_rows)
+    write_text_atomic(results_json_path, json.dumps(ordered_rows, indent=2))
+    log(f"wrote: {manifest_path}")
+    log(f"wrote: {results_json_path}")
+    log(f"wrote: {csv_path}")
+    log(f"wrote: {state_path}")
+    log(f"wrote: {sweep_log_path}")
 
 
 if __name__ == "__main__":

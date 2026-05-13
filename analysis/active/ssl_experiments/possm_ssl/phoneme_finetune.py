@@ -584,6 +584,7 @@ def _session_adapter_keys_for_rows(
 def _checkpoint_payload(
     *,
     model: POSSMPhonemeModel,
+    optimizer: torch.optim.Optimizer | None,
     resolved_config: POSSMFinetuneConfig,
     resolved_checkpoint_path: Path,
     checkpoint_cfg: dict[str, Any],
@@ -591,8 +592,9 @@ def _checkpoint_payload(
     steps: int,
     metrics: dict[str, Any],
     checkpoint_kind: str,
+    elapsed_seconds: float,
 ) -> dict[str, Any]:
-    return {
+    payload: dict[str, Any] = {
         "model_family": "possm",
         "stage": "stage2_phoneme_finetune",
         "stage1_checkpoint_path": str(resolved_checkpoint_path),
@@ -609,9 +611,55 @@ def _checkpoint_payload(
         "model_state": model.state_dict(),
         "vocab": problem["vocab"],
         "steps": int(steps),
+        "elapsed_seconds": float(elapsed_seconds),
         "metrics": dict(metrics),
         "checkpoint_kind": str(checkpoint_kind),
     }
+    if optimizer is not None:
+        payload["optimizer_state"] = optimizer.state_dict()
+    return payload
+
+
+def _find_latest_step_checkpoint(checkpoints_dir: Path) -> Path | None:
+    if not checkpoints_dir.exists():
+        return None
+    latest_step = -1
+    latest_path: Path | None = None
+    for path in checkpoints_dir.glob("step_*.pt"):
+        stem = path.stem
+        try:
+            step = int(stem.split("_", 1)[1])
+        except (IndexError, ValueError):
+            continue
+        if step > latest_step:
+            latest_step = step
+            latest_path = path
+    return latest_path
+
+
+def _validate_stage2_resume_payload(
+    payload: dict[str, Any],
+    *,
+    resolved_config: POSSMFinetuneConfig,
+    resolved_checkpoint_path: Path,
+) -> None:
+    if str(payload.get("stage", "")) != "stage2_phoneme_finetune":
+        raise ValueError("Resume checkpoint is not a POSSM stage-2 phoneme fine-tuning checkpoint.")
+    payload_stage1 = str(payload.get("stage1_checkpoint_path", ""))
+    if payload_stage1 and payload_stage1 != str(resolved_checkpoint_path):
+        raise ValueError(
+            "Resume checkpoint stage-1 path does not match requested stage-1 checkpoint. "
+            f"resume={payload_stage1} requested={resolved_checkpoint_path}"
+        )
+    payload_config = payload.get("config")
+    if not isinstance(payload_config, dict):
+        raise TypeError("Resume checkpoint is missing a valid stage-2 config payload.")
+    expected_config = asdict(resolved_config)
+    if payload_config != expected_config:
+        raise ValueError(
+            "Resume checkpoint config does not match the requested stage-2 config. "
+            "Use a new run directory or the exact same sweep settings to resume."
+        )
 
 
 def _timestamp_utc() -> str:
@@ -625,6 +673,8 @@ def run_possm_phoneme_finetuning(
     output_root: str | Path | None = None,
     config: POSSMFinetuneConfig | None = None,
     device: torch.device | None = None,
+    run_name: str | None = None,
+    resume_from_latest: bool = False,
 ) -> dict[str, Any]:
     resolved_config = config or POSSMFinetuneConfig()
     _seed_all(int(resolved_config.seed))
@@ -796,8 +846,12 @@ def run_possm_phoneme_finetuning(
         base_output_root = Path(output_root)
     base_output_root.mkdir(parents=True, exist_ok=True)
 
-    run_name = f"possm_stage2_{effective_config.mode}_{effective_feature_mode}_{_timestamp_utc()}"
-    run_dir = base_output_root / run_name
+    resolved_run_name = (
+        str(run_name)
+        if run_name is not None
+        else f"possm_stage2_{effective_config.mode}_{effective_feature_mode}_{_timestamp_utc()}"
+    )
+    run_dir = base_output_root / resolved_run_name
     run_dir.mkdir(parents=True, exist_ok=True)
     progress_log_path = run_dir / "progress.jsonl"
     summary_path = run_dir / "summary.json"
@@ -805,6 +859,7 @@ def run_possm_phoneme_finetuning(
     checkpoint_best_path = run_dir / "checkpoint_best.pt"
     checkpoint_final_path = run_dir / "checkpoint_final.pt"
 
+    resume_elapsed_seconds = 0.0
     start_time = time.time()
     last_report_elapsed = 0.0
     steps = 0
@@ -812,6 +867,57 @@ def run_possm_phoneme_finetuning(
     best_metrics: dict[str, Any] | None = None
     best_payload: dict[str, Any] | None = None
     best_step = 0
+    resumed_from_checkpoint: str | None = None
+
+    if resume_from_latest:
+        latest_checkpoint_path = _find_latest_step_checkpoint(checkpoints_dir)
+        if latest_checkpoint_path is not None:
+            payload = torch.load(latest_checkpoint_path, map_location="cpu")
+            _validate_stage2_resume_payload(
+                payload,
+                resolved_config=effective_config,
+                resolved_checkpoint_path=resolved_checkpoint_path,
+            )
+            model_state = payload.get("model_state")
+            if not isinstance(model_state, dict):
+                raise TypeError(f"Resume checkpoint missing valid model_state: {latest_checkpoint_path}")
+            model.load_state_dict(model_state)
+            optimizer_state = payload.get("optimizer_state")
+            if isinstance(optimizer_state, dict):
+                optimizer.load_state_dict(optimizer_state)
+            steps = int(payload.get("steps", 0))
+            last_eval_step = int(steps)
+            resume_elapsed_seconds = float(payload.get("elapsed_seconds", 0.0) or 0.0)
+            resumed_from_checkpoint = str(latest_checkpoint_path)
+            checkpoint_metrics = payload.get("metrics")
+            if isinstance(checkpoint_metrics, dict) and checkpoint_metrics.get("val_ctc_bpphone") is not None:
+                best_metrics = dict(checkpoint_metrics)
+                best_payload = payload
+                best_step = int(steps)
+            if checkpoint_best_path.exists():
+                best_payload_disk = torch.load(checkpoint_best_path, map_location="cpu")
+                _validate_stage2_resume_payload(
+                    best_payload_disk,
+                    resolved_config=effective_config,
+                    resolved_checkpoint_path=resolved_checkpoint_path,
+                )
+                disk_metrics = best_payload_disk.get("metrics")
+                if isinstance(disk_metrics, dict) and disk_metrics.get("val_ctc_bpphone") is not None:
+                    best_payload = best_payload_disk
+                    best_metrics = dict(disk_metrics)
+                    best_step = int(best_payload_disk.get("steps", best_step))
+            _emit_progress(
+                progress_log_path,
+                event="phoneme_resume",
+                stage="possm_phoneme_finetune",
+                step=int(steps),
+                elapsed_seconds=round(resume_elapsed_seconds, 3),
+                resumed_from_checkpoint=resumed_from_checkpoint,
+                mode=str(effective_config.mode),
+                data_mode=effective_data_mode,
+                feature_mode=effective_feature_mode,
+            )
+            start_time = time.time() - resume_elapsed_seconds
 
     def maybe_evaluate_and_checkpoint(*, force: bool = False) -> dict[str, Any] | None:
         nonlocal last_eval_step, best_metrics, best_payload, best_step
@@ -843,6 +949,7 @@ def run_possm_phoneme_finetuning(
         )
         payload = _checkpoint_payload(
             model=model,
+            optimizer=optimizer,
             resolved_config=effective_config,
             resolved_checkpoint_path=resolved_checkpoint_path,
             checkpoint_cfg=checkpoint_cfg,
@@ -850,6 +957,7 @@ def run_possm_phoneme_finetuning(
             steps=steps,
             metrics=metrics,
             checkpoint_kind="step" if not force else "final_eval",
+            elapsed_seconds=round(time.time() - start_time, 3),
         )
         if checkpoints_dir is not None and steps % int(effective_config.checkpoint_every_steps) == 0:
             checkpoints_dir.mkdir(parents=True, exist_ok=True)
@@ -858,6 +966,7 @@ def run_possm_phoneme_finetuning(
             best_metrics = dict(metrics)
             best_payload = payload
             best_step = int(steps)
+            torch.save(best_payload, checkpoint_best_path)
         return metrics
 
     while True:
@@ -942,6 +1051,7 @@ def run_possm_phoneme_finetuning(
     torch.save(
         _checkpoint_payload(
             model=model,
+            optimizer=optimizer,
             resolved_config=effective_config,
             resolved_checkpoint_path=resolved_checkpoint_path,
             checkpoint_cfg=checkpoint_cfg,
@@ -949,17 +1059,19 @@ def run_possm_phoneme_finetuning(
             steps=steps,
             metrics=final_metrics,
             checkpoint_kind="final",
+            elapsed_seconds=round(time.time() - start_time, 3),
         ),
         checkpoint_final_path,
     )
 
     summary = {
-        "run_name": run_name,
+        "run_name": resolved_run_name,
         "run_dir": str(run_dir),
         "progress_log_path": str(progress_log_path),
         "checkpoint_best_path": str(checkpoint_best_path),
         "checkpoint_final_path": str(checkpoint_final_path),
         "checkpoints_dir": str(checkpoints_dir),
+        "resumed_from_checkpoint": resumed_from_checkpoint,
         "stage1_checkpoint_path": str(resolved_checkpoint_path),
         "stage1_run_dir": str(stage1_run_dir),
         "mode": str(effective_config.mode),
