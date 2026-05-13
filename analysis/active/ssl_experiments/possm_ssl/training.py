@@ -646,7 +646,15 @@ def _train_loop(
         else float("inf")
     )
     best_step = int(run_state["best_step"]) if run_state.get("best_step") is not None else None
-    best_state = None
+    recovered_best_state = run_state.get("best_state")
+    best_state = (
+        {
+            key: value.detach().cpu().clone()
+            for key, value in recovered_best_state.items()
+        }
+        if isinstance(recovered_best_state, dict)
+        else None
+    )
     start_step = int(run_state.get("checkpoint_step", 0) or 0)
 
     log_every = int(config_payload["log_every"])
@@ -788,6 +796,7 @@ def run_possm_training(
     config: POSSMTrainingConfig,
     output_root: Path,
     device: torch.device,
+    run_name: str | None = None,
 ) -> dict[str, Any]:
     _seed_training_run(int(config.seed))
     if str(config.feature_mode) != str(cache_context.feature_mode):
@@ -852,8 +861,12 @@ def run_possm_training(
 
     config_payload = _serialize_config(config, cache_context=cache_context)
     objective = build_stage1_objective(config=config_payload, seed=int(config.seed))
-    run_name = f"possm_stage1_{config.feature_mode}_{config.data_mode}_{_timestamp_utc()}"
-    run_dir = Path(output_root) / run_name
+    resolved_run_name = (
+        str(run_name)
+        if run_name is not None
+        else f"possm_stage1_{config.feature_mode}_{config.data_mode}_{_timestamp_utc()}"
+    )
+    run_dir = Path(output_root) / resolved_run_name
     run_dir.mkdir(parents=True, exist_ok=True)
     progress_path = run_dir / "progress.jsonl"
     checkpoint_path = run_dir / "checkpoint_final.pt"
@@ -866,7 +879,7 @@ def run_possm_training(
         objective=objective,
         train_sampler=train_sampler,
         val_sampler=val_sampler,
-        run_name=run_name,
+        run_name=resolved_run_name,
         run_dir=run_dir,
         progress_path=progress_path,
         checkpoint_path=checkpoint_path,
@@ -965,6 +978,30 @@ def recover_possm_run_state_from_checkpoint(
 
     run_dir = resolved_checkpoint_path.parent.parent if resolved_checkpoint_path.parent.name == "checkpoints" else resolved_checkpoint_path.parent
     progress_path = run_dir / "progress.jsonl"
+    best_checkpoint_path = run_dir / "checkpoint_best.pt"
+    best_state = None
+    recovered_best_score = payload.get("best_score")
+    recovered_best_step = payload.get("best_step")
+    if best_checkpoint_path.exists():
+        best_payload = torch.load(best_checkpoint_path, map_location="cpu")
+        best_config = best_payload.get("config")
+        if best_config != recovered_config:
+            raise ValueError(
+                "Recovered best checkpoint config does not match the resume checkpoint config. "
+                f"best_checkpoint={best_checkpoint_path} resume_checkpoint={resolved_checkpoint_path}"
+            )
+        best_model_state = best_payload.get("model_state")
+        if not isinstance(best_model_state, dict):
+            raise TypeError(f"Recovered best checkpoint missing valid model_state: {best_checkpoint_path}")
+        best_state = best_model_state
+        recovered_best_score = best_payload.get("best_score")
+        recovered_best_step = best_payload.get("step", best_payload.get("best_step"))
+    else:
+        # A step checkpoint can remember the best score without containing the
+        # corresponding weights. Drop that stale best metadata rather than
+        # later writing a best checkpoint with mismatched score/model state.
+        recovered_best_score = None
+        recovered_best_step = None
     checkpoint_step = int(payload.get("step", 0))
     train_history = list(payload.get("train_history", []))
     val_history = list(payload.get("val_history", []))
@@ -990,12 +1027,13 @@ def recover_possm_run_state_from_checkpoint(
         "run_name": run_dir.name,
         "run_dir": run_dir,
         "progress_path": progress_path,
-        "checkpoint_path": resolved_checkpoint_path,
-        "best_checkpoint_path": run_dir / "checkpoint_best.pt",
+        "checkpoint_path": run_dir / "checkpoint_final.pt",
+        "best_checkpoint_path": best_checkpoint_path,
         "checkpoints_dir": run_dir / "checkpoints",
         "config": recovered_config,
-        "best_score": payload.get("best_score"),
-        "best_step": payload.get("best_step"),
+        "best_score": recovered_best_score,
+        "best_step": recovered_best_step,
+        "best_state": best_state,
         "train_history": train_history,
         "val_history": val_history,
         "dataset_counts": dict(payload.get("dataset_counts", {})),
@@ -1013,8 +1051,8 @@ def resume_possm_training(
 ) -> dict[str, Any]:
     del cache_context
     additional_steps = int(additional_steps)
-    if additional_steps <= 0:
-        raise ValueError("additional_steps must be positive")
+    if additional_steps < 0:
+        raise ValueError("additional_steps must be non-negative")
     start_step = int(run_state.get("checkpoint_step", 0) or 0)
     target_step = start_step + additional_steps
     run_state["config"] = {**dict(run_state["config"]), "num_steps": int(target_step)}
