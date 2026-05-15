@@ -12,7 +12,7 @@ Hyperparameters are intentionally summarized at a high level because the noteboo
 - boundary key mode: session-level
 - stage 1: POSSM-style neural reconstruction pretraining
 - stage 2: POSSM encoder plus GRU plus post-GRU strided-conv phoneme decoder trained with CTC
-- evaluation: held-out `brain2text24` validation sessions
+- evaluation: Willett-style `competition_train -> competition_test` within-session block split
 
 The earlier flat / suspicious stage-1 reconstruction loss behavior was traced to a data smoothing / stats mismatch. After fixing that, the reconstruction loss curve looked more normal.
 

@@ -199,11 +199,11 @@ def _write_tiny_canonical_probe_cache(cache_root: Path) -> None:
 
     manifest_rows = [
         {
-            "example_id": "src-train-0",
+            "example_id": "train-0",
             "session_id": "t00.2025.01.01",
             "subject_id": "t00",
             "session_date": "2025.01.01",
-            "source_split": "train",
+            "source_split": "competition_train",
             "has_labels": True,
             "shard_relpath": "brain2text24/toy_shard",
             "example_index": 0,
@@ -215,11 +215,11 @@ def _write_tiny_canonical_probe_cache(cache_root: Path) -> None:
             "has_sbp": True,
         },
         {
-            "example_id": "src-train-1",
+            "example_id": "train-1",
             "session_id": "t00.2025.01.01",
             "subject_id": "t00",
             "session_date": "2025.01.01",
-            "source_split": "train",
+            "source_split": "competition_train",
             "has_labels": True,
             "shard_relpath": "brain2text24/toy_shard",
             "example_index": 1,
@@ -231,11 +231,11 @@ def _write_tiny_canonical_probe_cache(cache_root: Path) -> None:
             "has_sbp": True,
         },
         {
-            "example_id": "target-train-0",
-            "session_id": "t00.2025.01.02",
+            "example_id": "test-0",
+            "session_id": "t00.2025.01.01",
             "subject_id": "t00",
-            "session_date": "2025.01.02",
-            "source_split": "train",
+            "session_date": "2025.01.01",
+            "source_split": "competition_test",
             "has_labels": True,
             "shard_relpath": "brain2text24/toy_shard",
             "example_index": 2,
@@ -247,11 +247,11 @@ def _write_tiny_canonical_probe_cache(cache_root: Path) -> None:
             "has_sbp": True,
         },
         {
-            "example_id": "target-val-0",
-            "session_id": "t00.2025.01.02",
+            "example_id": "holdout-0",
+            "session_id": "t00.2025.01.01",
             "subject_id": "t00",
-            "session_date": "2025.01.02",
-            "source_split": "val",
+            "session_date": "2025.01.01",
+            "source_split": "competition_holdout",
             "has_labels": True,
             "shard_relpath": "brain2text24/toy_shard",
             "example_index": 3,
@@ -1027,8 +1027,6 @@ class POSSMSSLTests(unittest.TestCase):
                     dataset="brain2text24",
                     feature_mode="tx_sbp",
                     data_mode="normalized",
-                    session_limit=2,
-                    target_session_count=1,
                     batch_size=1,
                     num_steps=2,
                     learning_rate=1e-3,
@@ -1047,6 +1045,13 @@ class POSSMSSLTests(unittest.TestCase):
             )
             self.assertEqual(summary["dataset"], "brain2text24")
             self.assertEqual(summary["feature_mode"], "tx_sbp")
+            self.assertEqual(summary["split_policy"], "competition_train_test")
+            self.assertEqual(summary["train_split_name"], "competition_train")
+            self.assertEqual(summary["val_split_name"], "competition_test")
+            self.assertEqual(summary["train_session_ids"], ["t00.2025.01.01"])
+            self.assertEqual(summary["val_session_ids"], ["t00.2025.01.01"])
+            self.assertEqual(int(summary["train_examples"]), 2)
+            self.assertEqual(int(summary["val_examples"]), 1)
             self.assertTrue(Path(summary["checkpoint_final_path"]).exists())
             self.assertTrue((Path(summary["checkpoints_dir"]) / "step_000001.pt").exists())
             self.assertIn("val_ctc_bpphone", summary["metrics"])
@@ -1061,6 +1066,11 @@ class POSSMSSLTests(unittest.TestCase):
             self.assertAlmostEqual(float(payload["config"]["white_noise_sd"]), 1.0)
             self.assertAlmostEqual(float(payload["config"]["constant_offset_sd"]), 0.2)
             self.assertEqual(str(payload["cache_root"]), str(tmp_path))
+            self.assertEqual(str(payload["split_policy"]), "competition_train_test")
+            self.assertEqual(str(payload["train_split_name"]), "competition_train")
+            self.assertEqual(str(payload["val_split_name"]), "competition_test")
+            self.assertEqual(int(payload["train_examples"]), 2)
+            self.assertEqual(int(payload["val_examples"]), 1)
             self.assertTrue(bool(payload["config"]["session_adapter_enabled"]))
             self.assertTrue(bool(payload["session_adapter_keys"]))
             self.assertTrue(

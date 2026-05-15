@@ -2,7 +2,8 @@
 
 This Colab-oriented script trains a small Stage-1 architecture/objective sweep,
 then evaluates each resulting encoder with Stage-2 phoneme decoding in
-``probe_frozen`` mode. It is designed to be safe to rerun after disconnects.
+``probe_frozen`` mode on the released Willett ``competition_train ->
+competition_test`` split. It is designed to be safe to rerun after disconnects.
 """
 
 from __future__ import annotations
@@ -86,8 +87,6 @@ def make_stage2_config(args: argparse.Namespace) -> POSSMFinetuneConfig:
         feature_mode=str(args.feature_mode),
         data_mode=str(args.stage2_data_mode),
         boundary_key_mode=str(args.boundary_key_mode),
-        session_limit=int(args.session_limit),
-        target_session_count=int(args.target_session_count),
         batch_size=int(args.stage2_batch_size),
         num_steps=int(args.stage2_steps),
         learning_rate=float(args.stage2_learning_rate),
@@ -395,8 +394,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stage1-log-every", type=int, default=20)
 
     parser.add_argument("--stage2-data-mode", choices=("raw", "normalized"), default="normalized")
-    parser.add_argument("--session-limit", type=int, default=28)
-    parser.add_argument("--target-session-count", type=int, default=4)
     parser.add_argument("--stage2-batch-size", type=int, default=32)
     parser.add_argument("--stage2-learning-rate", type=float, default=2e-4)
     parser.add_argument("--stage2-encoder-learning-rate", type=float, default=3e-5)

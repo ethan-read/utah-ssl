@@ -481,6 +481,91 @@ def _partition_probe_records(
     )
 
 
+def _group_rows_by_session(
+    rows: Sequence[CanonicalProbeManifestRow],
+) -> tuple[tuple[CanonicalProbeManifestRow, ...], dict[str, int], tuple[str, ...]]:
+    grouped: dict[str, list[CanonicalProbeManifestRow]] = {}
+    for row in rows:
+        grouped.setdefault(str(row.session_id), []).append(row)
+    session_ids = tuple(sorted(grouped))
+    flattened = tuple(row for session_id in session_ids for row in grouped[session_id])
+    counts = {session_id: len(grouped[session_id]) for session_id in session_ids}
+    return flattened, counts, session_ids
+
+
+def build_competition_split_problem(
+    *,
+    cache_root: Path,
+    dataset: str = "brain2text24",
+    feature_mode: str = "tx_only",
+    boundary_key_mode: str = "session",
+) -> dict[str, Any]:
+    canonical_root, manifest_path, metadata_path = _validate_canonical_probe_assets(
+        cache_root,
+        dataset=str(dataset),
+    )
+    manifest_rows = _load_canonical_probe_manifest(manifest_path)
+    metadata = _load_probe_metadata_json(metadata_path)
+
+    if feature_mode not in {"tx_only", "tx_sbp"}:
+        raise ValueError("feature_mode must be one of {'tx_only', 'tx_sbp'}")
+
+    def _row_matches_feature_mode(row: CanonicalProbeManifestRow) -> bool:
+        if feature_mode == "tx_only":
+            return int(row.n_tx_features) > 0
+        return int(row.n_tx_features) > 0 and int(row.n_sbp_features) > 0
+
+    split_counts: Counter[str] = Counter()
+    train_candidates: list[CanonicalProbeManifestRow] = []
+    val_candidates: list[CanonicalProbeManifestRow] = []
+    for row in manifest_rows:
+        split_name = str(row.source_split).strip().lower()
+        if bool(row.has_labels):
+            split_counts[split_name] += 1
+        if not bool(row.has_labels) or not _row_matches_feature_mode(row):
+            continue
+        if split_name == "competition_train":
+            train_candidates.append(row)
+        elif split_name == "competition_test":
+            val_candidates.append(row)
+
+    if not train_candidates:
+        raise ValueError(
+            "No labeled competition_train rows were found for the competition-style stage-2 split. "
+            f"Observed labeled split counts: {dict(split_counts)}"
+        )
+    if not val_candidates:
+        raise ValueError(
+            "No labeled competition_test rows were found for the competition-style stage-2 split. "
+            f"Observed labeled split counts: {dict(split_counts)}"
+        )
+
+    train_rows, train_examples_by_session, train_session_ids = _group_rows_by_session(train_candidates)
+    val_rows, val_examples_by_session, val_session_ids = _group_rows_by_session(val_candidates)
+
+    return {
+        "canonical_root": canonical_root,
+        "manifest_path": manifest_path,
+        "metadata_path": metadata_path,
+        "manifest_rows": manifest_rows,
+        "metadata": metadata,
+        "vocab": _resolve_phoneme_vocabulary(metadata),
+        "cache_root": Path(cache_root),
+        "dataset": str(dataset),
+        "feature_mode": str(feature_mode),
+        "boundary_key_mode": str(boundary_key_mode),
+        "split_policy": "competition_train_test",
+        "train_split_name": "competition_train",
+        "val_split_name": "competition_test",
+        "train_rows": train_rows,
+        "val_rows": val_rows,
+        "train_examples_by_session": train_examples_by_session,
+        "val_examples_by_session": val_examples_by_session,
+        "train_session_ids": train_session_ids,
+        "val_session_ids": val_session_ids,
+    }
+
+
 def compute_feature_stats(
     rows: tuple[CanonicalProbeManifestRow, ...] | list[CanonicalProbeManifestRow],
     *,

@@ -18,9 +18,8 @@ from torch.utils.data import DataLoader
 from masked_ssl.cache import load_cache_smoothing_provenance, resolve_boundary_key
 from masked_ssl.probe import (
     CanonicalSequenceDataset,
-    DownstreamProbeConfig,
     _make_loader_generator,
-    build_downstream_probe_problem,
+    build_competition_split_problem,
     collate_sequence_batch,
     compute_ctc_loss_sum,
     compute_feature_stats,
@@ -37,8 +36,6 @@ class POSSMFinetuneConfig:
     feature_mode: str | None = None
     data_mode: str | None = None
     boundary_key_mode: str | None = None
-    session_limit: int = 28
-    target_session_count: int = 4
     batch_size: int = 8
     num_steps: int = 5000
     learning_rate: float = 1e-3
@@ -97,10 +94,6 @@ class POSSMFinetuneConfig:
             raise ValueError(
                 "boundary_key_mode must be one of {'session', 'subject_if_available'} when provided"
             )
-        if int(self.session_limit) <= 0 or int(self.target_session_count) <= 0:
-            raise ValueError("session counts must be positive")
-        if int(self.target_session_count) >= int(self.session_limit):
-            raise ValueError("target_session_count must be smaller than session_limit")
         if int(self.batch_size) <= 0 or int(self.num_steps) <= 0:
             raise ValueError("batch_size and num_steps must be positive")
         if float(self.learning_rate) <= 0.0 or float(self.encoder_learning_rate) <= 0.0:
@@ -539,26 +532,11 @@ def _build_problem(
     feature_mode: str,
     boundary_key_mode: str,
 ) -> dict[str, Any]:
-    probe_config = DownstreamProbeConfig(
-        enabled=True,
-        seed=int(config.seed),
-        session_limit=int(config.session_limit),
-        target_session_count=int(config.target_session_count),
-        probe_batch_size=int(config.batch_size),
-        # This helper only needs the split-selection fields from DownstreamProbeConfig.
-        probe_budget_seconds=10**9,
-        max_probe_steps=int(config.num_steps),
-        probe_head_learning_rate=float(config.learning_rate),
-        encoder_learning_rate=float(config.encoder_learning_rate),
-        weight_decay=float(config.weight_decay),
-        probe_head_type="linear",
-    )
-    return build_downstream_probe_problem(
+    return build_competition_split_problem(
         cache_root=cache_root,
-        probe_config=probe_config,
+        dataset=str(config.dataset),
         feature_mode=str(feature_mode),
         boundary_key_mode=str(boundary_key_mode),
-        dataset=str(config.dataset),
     )
 
 
@@ -589,6 +567,9 @@ def _checkpoint_payload(
     resolved_checkpoint_path: Path,
     checkpoint_cfg: dict[str, Any],
     problem: dict[str, Any],
+    train_rows: tuple[Any, ...] | list[Any],
+    val_rows: tuple[Any, ...] | list[Any],
+    session_adapter_keys: tuple[str, ...],
     steps: int,
     metrics: dict[str, Any],
     checkpoint_kind: str,
@@ -605,8 +586,23 @@ def _checkpoint_payload(
         "dataset": str(problem["dataset"]),
         "cache_root": str(problem["cache_root"]),
         "cache_smoothing_provenance": problem.get("cache_smoothing_provenance"),
+        "split_policy": str(problem.get("split_policy", "competition_train_test")),
+        "train_split_name": str(problem.get("train_split_name", "competition_train")),
+        "val_split_name": str(problem.get("val_split_name", "competition_test")),
+        "train_examples": int(len(train_rows)),
+        "val_examples": int(len(val_rows)),
+        "train_examples_by_session": {
+            str(session_id): int(count)
+            for session_id, count in dict(problem.get("train_examples_by_session", {})).items()
+        },
+        "val_examples_by_session": {
+            str(session_id): int(count)
+            for session_id, count in dict(problem.get("val_examples_by_session", {})).items()
+        },
+        "train_session_ids": [str(session_id) for session_id in tuple(problem.get("train_session_ids", ()))],
+        "val_session_ids": [str(session_id) for session_id in tuple(problem.get("val_session_ids", ()))],
         "session_adapter_enabled": bool(model.session_adapter_enabled),
-        "session_adapter_keys": list(model.session_input_adapter.session_keys),
+        "session_adapter_keys": list(session_adapter_keys),
         "encoder_state": model.base_encoder.state_dict(),
         "model_state": model.state_dict(),
         "vocab": problem["vocab"],
@@ -733,11 +729,10 @@ def run_possm_phoneme_finetuning(
     problem["cache_smoothing_provenance"] = cache_smoothing_provenance
 
     if effective_data_mode == "normalized":
-        target_stats_mode = "global" if len(problem["target_session_ids"]) == 1 else "per_session"
         target_stats = compute_feature_stats(
-            problem["target_train_rows"],
+            problem["train_rows"],
             cache_root=Path(problem["cache_root"]),
-            mode=target_stats_mode,
+            mode="global",
             feature_mode=str(problem["feature_mode"]),
         )
     else:
@@ -745,7 +740,7 @@ def run_possm_phoneme_finetuning(
 
     train_loader = DataLoader(
         CanonicalSequenceDataset(
-            problem["target_train_rows"],
+            problem["train_rows"],
             cache_root=Path(problem["cache_root"]),
             stats=target_stats,
             feature_mode=str(problem["feature_mode"]),
@@ -757,7 +752,7 @@ def run_possm_phoneme_finetuning(
     )
     val_loader = DataLoader(
         CanonicalSequenceDataset(
-            problem["target_val_rows"],
+            problem["val_rows"],
             cache_root=Path(problem["cache_root"]),
             stats=target_stats,
             feature_mode=str(problem["feature_mode"]),
@@ -770,7 +765,7 @@ def run_possm_phoneme_finetuning(
 
     vocab = dict(problem["vocab"])
     session_adapter_keys = _session_adapter_keys_for_rows(
-        [*problem["target_train_rows"], *problem["target_val_rows"]],
+        [*problem["train_rows"], *problem["val_rows"]],
         dataset=str(problem.get("dataset", effective_config.dataset)),
         boundary_key_mode=str(problem.get("boundary_key_mode", effective_boundary_key_mode)),
     )
@@ -954,6 +949,9 @@ def run_possm_phoneme_finetuning(
             resolved_checkpoint_path=resolved_checkpoint_path,
             checkpoint_cfg=checkpoint_cfg,
             problem=problem,
+            train_rows=problem["train_rows"],
+            val_rows=problem["val_rows"],
+            session_adapter_keys=session_adapter_keys,
             steps=steps,
             metrics=metrics,
             checkpoint_kind="step" if not force else "final_eval",
@@ -1056,6 +1054,9 @@ def run_possm_phoneme_finetuning(
             resolved_checkpoint_path=resolved_checkpoint_path,
             checkpoint_cfg=checkpoint_cfg,
             problem=problem,
+            train_rows=problem["train_rows"],
+            val_rows=problem["val_rows"],
+            session_adapter_keys=session_adapter_keys,
             steps=steps,
             metrics=final_metrics,
             checkpoint_kind="final",
@@ -1081,8 +1082,23 @@ def run_possm_phoneme_finetuning(
         "dataset": str(effective_config.dataset),
         "cache_root": str(problem["cache_root"]),
         "cache_smoothing_provenance": problem.get("cache_smoothing_provenance"),
+        "split_policy": str(problem.get("split_policy", "competition_train_test")),
         "session_adapter_enabled": bool(effective_config.session_adapter_enabled),
         "session_adapter_keys": list(session_adapter_keys),
+        "train_split_name": str(problem.get("train_split_name", "competition_train")),
+        "val_split_name": str(problem.get("val_split_name", "competition_test")),
+        "train_session_ids": [str(session_id) for session_id in tuple(problem.get("train_session_ids", ()))],
+        "val_session_ids": [str(session_id) for session_id in tuple(problem.get("val_session_ids", ()))],
+        "train_examples": int(len(problem["train_rows"])),
+        "val_examples": int(len(problem["val_rows"])),
+        "train_examples_by_session": {
+            str(session_id): int(count)
+            for session_id, count in dict(problem.get("train_examples_by_session", {})).items()
+        },
+        "val_examples_by_session": {
+            str(session_id): int(count)
+            for session_id, count in dict(problem.get("val_examples_by_session", {})).items()
+        },
         "steps": int(steps),
         "metrics": {
             "val_ctc_bpphone": float(final_metrics["val_ctc_bpphone"]),

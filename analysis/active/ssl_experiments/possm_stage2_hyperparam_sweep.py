@@ -2,7 +2,8 @@
 
 This script is intended to be launched from Colab after the repository is
 available on the Python path. It keeps the current best Stage-2 recipe fixed
-except for targeted regularization / learning-rate variants.
+except for targeted regularization / learning-rate variants while using the
+released Willett ``competition_train -> competition_test`` split.
 """
 
 from __future__ import annotations
@@ -40,8 +41,6 @@ def base_config(args: argparse.Namespace) -> POSSMFinetuneConfig:
         feature_mode=str(args.feature_mode),
         data_mode=str(args.data_mode),
         boundary_key_mode=str(args.boundary_key_mode),
-        session_limit=int(args.session_limit),
-        target_session_count=int(args.target_session_count),
         batch_size=int(args.batch_size),
         num_steps=int(args.num_steps),
         learning_rate=float(args.learning_rate),
@@ -259,8 +258,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--feature-mode", choices=("tx_only", "tx_sbp"), default="tx_only")
     parser.add_argument("--data-mode", choices=("raw", "normalized"), default="normalized")
     parser.add_argument("--boundary-key-mode", choices=("session", "subject_if_available"), default="session")
-    parser.add_argument("--session-limit", type=int, default=28)
-    parser.add_argument("--target-session-count", type=int, default=4)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--num-steps", type=int, default=3000)
     parser.add_argument("--learning-rate", type=float, default=2e-4)

@@ -45,6 +45,7 @@ from masked_ssl.probe import (
     CanonicalSequenceDataset,
     DownstreamProbeConfig,
     NotebookProbeEncoderAdapter,
+    build_competition_split_problem,
     recover_downstream_probe_state,
 )
 from masked_ssl.sweeps import resolve_cache_candidates_for_sigma
@@ -264,6 +265,192 @@ def _write_tiny_canonical_probe_cache(cache_root: Path) -> None:
             "num_classes": 3,
             "blank_index": 0,
             "index_to_symbol": ["<blk>", "AA", "BB"],
+        },
+    }
+    (dataset_root / "metadata.json").write_text(json.dumps(metadata))
+
+
+def _write_tiny_competition_probe_cache(cache_root: Path) -> None:
+    dataset_root = cache_root / "brain2text24"
+    shard_dir = dataset_root / "toy_shard"
+    shard_dir.mkdir(parents=True, exist_ok=True)
+
+    tx = np.array(
+        [
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [1.0, 0.0, 1.0],
+            [0.0, 1.0, 1.0],
+            [1.0, 2.0, 0.0],
+            [0.0, 2.0, 1.0],
+            [2.0, 0.0, 1.0],
+            [1.0, 1.0, 1.0],
+            [2.0, 1.0, 0.0],
+            [0.0, 2.0, 2.0],
+            [2.0, 2.0, 0.0],
+            [1.0, 0.0, 2.0],
+            [0.0, 1.0, 2.0],
+            [2.0, 1.0, 1.0],
+            [2.0, 2.0, 1.0],
+            [1.0, 2.0, 2.0],
+            [2.0, 1.0, 2.0],
+            [2.0, 2.0, 2.0],
+            [3.0, 0.0, 0.0],
+            [0.0, 3.0, 0.0],
+            [0.0, 0.0, 3.0],
+            [3.0, 3.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    sbp = np.array(
+        [
+            [10.0, 0.0],
+            [10.0, 1.0],
+            [11.0, 0.0],
+            [11.0, 1.0],
+            [12.0, 0.0],
+            [12.0, 1.0],
+            [13.0, 0.0],
+            [13.0, 1.0],
+            [14.0, 0.0],
+            [14.0, 1.0],
+            [15.0, 0.0],
+            [15.0, 1.0],
+            [16.0, 0.0],
+            [16.0, 1.0],
+            [17.0, 0.0],
+            [17.0, 1.0],
+            [18.0, 0.0],
+            [18.0, 1.0],
+            [19.0, 0.0],
+            [19.0, 1.0],
+            [20.0, 0.0],
+            [20.0, 1.0],
+            [21.0, 0.0],
+            [21.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+    np.save(shard_dir / "time_offsets.npy", np.array([0, 4, 8, 12, 16, 20, 24], dtype=np.int64))
+    np.save(shard_dir / "tx.npy", tx)
+    np.save(shard_dir / "sbp.npy", sbp)
+    np.save(shard_dir / "phoneme_offsets.npy", np.array([0, 2, 4, 6, 8, 10, 12], dtype=np.int64))
+    np.save(
+        shard_dir / "phoneme_ids.npy",
+        np.array([1, 2, 2, 1, 1, 1, 2, 2, 1, 2, 2, 1], dtype=np.int64),
+    )
+
+    manifest_rows = [
+        {
+            "example_id": "sess-a-train-0",
+            "session_id": "t12.2022.08.10",
+            "subject_id": "t12",
+            "session_date": "2022.08.10",
+            "source_split": "competition_train",
+            "has_labels": True,
+            "shard_relpath": "brain2text24/toy_shard",
+            "example_index": 0,
+            "n_tx_features": 3,
+            "n_sbp_features": 2,
+            "target_length": 2,
+            "transcript": "AA",
+            "has_tx": True,
+            "has_sbp": True,
+        },
+        {
+            "example_id": "sess-a-train-1",
+            "session_id": "t12.2022.08.10",
+            "subject_id": "t12",
+            "session_date": "2022.08.10",
+            "source_split": "competition_train",
+            "has_labels": True,
+            "shard_relpath": "brain2text24/toy_shard",
+            "example_index": 1,
+            "n_tx_features": 3,
+            "n_sbp_features": 2,
+            "target_length": 2,
+            "transcript": "BB",
+            "has_tx": True,
+            "has_sbp": True,
+        },
+        {
+            "example_id": "sess-a-test-0",
+            "session_id": "t12.2022.08.10",
+            "subject_id": "t12",
+            "session_date": "2022.08.10",
+            "source_split": "competition_test",
+            "has_labels": True,
+            "shard_relpath": "brain2text24/toy_shard",
+            "example_index": 2,
+            "n_tx_features": 3,
+            "n_sbp_features": 2,
+            "target_length": 2,
+            "transcript": "AB",
+            "has_tx": True,
+            "has_sbp": True,
+        },
+        {
+            "example_id": "sess-a-holdout-0",
+            "session_id": "t12.2022.08.10",
+            "subject_id": "t12",
+            "session_date": "2022.08.10",
+            "source_split": "competition_holdout",
+            "has_labels": True,
+            "shard_relpath": "brain2text24/toy_shard",
+            "example_index": 3,
+            "n_tx_features": 3,
+            "n_sbp_features": 2,
+            "target_length": 2,
+            "transcript": "BA",
+            "has_tx": True,
+            "has_sbp": True,
+        },
+        {
+            "example_id": "sess-b-train-0",
+            "session_id": "t12.2022.08.11",
+            "subject_id": "t12",
+            "session_date": "2022.08.11",
+            "source_split": "competition_train",
+            "has_labels": True,
+            "shard_relpath": "brain2text24/toy_shard",
+            "example_index": 4,
+            "n_tx_features": 3,
+            "n_sbp_features": 2,
+            "target_length": 2,
+            "transcript": "AC",
+            "has_tx": True,
+            "has_sbp": True,
+        },
+        {
+            "example_id": "sess-b-test-0",
+            "session_id": "t12.2022.08.11",
+            "subject_id": "t12",
+            "session_date": "2022.08.11",
+            "source_split": "competition_test",
+            "has_labels": True,
+            "shard_relpath": "brain2text24/toy_shard",
+            "example_index": 5,
+            "n_tx_features": 3,
+            "n_sbp_features": 2,
+            "target_length": 2,
+            "transcript": "CA",
+            "has_tx": True,
+            "has_sbp": True,
+        },
+    ]
+    with (dataset_root / "manifest.jsonl").open("w") as handle:
+        for row in manifest_rows:
+            handle.write(json.dumps(row) + "\n")
+
+    metadata = {
+        "n_tx_features": 3,
+        "n_sbp_features": 2,
+        "phoneme_vocabulary": {
+            "num_classes": 4,
+            "blank_index": 0,
+            "index_to_symbol": ["<blk>", "AA", "BB", "CC"],
         },
     }
     (dataset_root / "metadata.json").write_text(json.dumps(metadata))
@@ -1230,6 +1417,63 @@ class MaskedSSLTests(unittest.TestCase):
                 device=torch.device("cpu"),
             )
         self.assertEqual(state["model"].encoder.backbone_direction, "bidirectional")
+
+    def test_build_competition_split_problem_uses_competition_labels(self) -> None:
+        cache_root = Path(self._tmp_dir())
+        _write_tiny_competition_probe_cache(cache_root)
+
+        problem = build_competition_split_problem(
+            cache_root=cache_root,
+            dataset="brain2text24",
+            feature_mode="tx_only",
+            boundary_key_mode="session",
+        )
+
+        self.assertEqual(problem["split_policy"], "competition_train_test")
+        self.assertEqual(problem["train_split_name"], "competition_train")
+        self.assertEqual(problem["val_split_name"], "competition_test")
+        self.assertEqual(problem["train_examples_by_session"], {"t12.2022.08.10": 2, "t12.2022.08.11": 1})
+        self.assertEqual(problem["val_examples_by_session"], {"t12.2022.08.10": 1, "t12.2022.08.11": 1})
+        self.assertEqual(problem["train_session_ids"], ("t12.2022.08.10", "t12.2022.08.11"))
+        self.assertEqual(problem["val_session_ids"], ("t12.2022.08.10", "t12.2022.08.11"))
+        self.assertEqual(len(problem["train_rows"]), 3)
+        self.assertEqual(len(problem["val_rows"]), 2)
+        self.assertTrue(all(row.source_split == "competition_train" for row in problem["train_rows"]))
+        self.assertTrue(all(row.source_split == "competition_test" for row in problem["val_rows"]))
+        self.assertNotIn("competition_holdout", {row.source_split for row in problem["train_rows"]})
+        self.assertNotIn("competition_holdout", {row.source_split for row in problem["val_rows"]})
+
+    def test_build_competition_split_problem_requires_competition_test_rows(self) -> None:
+        cache_root = Path(self._tmp_dir())
+        _write_tiny_competition_probe_cache(cache_root)
+        manifest_path = cache_root / "brain2text24" / "manifest.jsonl"
+        rows = [json.loads(line) for line in manifest_path.read_text().splitlines()]
+        rows = [row for row in rows if row["source_split"] != "competition_test"]
+        manifest_path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+
+        with self.assertRaisesRegex(ValueError, "competition_test"):
+            build_competition_split_problem(
+                cache_root=cache_root,
+                dataset="brain2text24",
+                feature_mode="tx_only",
+                boundary_key_mode="session",
+            )
+
+    def test_build_competition_split_problem_requires_competition_train_rows(self) -> None:
+        cache_root = Path(self._tmp_dir())
+        _write_tiny_competition_probe_cache(cache_root)
+        manifest_path = cache_root / "brain2text24" / "manifest.jsonl"
+        rows = [json.loads(line) for line in manifest_path.read_text().splitlines()]
+        rows = [row for row in rows if row["source_split"] != "competition_train"]
+        manifest_path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+
+        with self.assertRaisesRegex(ValueError, "competition_train"):
+            build_competition_split_problem(
+                cache_root=cache_root,
+                dataset="brain2text24",
+                feature_mode="tx_only",
+                boundary_key_mode="session",
+            )
 
     def test_raw_feature_adapter_starts_as_identity_on_tx_block(self) -> None:
         adapter = RawFeatureAdapter(input_dim=5, output_dim=3)
