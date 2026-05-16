@@ -12,7 +12,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Sequence
+from typing import Any, Iterator, Sequence
 
 import numpy as np
 import torch
@@ -323,6 +323,7 @@ class CanonicalProbeManifestRow:
     n_sbp_features: int
     target_length: int | None
     transcript: str
+    n_time_bins: int | None = None
 
 
 @dataclass(frozen=True)
@@ -435,9 +436,98 @@ def _load_canonical_probe_manifest(manifest_path: Path) -> list[CanonicalProbeMa
                     n_sbp_features=int(payload.get("n_sbp_features", 0) or 0),
                     target_length=int(payload["target_length"]) if payload.get("target_length") is not None else None,
                     transcript=str(payload.get("transcript", payload.get("transcription", ""))),
+                    n_time_bins=int(payload["n_time_bins"]) if payload.get("n_time_bins") is not None else None,
                 )
             )
     return rows
+
+
+def canonical_row_input_length(row: CanonicalProbeManifestRow) -> int:
+    length = getattr(row, "n_time_bins", None)
+    if length is None:
+        raise ValueError(f"Canonical row is missing n_time_bins metadata: {row.example_id}")
+    resolved = int(length)
+    if resolved <= 0:
+        raise ValueError(f"Canonical row has non-positive n_time_bins={resolved}: {row.example_id}")
+    return resolved
+
+
+def canonical_rows_padded_time_percentile(
+    rows: Sequence[CanonicalProbeManifestRow],
+    *,
+    percentile: float,
+) -> int:
+    if not rows:
+        raise ValueError("Cannot compute a padded-time percentile on an empty canonical row set.")
+    if not (0.0 < float(percentile) <= 100.0):
+        raise ValueError("percentile must be in (0, 100].")
+    lengths = np.array([canonical_row_input_length(row) for row in rows], dtype=np.float64)
+    value = np.percentile(lengths, float(percentile), method="linear")
+    return max(1, int(math.ceil(float(value))))
+
+
+class LengthAwareBatchSampler(torch.utils.data.Sampler[list[int]]):
+    def __init__(
+        self,
+        rows: Sequence[CanonicalProbeManifestRow],
+        *,
+        max_examples_per_microbatch: int,
+        max_padded_time_per_microbatch: int,
+        shuffle: bool,
+        seed: int,
+    ) -> None:
+        if int(max_examples_per_microbatch) <= 0:
+            raise ValueError("max_examples_per_microbatch must be positive")
+        if int(max_padded_time_per_microbatch) <= 0:
+            raise ValueError("max_padded_time_per_microbatch must be positive")
+        self.rows = tuple(rows)
+        self.max_examples_per_microbatch = int(max_examples_per_microbatch)
+        self.max_padded_time_per_microbatch = int(max_padded_time_per_microbatch)
+        self.shuffle = bool(shuffle)
+        self.seed = int(seed)
+        self._iteration_count = 0
+
+    def _ordered_indices(self) -> list[int]:
+        indices = list(range(len(self.rows)))
+        if not self.shuffle:
+            return indices
+        generator = torch.Generator()
+        generator.manual_seed(self.seed + self._iteration_count)
+        permutation = torch.randperm(len(indices), generator=generator)
+        return permutation.tolist()
+
+    def _build_batches(self, ordered_indices: Sequence[int]) -> list[list[int]]:
+        batches: list[list[int]] = []
+        current_batch: list[int] = []
+        current_max_length = 0
+        for row_idx in ordered_indices:
+            row_length = canonical_row_input_length(self.rows[row_idx])
+            proposed_count = len(current_batch) + 1
+            proposed_max_length = max(current_max_length, row_length)
+            proposed_padded_time = proposed_count * proposed_max_length
+            exceeds_examples = proposed_count > self.max_examples_per_microbatch
+            exceeds_padded_time = proposed_padded_time > self.max_padded_time_per_microbatch
+            if current_batch and (exceeds_examples or exceeds_padded_time):
+                batches.append(list(current_batch))
+                current_batch = []
+                current_max_length = 0
+            current_batch.append(int(row_idx))
+            current_max_length = max(current_max_length, row_length)
+        if current_batch:
+            batches.append(list(current_batch))
+        return batches
+
+    def __iter__(self) -> Iterator[list[int]]:
+        ordered_indices = self._ordered_indices()
+        batches = self._build_batches(ordered_indices)
+        if self.shuffle:
+            self._iteration_count += 1
+        for batch in batches:
+            yield batch
+
+    def __len__(self) -> int:
+        ordered_indices = list(range(len(self.rows)))
+        return len(self._build_batches(ordered_indices))
 
 
 def _session_ids_from_split(split: Any) -> tuple[tuple[str, ...], tuple[str, ...]]:

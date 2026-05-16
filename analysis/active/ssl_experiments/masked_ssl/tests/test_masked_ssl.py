@@ -44,8 +44,10 @@ from masked_ssl.probe import (
     CanonicalProbeManifestRow,
     CanonicalSequenceDataset,
     DownstreamProbeConfig,
+    LengthAwareBatchSampler,
     NotebookProbeEncoderAdapter,
     build_competition_split_problem,
+    canonical_rows_padded_time_percentile,
     recover_downstream_probe_state,
 )
 from masked_ssl.sweeps import resolve_cache_candidates_for_sigma
@@ -200,6 +202,7 @@ def _write_tiny_canonical_probe_cache(cache_root: Path) -> None:
             "example_index": 0,
             "n_tx_features": 3,
             "n_sbp_features": 2,
+            "n_time_bins": 4,
             "target_length": 2,
             "transcript": "AA",
             "has_tx": True,
@@ -216,6 +219,7 @@ def _write_tiny_canonical_probe_cache(cache_root: Path) -> None:
             "example_index": 1,
             "n_tx_features": 3,
             "n_sbp_features": 2,
+            "n_time_bins": 4,
             "target_length": 2,
             "transcript": "BB",
             "has_tx": True,
@@ -232,6 +236,7 @@ def _write_tiny_canonical_probe_cache(cache_root: Path) -> None:
             "example_index": 2,
             "n_tx_features": 3,
             "n_sbp_features": 2,
+            "n_time_bins": 4,
             "target_length": 2,
             "transcript": "AB",
             "has_tx": True,
@@ -248,6 +253,7 @@ def _write_tiny_canonical_probe_cache(cache_root: Path) -> None:
             "example_index": 3,
             "n_tx_features": 3,
             "n_sbp_features": 2,
+            "n_time_bins": 4,
             "target_length": 2,
             "transcript": "BA",
             "has_tx": True,
@@ -354,6 +360,7 @@ def _write_tiny_competition_probe_cache(cache_root: Path) -> None:
             "example_index": 0,
             "n_tx_features": 3,
             "n_sbp_features": 2,
+            "n_time_bins": 4,
             "target_length": 2,
             "transcript": "AA",
             "has_tx": True,
@@ -370,6 +377,7 @@ def _write_tiny_competition_probe_cache(cache_root: Path) -> None:
             "example_index": 1,
             "n_tx_features": 3,
             "n_sbp_features": 2,
+            "n_time_bins": 4,
             "target_length": 2,
             "transcript": "BB",
             "has_tx": True,
@@ -386,6 +394,7 @@ def _write_tiny_competition_probe_cache(cache_root: Path) -> None:
             "example_index": 2,
             "n_tx_features": 3,
             "n_sbp_features": 2,
+            "n_time_bins": 4,
             "target_length": 2,
             "transcript": "AB",
             "has_tx": True,
@@ -402,6 +411,7 @@ def _write_tiny_competition_probe_cache(cache_root: Path) -> None:
             "example_index": 3,
             "n_tx_features": 3,
             "n_sbp_features": 2,
+            "n_time_bins": 4,
             "target_length": 2,
             "transcript": "BA",
             "has_tx": True,
@@ -418,6 +428,7 @@ def _write_tiny_competition_probe_cache(cache_root: Path) -> None:
             "example_index": 4,
             "n_tx_features": 3,
             "n_sbp_features": 2,
+            "n_time_bins": 4,
             "target_length": 2,
             "transcript": "AC",
             "has_tx": True,
@@ -434,6 +445,7 @@ def _write_tiny_competition_probe_cache(cache_root: Path) -> None:
             "example_index": 5,
             "n_tx_features": 3,
             "n_sbp_features": 2,
+            "n_time_bins": 4,
             "target_length": 2,
             "transcript": "CA",
             "has_tx": True,
@@ -1474,6 +1486,145 @@ class MaskedSSLTests(unittest.TestCase):
                 feature_mode="tx_only",
                 boundary_key_mode="session",
             )
+
+    def test_build_competition_split_problem_retains_n_time_bins(self) -> None:
+        cache_root = Path(self._tmp_dir())
+        _write_tiny_competition_probe_cache(cache_root)
+
+        problem = build_competition_split_problem(
+            cache_root=cache_root,
+            dataset="brain2text24",
+            feature_mode="tx_only",
+            boundary_key_mode="session",
+        )
+
+        self.assertEqual([row.n_time_bins for row in problem["train_rows"]], [4, 4, 4])
+        self.assertEqual([row.n_time_bins for row in problem["val_rows"]], [4, 4])
+
+    def test_length_aware_batch_sampler_respects_padded_time_budget(self) -> None:
+        rows = [
+            CanonicalProbeManifestRow(
+                example_id=f"ex-{idx}",
+                session_id="t12.2022.08.10",
+                subject_id="t12",
+                source_split="competition_train",
+                has_labels=True,
+                shard_relpath="brain2text24/toy_shard",
+                example_index=idx,
+                n_tx_features=3,
+                n_sbp_features=2,
+                target_length=2,
+                transcript="AA",
+                n_time_bins=length,
+            )
+            for idx, length in enumerate((4, 5, 6, 20, 7))
+        ]
+        sampler = LengthAwareBatchSampler(
+            rows,
+            max_examples_per_microbatch=3,
+            max_padded_time_per_microbatch=18,
+            shuffle=False,
+            seed=7,
+        )
+
+        batches = list(iter(sampler))
+
+        self.assertEqual(batches, [[0, 1, 2], [3], [4]])
+        for batch in batches:
+            batch_lengths = [int(rows[idx].n_time_bins or 0) for idx in batch]
+            padded_time = len(batch) * max(batch_lengths)
+            if len(batch) == 1:
+                self.assertGreaterEqual(padded_time, max(batch_lengths))
+            else:
+                self.assertLessEqual(padded_time, 18)
+
+    def test_length_aware_batch_sampler_uses_seeded_training_order(self) -> None:
+        rows = [
+            CanonicalProbeManifestRow(
+                example_id=f"ex-{idx}",
+                session_id="t12.2022.08.10",
+                subject_id="t12",
+                source_split="competition_train",
+                has_labels=True,
+                shard_relpath="brain2text24/toy_shard",
+                example_index=idx,
+                n_tx_features=3,
+                n_sbp_features=2,
+                target_length=2,
+                transcript="AA",
+                n_time_bins=length,
+            )
+            for idx, length in enumerate((4, 8, 5, 7, 6, 9))
+        ]
+
+        sampler_a = LengthAwareBatchSampler(
+            rows,
+            max_examples_per_microbatch=3,
+            max_padded_time_per_microbatch=24,
+            shuffle=True,
+            seed=11,
+        )
+        sampler_b = LengthAwareBatchSampler(
+            rows,
+            max_examples_per_microbatch=3,
+            max_padded_time_per_microbatch=24,
+            shuffle=True,
+            seed=11,
+        )
+        self.assertEqual(list(iter(sampler_a)), list(iter(sampler_b)))
+
+    def test_length_aware_batch_sampler_validation_order_is_stable(self) -> None:
+        rows = [
+            CanonicalProbeManifestRow(
+                example_id=f"ex-{idx}",
+                session_id="t12.2022.08.10",
+                subject_id="t12",
+                source_split="competition_test",
+                has_labels=True,
+                shard_relpath="brain2text24/toy_shard",
+                example_index=idx,
+                n_tx_features=3,
+                n_sbp_features=2,
+                target_length=2,
+                transcript="AA",
+                n_time_bins=length,
+            )
+            for idx, length in enumerate((4, 8, 5, 7))
+        ]
+        sampler = LengthAwareBatchSampler(
+            rows,
+            max_examples_per_microbatch=2,
+            max_padded_time_per_microbatch=16,
+            shuffle=False,
+            seed=7,
+        )
+
+        first = list(iter(sampler))
+        second = list(iter(sampler))
+
+        self.assertEqual(first, second)
+        self.assertEqual(first, [[0, 1], [2, 3]])
+
+    def test_canonical_rows_padded_time_percentile_uses_n_time_bins(self) -> None:
+        rows = [
+            CanonicalProbeManifestRow(
+                example_id=f"ex-{idx}",
+                session_id="t12.2022.08.10",
+                subject_id="t12",
+                source_split="competition_train",
+                has_labels=True,
+                shard_relpath="brain2text24/toy_shard",
+                example_index=idx,
+                n_tx_features=3,
+                n_sbp_features=2,
+                target_length=2,
+                transcript="AA",
+                n_time_bins=length,
+            )
+            for idx, length in enumerate((4, 5, 6, 7, 20))
+        ]
+
+        self.assertEqual(canonical_rows_padded_time_percentile(rows, percentile=95.0), 18)
 
     def test_raw_feature_adapter_starts_as_identity_on_tx_block(self) -> None:
         adapter = RawFeatureAdapter(input_dim=5, output_dim=3)

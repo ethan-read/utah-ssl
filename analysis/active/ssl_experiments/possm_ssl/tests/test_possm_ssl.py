@@ -209,6 +209,7 @@ def _write_tiny_canonical_probe_cache(cache_root: Path) -> None:
             "example_index": 0,
             "n_tx_features": 3,
             "n_sbp_features": 2,
+            "n_time_bins": 4,
             "target_length": 2,
             "transcript": "AA",
             "has_tx": True,
@@ -225,6 +226,7 @@ def _write_tiny_canonical_probe_cache(cache_root: Path) -> None:
             "example_index": 1,
             "n_tx_features": 3,
             "n_sbp_features": 2,
+            "n_time_bins": 4,
             "target_length": 2,
             "transcript": "BB",
             "has_tx": True,
@@ -241,6 +243,7 @@ def _write_tiny_canonical_probe_cache(cache_root: Path) -> None:
             "example_index": 2,
             "n_tx_features": 3,
             "n_sbp_features": 2,
+            "n_time_bins": 4,
             "target_length": 2,
             "transcript": "AB",
             "has_tx": True,
@@ -257,6 +260,7 @@ def _write_tiny_canonical_probe_cache(cache_root: Path) -> None:
             "example_index": 3,
             "n_tx_features": 3,
             "n_sbp_features": 2,
+            "n_time_bins": 4,
             "target_length": 2,
             "transcript": "BA",
             "has_tx": True,
@@ -1052,6 +1056,11 @@ class POSSMSSLTests(unittest.TestCase):
             self.assertEqual(summary["val_session_ids"], ["t00.2025.01.01"])
             self.assertEqual(int(summary["train_examples"]), 2)
             self.assertEqual(int(summary["val_examples"]), 1)
+            self.assertTrue(bool(summary["dynamic_batching_enabled"]))
+            self.assertEqual(int(summary["p95_train_input_length"]), 4)
+            self.assertEqual(int(summary["max_padded_time_per_microbatch"]), 4)
+            self.assertEqual(summary["train_microbatch_examples_range"], {"min": 1, "max": 1})
+            self.assertEqual(summary["train_microbatch_max_input_length_range"], {"min": 4, "max": 4})
             self.assertTrue(Path(summary["checkpoint_final_path"]).exists())
             self.assertTrue((Path(summary["checkpoints_dir"]) / "step_000001.pt").exists())
             self.assertIn("val_ctc_bpphone", summary["metrics"])
@@ -1071,6 +1080,11 @@ class POSSMSSLTests(unittest.TestCase):
             self.assertEqual(str(payload["val_split_name"]), "competition_test")
             self.assertEqual(int(payload["train_examples"]), 2)
             self.assertEqual(int(payload["val_examples"]), 1)
+            self.assertTrue(bool(payload["dynamic_batching_enabled"]))
+            self.assertEqual(int(payload["p95_train_input_length"]), 4)
+            self.assertEqual(int(payload["max_padded_time_per_microbatch"]), 4)
+            self.assertEqual(payload["train_microbatch_examples_range"], {"min": 1, "max": 1})
+            self.assertEqual(payload["train_microbatch_max_input_length_range"], {"min": 4, "max": 4})
             self.assertTrue(bool(payload["config"]["session_adapter_enabled"]))
             self.assertTrue(bool(payload["session_adapter_keys"]))
             self.assertTrue(
@@ -1078,6 +1092,46 @@ class POSSMSSLTests(unittest.TestCase):
             )
             self.assertEqual(int(payload["model_state"]["gru.weight_ih_l0"].shape[1]), 7)
             self.assertTrue(any(key.startswith("conv.") for key in payload["model_state"].keys()))
+
+    def test_run_possm_phoneme_finetuning_flushes_partial_accumulation_at_epoch_end(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            checkpoint_path = _make_stage1_checkpoint(tmp_path, temporal_gru_hidden_size=7)
+            _write_tiny_canonical_probe_cache(tmp_path)
+            manifest_path = tmp_path / "brain2text24" / "manifest.jsonl"
+            rows = [json.loads(line) for line in manifest_path.read_text().splitlines()]
+            for row in rows:
+                if row["example_id"] == "holdout-0":
+                    row["source_split"] = "competition_train"
+            manifest_path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+
+            summary = run_possm_phoneme_finetuning(
+                checkpoint_path=checkpoint_path,
+                cache_root=tmp_path,
+                config=POSSMFinetuneConfig(
+                    seed=7,
+                    mode="probe_frozen",
+                    dataset="brain2text24",
+                    feature_mode="tx_sbp",
+                    data_mode="normalized",
+                    batch_size=2,
+                    num_steps=2,
+                    learning_rate=1e-3,
+                    encoder_learning_rate=3e-4,
+                    checkpoint_every_steps=1,
+                    input_smoothing_sigma_bins=2.0,
+                    gru_hidden_size=8,
+                    gru_num_layers=2,
+                    gru_dropout=0.0,
+                    conv_kernel_size=3,
+                    conv_stride=1,
+                ),
+                device=torch.device("cpu"),
+            )
+
+            self.assertEqual(int(summary["train_examples"]), 3)
+            self.assertEqual(int(summary["steps"]), 2)
+            self.assertEqual(summary["train_microbatch_examples_range"], {"min": 1, "max": 2})
 
 
 if __name__ == "__main__":

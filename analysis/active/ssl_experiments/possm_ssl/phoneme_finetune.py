@@ -18,8 +18,9 @@ from torch.utils.data import DataLoader
 from masked_ssl.cache import load_cache_smoothing_provenance, resolve_boundary_key
 from masked_ssl.probe import (
     CanonicalSequenceDataset,
-    _make_loader_generator,
+    LengthAwareBatchSampler,
     build_competition_split_problem,
+    canonical_rows_padded_time_percentile,
     collate_sequence_batch,
     compute_ctc_loss_sum,
     compute_feature_stats,
@@ -130,10 +131,8 @@ def _seed_all(seed: int) -> None:
         torch.cuda.manual_seed_all(int(seed))
 
 
-def _loader_kwargs(device: torch.device, batch_size: int, *, shuffle: bool) -> dict[str, Any]:
+def _loader_kwargs(device: torch.device) -> dict[str, Any]:
     return {
-        "batch_size": int(batch_size),
-        "shuffle": shuffle,
         "num_workers": 0,
         "pin_memory": device.type == "cuda",
         "collate_fn": collate_sequence_batch,
@@ -282,6 +281,18 @@ def _prepare_stage2_inputs(
         kernel_size=int(config.input_smoothing_kernel_size),
         threshold=float(config.input_smoothing_threshold),
     )
+
+
+def _empty_microbatch_range() -> dict[str, int | None]:
+    return {"min": None, "max": None}
+
+
+def _update_microbatch_range(range_payload: dict[str, int | None], value: int) -> None:
+    resolved = int(value)
+    current_min = range_payload.get("min")
+    current_max = range_payload.get("max")
+    range_payload["min"] = resolved if current_min is None else min(int(current_min), resolved)
+    range_payload["max"] = resolved if current_max is None else max(int(current_max), resolved)
 
 
 def _ctc_greedy_decode(
@@ -574,7 +585,9 @@ def _checkpoint_payload(
     metrics: dict[str, Any],
     checkpoint_kind: str,
     elapsed_seconds: float,
+    batching_diagnostics: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    resolved_batching_diagnostics = dict(batching_diagnostics or {})
     payload: dict[str, Any] = {
         "model_family": "possm",
         "stage": "stage2_phoneme_finetune",
@@ -610,6 +623,14 @@ def _checkpoint_payload(
         "elapsed_seconds": float(elapsed_seconds),
         "metrics": dict(metrics),
         "checkpoint_kind": str(checkpoint_kind),
+        "dynamic_batching_enabled": bool(resolved_batching_diagnostics.get("dynamic_batching_enabled", False)),
+        "p95_train_input_length": resolved_batching_diagnostics.get("p95_train_input_length"),
+        "max_padded_time_per_microbatch": resolved_batching_diagnostics.get("max_padded_time_per_microbatch"),
+        "train_microbatch_examples_range": resolved_batching_diagnostics.get("train_microbatch_examples_range"),
+        "train_microbatch_max_input_length_range": resolved_batching_diagnostics.get(
+            "train_microbatch_max_input_length_range"
+        ),
+        "batching_diagnostics": resolved_batching_diagnostics,
     }
     if optimizer is not None:
         payload["optimizer_state"] = optimizer.state_dict()
@@ -738,30 +759,59 @@ def run_possm_phoneme_finetuning(
     else:
         target_stats = None
 
+    p95_train_input_length = canonical_rows_padded_time_percentile(
+        problem["train_rows"],
+        percentile=95.0,
+    )
+    max_examples_per_microbatch = int(effective_config.batch_size)
+    max_padded_time_per_microbatch = int(max_examples_per_microbatch * p95_train_input_length)
+
+    train_dataset = CanonicalSequenceDataset(
+        problem["train_rows"],
+        cache_root=Path(problem["cache_root"]),
+        stats=target_stats,
+        feature_mode=str(problem["feature_mode"]),
+        boundary_key_mode=str(problem.get("boundary_key_mode", "session")),
+        dataset=str(problem.get("dataset", effective_config.dataset)),
+    )
+    val_dataset = CanonicalSequenceDataset(
+        problem["val_rows"],
+        cache_root=Path(problem["cache_root"]),
+        stats=target_stats,
+        feature_mode=str(problem["feature_mode"]),
+        boundary_key_mode=str(problem.get("boundary_key_mode", "session")),
+        dataset=str(problem.get("dataset", effective_config.dataset)),
+    )
     train_loader = DataLoader(
-        CanonicalSequenceDataset(
+        train_dataset,
+        batch_sampler=LengthAwareBatchSampler(
             problem["train_rows"],
-            cache_root=Path(problem["cache_root"]),
-            stats=target_stats,
-            feature_mode=str(problem["feature_mode"]),
-            boundary_key_mode=str(problem.get("boundary_key_mode", "session")),
-            dataset=str(problem.get("dataset", effective_config.dataset)),
+            max_examples_per_microbatch=max_examples_per_microbatch,
+            max_padded_time_per_microbatch=max_padded_time_per_microbatch,
+            shuffle=True,
+            seed=int(effective_config.seed),
         ),
-        **_loader_kwargs(resolved_device, int(effective_config.batch_size), shuffle=True),
-        generator=_make_loader_generator(int(effective_config.seed)),
+        **_loader_kwargs(resolved_device),
     )
     val_loader = DataLoader(
-        CanonicalSequenceDataset(
+        val_dataset,
+        batch_sampler=LengthAwareBatchSampler(
             problem["val_rows"],
-            cache_root=Path(problem["cache_root"]),
-            stats=target_stats,
-            feature_mode=str(problem["feature_mode"]),
-            boundary_key_mode=str(problem.get("boundary_key_mode", "session")),
-            dataset=str(problem.get("dataset", effective_config.dataset)),
+            max_examples_per_microbatch=max_examples_per_microbatch,
+            max_padded_time_per_microbatch=max_padded_time_per_microbatch,
+            shuffle=False,
+            seed=int(effective_config.seed) + 1,
         ),
-        **_loader_kwargs(resolved_device, int(effective_config.batch_size), shuffle=False),
-        generator=_make_loader_generator(int(effective_config.seed) + 1),
+        **_loader_kwargs(resolved_device),
     )
+    batching_diagnostics: dict[str, Any] = {
+        "dynamic_batching_enabled": True,
+        "p95_train_input_length": int(p95_train_input_length),
+        "max_padded_time_per_microbatch": int(max_padded_time_per_microbatch),
+        "max_examples_per_microbatch": int(max_examples_per_microbatch),
+        "train_microbatch_examples_range": _empty_microbatch_range(),
+        "train_microbatch_max_input_length_range": _empty_microbatch_range(),
+    }
 
     vocab = dict(problem["vocab"])
     session_adapter_keys = _session_adapter_keys_for_rows(
@@ -834,6 +884,7 @@ def run_possm_phoneme_finetuning(
         lr=float(effective_config.learning_rate),
         weight_decay=float(effective_config.weight_decay),
     )
+    clip_params = [param for group in trainable_groups for param in group["params"] if param.requires_grad]
 
     if output_root is None:
         base_output_root = stage1_run_dir / "phoneme_finetune"
@@ -956,6 +1007,7 @@ def run_possm_phoneme_finetuning(
             metrics=metrics,
             checkpoint_kind="step" if not force else "final_eval",
             elapsed_seconds=round(time.time() - start_time, 3),
+            batching_diagnostics=batching_diagnostics,
         )
         if checkpoints_dir is not None and steps % int(effective_config.checkpoint_every_steps) == 0:
             checkpoints_dir.mkdir(parents=True, exist_ok=True)
@@ -966,6 +1018,55 @@ def run_possm_phoneme_finetuning(
             best_step = int(steps)
             torch.save(best_payload, checkpoint_best_path)
         return metrics
+
+    accumulated_examples = 0
+    accumulated_target_count = 0
+    accumulated_loss_sum = 0.0
+    accumulation_microbatches = 0
+    has_pending_gradients = False
+
+    def flush_pending_gradients(*, force_report: bool = False) -> None:
+        nonlocal steps
+        nonlocal last_report_elapsed
+        nonlocal accumulated_examples
+        nonlocal accumulated_target_count
+        nonlocal accumulated_loss_sum
+        nonlocal accumulation_microbatches
+        nonlocal has_pending_gradients
+        if not has_pending_gradients:
+            return
+        torch.nn.utils.clip_grad_norm_(clip_params, max_norm=float(effective_config.max_grad_norm))
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+        steps += 1
+        elapsed = time.time() - start_time
+        should_report = force_report or steps == 1 or steps % int(effective_config.progress_every_steps) == 0
+        if should_report:
+            last_report_elapsed = elapsed
+            train_ctc_bpphone = float("nan")
+            if accumulated_target_count > 0:
+                train_ctc_bpphone = float(accumulated_loss_sum / accumulated_target_count / math.log(2.0))
+            _emit_progress(
+                progress_log_path,
+                event="phoneme_train_report",
+                stage="possm_phoneme_finetune",
+                step=int(steps),
+                elapsed_seconds=round(elapsed, 3),
+                train_ctc_bpphone=train_ctc_bpphone,
+                microbatch_examples=int(accumulated_examples),
+                accumulation_microbatches=int(accumulation_microbatches),
+                optimizer_target_examples=int(effective_config.batch_size),
+                mode=str(effective_config.mode),
+                data_mode=effective_data_mode,
+                feature_mode=effective_feature_mode,
+                dynamic_batching_enabled=True,
+                max_padded_time_per_microbatch=int(max_padded_time_per_microbatch),
+            )
+        accumulated_examples = 0
+        accumulated_target_count = 0
+        accumulated_loss_sum = 0.0
+        accumulation_microbatches = 0
+        has_pending_gradients = False
 
     while True:
         elapsed = time.time() - start_time
@@ -990,6 +1091,16 @@ def run_possm_phoneme_finetuning(
             )
             labels = batch["labels"].to(resolved_device)
             label_lengths = batch["label_lengths"].to(resolved_device)
+            microbatch_examples = int(x.shape[0])
+            microbatch_max_input_length = int(input_lengths.max().item())
+            _update_microbatch_range(
+                batching_diagnostics["train_microbatch_examples_range"],
+                microbatch_examples,
+            )
+            _update_microbatch_range(
+                batching_diagnostics["train_microbatch_max_input_length_range"],
+                microbatch_max_input_length,
+            )
 
             outputs = model(x, input_lengths, session_ids=batch["boundary_keys"])
             loss_sum, target_count = compute_ctc_loss_sum(
@@ -1002,35 +1113,28 @@ def run_possm_phoneme_finetuning(
             if target_count <= 0:
                 continue
             loss = loss_sum / target_count
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            clip_params = [param for group in trainable_groups for param in group["params"] if param.requires_grad]
-            torch.nn.utils.clip_grad_norm_(clip_params, max_norm=float(effective_config.max_grad_norm))
-            optimizer.step()
-            steps += 1
+            if not has_pending_gradients:
+                optimizer.zero_grad(set_to_none=True)
+            scaled_loss = loss * (float(microbatch_examples) / float(effective_config.batch_size))
+            scaled_loss.backward()
+            accumulated_examples += microbatch_examples
+            accumulated_target_count += int(target_count)
+            accumulated_loss_sum += float(loss_sum.item())
+            accumulation_microbatches += 1
+            has_pending_gradients = True
             made_progress = True
 
-            elapsed = time.time() - start_time
-            should_report = (
-                steps == 1
-                or steps % int(effective_config.progress_every_steps) == 0
-            )
-            if should_report:
-                last_report_elapsed = elapsed
-                _emit_progress(
-                    progress_log_path,
-                    event="phoneme_train_report",
-                    stage="possm_phoneme_finetune",
-                    step=int(steps),
-                    elapsed_seconds=round(elapsed, 3),
-                    train_ctc_bpphone=float(loss.item()) / math.log(2.0),
-                    mode=str(effective_config.mode),
-                    data_mode=effective_data_mode,
-                    feature_mode=effective_feature_mode,
-                )
-            maybe_evaluate_and_checkpoint()
+            if accumulated_examples >= int(effective_config.batch_size):
+                flush_pending_gradients()
+                maybe_evaluate_and_checkpoint()
+                if steps >= int(effective_config.num_steps):
+                    break
         if not made_progress:
             break
+        if steps >= int(effective_config.num_steps):
+            break
+        flush_pending_gradients()
+        maybe_evaluate_and_checkpoint()
 
     final_metrics = maybe_evaluate_and_checkpoint(force=True)
     if final_metrics is None:
@@ -1061,6 +1165,7 @@ def run_possm_phoneme_finetuning(
             metrics=final_metrics,
             checkpoint_kind="final",
             elapsed_seconds=round(time.time() - start_time, 3),
+            batching_diagnostics=batching_diagnostics,
         ),
         checkpoint_final_path,
     )
@@ -1083,6 +1188,9 @@ def run_possm_phoneme_finetuning(
         "cache_root": str(problem["cache_root"]),
         "cache_smoothing_provenance": problem.get("cache_smoothing_provenance"),
         "split_policy": str(problem.get("split_policy", "competition_train_test")),
+        "dynamic_batching_enabled": bool(batching_diagnostics["dynamic_batching_enabled"]),
+        "p95_train_input_length": int(batching_diagnostics["p95_train_input_length"]),
+        "max_padded_time_per_microbatch": int(batching_diagnostics["max_padded_time_per_microbatch"]),
         "session_adapter_enabled": bool(effective_config.session_adapter_enabled),
         "session_adapter_keys": list(session_adapter_keys),
         "train_split_name": str(problem.get("train_split_name", "competition_train")),
@@ -1099,6 +1207,10 @@ def run_possm_phoneme_finetuning(
             str(session_id): int(count)
             for session_id, count in dict(problem.get("val_examples_by_session", {})).items()
         },
+        "train_microbatch_examples_range": dict(batching_diagnostics["train_microbatch_examples_range"]),
+        "train_microbatch_max_input_length_range": dict(
+            batching_diagnostics["train_microbatch_max_input_length_range"]
+        ),
         "steps": int(steps),
         "metrics": {
             "val_ctc_bpphone": float(final_metrics["val_ctc_bpphone"]),
