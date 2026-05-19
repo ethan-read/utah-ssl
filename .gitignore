@@ -36,3 +36,6 @@ tmp/
 
 # Failed/archival experiment assets that should stay local
 analysis/active/channel_ablation/
+docs/learning_notes/deep_state_space_models/main.pdf
+docs/learning_notes/deep_state_space_models/main.tex
+docs/learning_notes/deep_state_space_models/main.pdf
