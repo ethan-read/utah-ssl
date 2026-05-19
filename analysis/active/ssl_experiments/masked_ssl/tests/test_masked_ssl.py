@@ -792,6 +792,52 @@ class MaskedSSLTests(unittest.TestCase):
             self.assertTrue(torch.equal(mean, torch.full((4,), 2.0)))
             self.assertTrue(torch.equal(std, torch.ones(4)))
 
+    def test_prepare_cache_context_auto_discovers_canonical_session_stats(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            cache_root = tmp_path / "cache_v1"
+            stats_path = (
+                tmp_path
+                / "stats"
+                / "session_feature_stats"
+                / "raw"
+                / "tx_sbp"
+                / "session"
+                / "ssl_pretrain_all_datasets_v1.pt"
+            )
+            _write_tiny_pretrain_cache(cache_root, dataset="toyset")
+            stats_path.parent.mkdir(parents=True, exist_ok=True)
+            torch.save(
+                {
+                    "session_feature_stats": {
+                        "toyset:toy.2025.01.01": (torch.zeros(4), torch.ones(4)),
+                        "toyset:toy.2025.01.02": (torch.full((4,), 3.0), torch.ones(4)),
+                    },
+                    "metadata": {"kind": "test"},
+                },
+                stats_path,
+            )
+
+            with mock.patch(
+                "masked_ssl.cache._compute_session_feature_stats",
+                side_effect=AssertionError("should not recompute stats"),
+            ):
+                context = prepare_cache_context(
+                    cache_candidates=[cache_root],
+                    config=CacheAccessConfig(
+                        mode="drive_direct",
+                        excluded_datasets=(),
+                        feature_mode="tx_sbp",
+                        tx_dim=2,
+                        sbp_dim=2,
+                        use_normalization=True,
+                    ),
+                )
+
+            mean, std = context.session_feature_stats["toyset:toy.2025.01.02"]
+            self.assertTrue(torch.equal(mean, torch.full((4,), 3.0)))
+            self.assertTrue(torch.equal(std, torch.ones(4)))
+
     def test_resolve_cache_candidates_for_sigma_finds_sibling_smoothed_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = Path(tmpdir)

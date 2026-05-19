@@ -200,6 +200,74 @@ def load_cache_smoothing_provenance(
     return None
 
 
+def _cache_variant_name(cache_root: str | Path) -> str:
+    name = Path(cache_root).name
+    if "smoothed_sigma2p0" in name:
+        return "smoothed_sigma2p0"
+    if name == "cache_v1":
+        return "raw"
+    return name.replace("cache_v1_", "").replace("/", "_")
+
+
+def _canonical_stats_root_for_cache(cache_root: str | Path) -> Path:
+    cache_root = Path(cache_root)
+    if cache_root.parent.name == "data":
+        return cache_root.parent / "stats"
+    local_stats_root = cache_root / "stats"
+    if local_stats_root.exists():
+        return local_stats_root
+    return cache_root.parent / "stats"
+
+
+def _canonical_session_stats_dir(
+    *,
+    cache_root: str | Path,
+    feature_mode: str,
+    boundary_key_mode: str,
+) -> Path:
+    return (
+        _canonical_stats_root_for_cache(cache_root)
+        / "session_feature_stats"
+        / _cache_variant_name(cache_root)
+        / str(feature_mode)
+        / str(boundary_key_mode)
+    )
+
+
+def _canonical_session_stats_stem(
+    *,
+    excluded_datasets: Sequence[str],
+) -> str:
+    excluded = tuple(sorted(str(item) for item in excluded_datasets))
+    if excluded:
+        joined = "_".join(item.replace("/", "_") for item in excluded)
+        return f"ssl_pretrain_excluding_{joined}_v1"
+    return "ssl_pretrain_all_datasets_v1"
+
+
+def resolve_precomputed_session_stats_path(
+    *,
+    cache_root: str | Path,
+    feature_mode: str,
+    boundary_key_mode: str,
+    excluded_datasets: Sequence[str],
+) -> Path | None:
+    stats_dir = _canonical_session_stats_dir(
+        cache_root=cache_root,
+        feature_mode=feature_mode,
+        boundary_key_mode=boundary_key_mode,
+    )
+    preferred = stats_dir / (
+        f"{_canonical_session_stats_stem(excluded_datasets=excluded_datasets)}.pt"
+    )
+    if preferred.exists():
+        return preferred
+    candidates = sorted(stats_dir.glob("*.pt"))
+    if len(candidates) == 1:
+        return candidates[0]
+    return None
+
+
 def _format_bytes(num_bytes: int) -> str:
     value = float(num_bytes)
     for unit in ["B", "KB", "MB", "GB", "TB"]:
@@ -1119,9 +1187,19 @@ def prepare_cache_context(
     )
     session_feature_stats: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
     if config.use_normalization:
-        if config.precomputed_session_stats_path is not None:
+        resolved_stats_path = (
+            Path(config.precomputed_session_stats_path)
+            if config.precomputed_session_stats_path is not None
+            else resolve_precomputed_session_stats_path(
+                cache_root=cache_root,
+                feature_mode=str(config.feature_mode),
+                boundary_key_mode=str(config.boundary_key_mode),
+                excluded_datasets=config.excluded_datasets,
+            )
+        )
+        if resolved_stats_path is not None:
             session_feature_stats, _, stats_path = _load_precomputed_session_feature_stats(
-                stats_path=config.precomputed_session_stats_path,
+                stats_path=resolved_stats_path,
                 expected_dim=int(config.full_dim),
                 feature_mode=str(config.feature_mode),
             )

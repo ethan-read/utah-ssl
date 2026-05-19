@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 import torch
@@ -1095,6 +1096,66 @@ class POSSMSSLTests(unittest.TestCase):
             )
             self.assertEqual(int(payload["model_state"]["gru.weight_ih_l0"].shape[1]), 7)
             self.assertTrue(any(key.startswith("conv.") for key in payload["model_state"].keys()))
+
+    def test_run_possm_phoneme_finetuning_auto_discovers_canonical_split_stats(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            cache_root = tmp_path / "cache_v1"
+            checkpoint_path = _make_stage1_checkpoint(tmp_path, temporal_gru_hidden_size=7)
+            _write_tiny_canonical_probe_cache(cache_root)
+            stats_path = (
+                tmp_path
+                / "stats"
+                / "split_feature_stats"
+                / "raw"
+                / "brain2text24"
+                / "competition_train"
+                / "tx_sbp"
+                / "global_v1.pt"
+            )
+            stats_path.parent.mkdir(parents=True, exist_ok=True)
+            torch.save(
+                {
+                    "mean": torch.zeros(5),
+                    "std": torch.ones(5),
+                    "metadata": {"kind": "split_feature_stats", "source": "test"},
+                },
+                stats_path,
+            )
+
+            with mock.patch(
+                "possm_ssl.phoneme_finetune.compute_feature_stats",
+                side_effect=AssertionError("should not recompute split stats"),
+            ):
+                summary = run_possm_phoneme_finetuning(
+                    checkpoint_path=checkpoint_path,
+                    cache_root=cache_root,
+                    config=POSSMFinetuneConfig(
+                        seed=7,
+                        mode="probe_frozen",
+                        dataset="brain2text24",
+                        feature_mode="tx_sbp",
+                        data_mode="normalized",
+                        batch_size=1,
+                        num_steps=1,
+                        learning_rate=1e-3,
+                        encoder_learning_rate=3e-4,
+                        checkpoint_every_steps=1,
+                        input_smoothing_sigma_bins=0.0,
+                        gru_hidden_size=8,
+                        gru_num_layers=2,
+                        gru_dropout=0.0,
+                        conv_kernel_size=3,
+                        conv_stride=1,
+                    ),
+                    device=torch.device("cpu"),
+                )
+
+            self.assertEqual(summary["precomputed_split_stats_path"], str(stats_path))
+            self.assertEqual(
+                summary["precomputed_split_stats_metadata"],
+                {"kind": "split_feature_stats", "source": "test"},
+            )
 
     def test_recover_possm_stage2_summary_prefers_latest_step_for_interrupted_run(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

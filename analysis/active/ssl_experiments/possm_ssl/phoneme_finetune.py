@@ -12,10 +12,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from masked_ssl.cache import load_cache_smoothing_provenance, resolve_boundary_key
+from masked_ssl.cache import (
+    load_cache_smoothing_provenance,
+    resolve_boundary_key,
+    _cache_variant_name,
+    _canonical_stats_root_for_cache,
+)
 from masked_ssl.probe import (
     CanonicalSequenceDataset,
     LengthAwareBatchSampler,
@@ -62,6 +68,7 @@ class POSSMFinetuneConfig:
     conv_kernel_size: int | None = None
     conv_stride: int | None = None
     conv_dropout: float = 0.1
+    precomputed_split_stats_path: str | Path | None = None
 
     def __post_init__(self) -> None:
         if self.conv_kernel_size is None:
@@ -123,6 +130,64 @@ class POSSMFinetuneConfig:
             raise ValueError("Conv kernel and stride must be positive")
         if not (0.0 <= float(self.conv_dropout) < 1.0):
             raise ValueError("conv_dropout must be in [0, 1)")
+
+
+def _load_precomputed_split_feature_stats(
+    *,
+    stats_path: str | Path,
+    expected_dim: int,
+    feature_mode: str,
+) -> tuple[tuple[np.ndarray, np.ndarray], dict[str, Any], Path]:
+    path = Path(stats_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Precomputed split stats file does not exist: {path}")
+    payload = torch.load(path, map_location="cpu")
+    if not isinstance(payload, dict):
+        raise ValueError(f"Precomputed split stats payload must be a dict: {path}")
+    mean_t = torch.as_tensor(payload.get("mean")).float().cpu()
+    std_t = torch.as_tensor(payload.get("std")).float().cpu()
+    if mean_t.numel() < expected_dim or std_t.numel() < expected_dim:
+        raise ValueError(
+            f"Precomputed split stats payload is too small for feature_mode={feature_mode!r}: "
+            f"expected at least {expected_dim} values, got mean={mean_t.numel()} std={std_t.numel()}."
+        )
+    if mean_t.numel() != expected_dim:
+        mean_t = mean_t[:expected_dim].clone()
+    if std_t.numel() != expected_dim:
+        std_t = std_t[:expected_dim].clone()
+    metadata = dict(payload.get("metadata", {}))
+    return (
+        mean_t.numpy().astype(np.float32, copy=False),
+        std_t.numpy().astype(np.float32, copy=False),
+    ), metadata, path
+
+
+def _resolve_precomputed_split_stats_path(
+    *,
+    cache_root: str | Path,
+    dataset: str,
+    train_split_name: str,
+    feature_mode: str,
+    preferred_path: str | Path | None,
+) -> Path | None:
+    if preferred_path is not None:
+        path = Path(preferred_path)
+        return path if path.exists() else None
+    stats_dir = (
+        _canonical_stats_root_for_cache(cache_root)
+        / "split_feature_stats"
+        / _cache_variant_name(cache_root)
+        / str(dataset)
+        / str(train_split_name)
+        / str(feature_mode)
+    )
+    preferred = stats_dir / "global_v1.pt"
+    if preferred.exists():
+        return preferred
+    candidates = sorted(stats_dir.glob("*.pt"))
+    if len(candidates) == 1:
+        return candidates[0]
+    return None
 
 
 def _seed_all(seed: int) -> None:
@@ -837,14 +902,33 @@ def run_possm_phoneme_finetuning(
     problem["cache_smoothing_provenance"] = cache_smoothing_provenance
 
     if effective_data_mode == "normalized":
-        target_stats = compute_feature_stats(
-            problem["train_rows"],
-            cache_root=Path(problem["cache_root"]),
-            mode="global",
+        resolved_split_stats_path = _resolve_precomputed_split_stats_path(
+            cache_root=problem["cache_root"],
+            dataset=str(problem["dataset"]),
+            train_split_name=str(problem.get("train_split_name", "competition_train")),
             feature_mode=str(problem["feature_mode"]),
+            preferred_path=effective_config.precomputed_split_stats_path,
         )
+        if resolved_split_stats_path is not None:
+            target_stats, target_stats_metadata, loaded_stats_path = _load_precomputed_split_feature_stats(
+                stats_path=resolved_split_stats_path,
+                expected_dim=int(base_encoder.input_dim),
+                feature_mode=str(problem["feature_mode"]),
+            )
+            print(f"loaded precomputed POSSM stage-2 split stats: {loaded_stats_path}")
+        else:
+            target_stats = compute_feature_stats(
+                problem["train_rows"],
+                cache_root=Path(problem["cache_root"]),
+                mode="global",
+                feature_mode=str(problem["feature_mode"]),
+            )
+            target_stats_metadata = None
+            loaded_stats_path = None
     else:
         target_stats = None
+        target_stats_metadata = None
+        loaded_stats_path = None
 
     p95_train_input_length = canonical_rows_padded_time_percentile(
         problem["train_rows"],
@@ -1274,6 +1358,10 @@ def run_possm_phoneme_finetuning(
         "dataset": str(effective_config.dataset),
         "cache_root": str(problem["cache_root"]),
         "cache_smoothing_provenance": problem.get("cache_smoothing_provenance"),
+        "precomputed_split_stats_path": (
+            str(loaded_stats_path) if loaded_stats_path is not None else None
+        ),
+        "precomputed_split_stats_metadata": target_stats_metadata,
         "split_policy": str(problem.get("split_policy", "competition_train_test")),
         "dynamic_batching_enabled": bool(batching_diagnostics["dynamic_batching_enabled"]),
         "p95_train_input_length": int(batching_diagnostics["p95_train_input_length"]),
