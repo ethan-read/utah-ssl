@@ -1,6 +1,7 @@
 # Cache And Stats Inventory
 
-This note records the cache roots and session-stats artifacts that are still relevant for current Utah SSL notebook work.
+This note records the cache roots and normalization-stat artifacts that are
+still relevant for current Utah SSL notebook work.
 
 ## Canonical Raw Cache
 
@@ -40,11 +41,43 @@ This note records the cache roots and session-stats artifacts that are still rel
 
 ## Precomputed Session Stats
 
+Reusable normalization statistics should now live with the data artifacts under
+`utah_ssl/data/stats`, not under experiment-output folders. The older
+`outputs/ssl_experiments/contrastive/precomputed_ssl_session_stats` location is
+legacy and may be absent in a fresh Drive organization.
+
+### Canonical Drive Layout
+
+Stage-1 SSL/POSSM sampling uses session-level stats keyed by
+`dataset:session_id`:
+
+- Drive root:
+  - `/content/drive/MyDrive/utah_ssl/data/stats/session_feature_stats/`
+- current POSSM Stage-1 target path:
+  - `/content/drive/MyDrive/utah_ssl/data/stats/session_feature_stats/smoothed_sigma2p0/tx_only/session/ssl_pretrain_excluding_brain2text25_v1.pt`
+  - `/content/drive/MyDrive/utah_ssl/data/stats/session_feature_stats/smoothed_sigma2p0/tx_only/session/ssl_pretrain_excluding_brain2text25_v1.json`
+
+Stage-2 phoneme fine-tuning uses train-split global stats computed on the
+released Willett `competition_train` rows and then applied to both train and
+validation examples:
+
+- Drive root:
+  - `/content/drive/MyDrive/utah_ssl/data/stats/split_feature_stats/`
+- current POSSM Stage-2 target path:
+  - `/content/drive/MyDrive/utah_ssl/data/stats/split_feature_stats/raw/brain2text24/competition_train/tx_only/global_v1.pt`
+  - `/content/drive/MyDrive/utah_ssl/data/stats/split_feature_stats/raw/brain2text24/competition_train/tx_only/global_v1.json`
+
+The `.pt` files contain tensors/arrays. The paired `.json` files contain
+human-readable provenance such as cache variant, feature mode, split policy,
+dataset list, and creation time.
+
+### Legacy Output-Root Locations
+
 ### Unsmoothed Stats
 - Drive path:
   - `/content/drive/MyDrive/utah_ssl/outputs/ssl_experiments/contrastive/precomputed_ssl_session_stats/session_feature_stats_session_featurewise_v1_refds000950_cap126682_tx256_sbp256_stable.pt`
 - intended use:
-  - raw-cache normalized runs
+  - legacy raw-cache normalized runs
   - set `USE_SMOOTHED_CACHE = False`
   - set `SESSION_STATS_VARIANT = 'unsmoothed'`
 
@@ -52,7 +85,7 @@ This note records the cache roots and session-stats artifacts that are still rel
 - Drive path:
   - `/content/drive/MyDrive/utah_ssl/outputs/ssl_experiments/contrastive/precomputed_ssl_session_stats/session_feature_stats_session_featurewise_v1_refds000950_cap126682_tx256_sbp256_smooth_sigma2p0_stable.pt`
 - intended use:
-  - sigma-2 pre-smoothed-cache normalized runs
+  - legacy sigma-2 pre-smoothed-cache normalized runs
   - set `USE_SMOOTHED_CACHE = True`
   - set `SESSION_STATS_VARIANT = 'smoothed'`
 - requirement:
@@ -64,11 +97,15 @@ This note records the cache roots and session-stats artifacts that are still rel
 - current intended setup:
   - stage 1 uses `USE_SMOOTHED_CACHE = True`
   - stage 1 keeps `GAUSSIAN_SMOOTHING_SIGMA_BINS = 0.0`
-  - stage 1 uses `SESSION_STATS_VARIANT = 'smoothed'`
+  - stage 1 uses session-level featurewise z-scoring stats; prefer the
+    `utah_ssl/data/stats/session_feature_stats/...` artifact once created
   - stage 2 uses the raw cache root via `STAGE2_CACHE_ROOT = DEFAULT_CACHE_ROOT_RAW`
+  - stage 2 uses train-split global z-scoring stats from `competition_train`
   - stage 2 applies Willett-style online input smoothing after normalization and training-time noise/offset augmentation
   - `FEATURE_MODE = 'tx_only'`
   - `BOUNDARY_KEY_MODE = 'session'`
+  - the notebook contains a temporary maintenance cell to populate
+    `/content/drive/MyDrive/utah_ssl/data/stats`
 - rationale:
   - stage-1 SSL smoothing is precomputed in the selected cache
   - stage-2 CTC smoothing is online so that future white-noise and constant-offset augmentations are smoothed in the same order as Willett's decoder
@@ -77,8 +114,12 @@ This note records the cache roots and session-stats artifacts that are still rel
 
 ## Practical Rules
 
+- Keep reusable stats in `utah_ssl/data/stats`; keep run checkpoints/logs in
+  `utah_ssl/outputs/ssl_experiments`.
 - Pair raw cache with unsmoothed stats.
-- Pair sigma-2 pre-smoothed cache with sigma-2 smoothed stats.
+- Pair sigma-2 pre-smoothed cache with sigma-2 smoothed session stats.
+- Do not mix Stage-1 session stats with Stage-2 split/global stats; they have
+  different scopes.
 - Keep `gaussian_smoothing_sigma_bins=0.0` whenever using a pre-smoothed cache.
 - Before long Colab runs, verify that the selected cache root contains `brain2text24/manifest.jsonl`, `brain2text24/metadata.json`, and `brain2text24/shards/`.
 - If normalized samples look shifted, recompute stats from the exact cache root being used rather than mixing stats across cache variants.

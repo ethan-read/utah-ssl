@@ -654,6 +654,93 @@ def _find_latest_step_checkpoint(checkpoints_dir: Path) -> Path | None:
     return latest_path
 
 
+def _checkpoint_mtime(path: Path) -> int:
+    return int(path.stat().st_mtime_ns) if path.exists() else -1
+
+
+def _stage2_run_dir_for_checkpoint(path: str | Path) -> Path:
+    resolved_path = Path(path)
+    return resolved_path.parent.parent if resolved_path.parent.name == "checkpoints" else resolved_path.parent
+
+
+def find_latest_possm_stage2_run_dir(output_root: str | Path) -> Path:
+    """Find the Stage-2 run directory containing the newest checkpoint file."""
+    root = Path(output_root)
+    if not root.exists():
+        raise FileNotFoundError(f"Stage-2 output root does not exist: {root}")
+    candidates: list[Path] = []
+    for pattern in ("*/checkpoints/step_*.pt", "*/checkpoint_final.pt", "*/checkpoint_best.pt"):
+        candidates.extend(path for path in root.glob(pattern) if path.is_file())
+    if not candidates:
+        raise FileNotFoundError(f"No POSSM Stage-2 checkpoints found under {root}")
+    latest_checkpoint = max(candidates, key=_checkpoint_mtime)
+    return _stage2_run_dir_for_checkpoint(latest_checkpoint)
+
+
+def recover_possm_stage2_summary(
+    output_root: str | Path,
+    *,
+    run_dir: str | Path | None = None,
+    checkpoint_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """Recover lightweight metadata for a POSSM Stage-2 run.
+
+    ``resume_checkpoint_path`` is intentionally separate from
+    ``checkpoint_final_path``. Interrupted runs often have no final checkpoint,
+    but they can still resume from the latest step checkpoint.
+    """
+    if run_dir is not None and checkpoint_path is not None:
+        raise ValueError("Specify at most one of run_dir or checkpoint_path.")
+
+    root = Path(output_root)
+    if checkpoint_path is not None:
+        resolved_checkpoint_path = Path(checkpoint_path)
+        resolved_run_dir = _stage2_run_dir_for_checkpoint(resolved_checkpoint_path)
+    else:
+        resolved_run_dir = Path(run_dir) if run_dir is not None else find_latest_possm_stage2_run_dir(root)
+        latest_step_path = _find_latest_step_checkpoint(resolved_run_dir / "checkpoints")
+        final_candidate = resolved_run_dir / "checkpoint_final.pt"
+        best_candidate = resolved_run_dir / "checkpoint_best.pt"
+        if latest_step_path is not None:
+            resolved_checkpoint_path = latest_step_path
+        elif final_candidate.exists():
+            resolved_checkpoint_path = final_candidate
+        elif best_candidate.exists():
+            resolved_checkpoint_path = best_candidate
+        else:
+            raise FileNotFoundError(f"No POSSM Stage-2 checkpoints found for run dir: {resolved_run_dir}")
+
+    if not resolved_checkpoint_path.exists():
+        raise FileNotFoundError(f"Stage-2 checkpoint does not exist: {resolved_checkpoint_path}")
+    if not resolved_run_dir.exists():
+        raise FileNotFoundError(f"Stage-2 run dir does not exist: {resolved_run_dir}")
+
+    payload = torch.load(resolved_checkpoint_path, map_location="cpu")
+    if str(payload.get("stage", "")) != "stage2_phoneme_finetune":
+        raise ValueError(f"Checkpoint is not a POSSM Stage-2 checkpoint: {resolved_checkpoint_path}")
+    config = dict(payload.get("config", {}))
+    metrics = dict(payload.get("metrics", {}))
+    checkpoints_dir = resolved_run_dir / "checkpoints"
+    best_path = resolved_run_dir / "checkpoint_best.pt"
+    final_path = resolved_run_dir / "checkpoint_final.pt"
+    progress_path = resolved_run_dir / "progress.jsonl"
+
+    return {
+        "run_name": resolved_run_dir.name,
+        "run_dir": str(resolved_run_dir),
+        "progress_log_path": str(progress_path),
+        "checkpoints_dir": str(checkpoints_dir),
+        "resume_checkpoint_path": str(resolved_checkpoint_path),
+        "checkpoint_best_path": str(best_path) if best_path.exists() else None,
+        "checkpoint_final_path": str(final_path) if final_path.exists() else None,
+        "stage1_checkpoint_path": payload.get("stage1_checkpoint_path"),
+        "cache_root": payload.get("cache_root"),
+        "config": config,
+        "steps": int(payload.get("steps", 0) or 0),
+        "metrics": metrics,
+    }
+
+
 def _validate_stage2_resume_payload(
     payload: dict[str, Any],
     *,

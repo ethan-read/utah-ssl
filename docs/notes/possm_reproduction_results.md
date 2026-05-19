@@ -16,6 +16,32 @@ Hyperparameters are intentionally summarized at a high level because the noteboo
 
 The earlier flat / suspicious stage-1 reconstruction loss behavior was traced to a data smoothing / stats mismatch. After fixing that, the reconstruction loss curve looked more normal.
 
+## Active Workflow Layout
+
+The active notebook is
+`analysis/active/ssl_experiments/s6_possm_maskedreconstruction.ipynb`. It is now
+intended to be a thin experiment driver: Colab setup, workflow switches,
+Stage-1 run/recover, Stage-2 run/recover/resume, and optional one-line reports.
+
+Reusable implementation lives in `analysis/active/ssl_experiments/possm_ssl`:
+
+- training/recovery helpers: `possm_ssl.training` and `possm_ssl.phoneme_finetune`
+- notebook display/diagnostic helpers: `possm_ssl.reporting`
+- sweep/launcher scripts: `possm_ssl/scripts`
+
+The old top-level `analysis/active/ssl_experiments/possm_stage*.py` script paths
+are compatibility wrappers. New script references should prefer
+`python -m possm_ssl.scripts.<script_name>` from
+`analysis/active/ssl_experiments`, or the direct files under
+`possm_ssl/scripts`.
+
+Reusable normalization stats should be treated as data artifacts rather than
+experiment outputs. The intended Drive organization is now under
+`/content/drive/MyDrive/utah_ssl/data/stats`; see
+`docs/notes/cache_and_stats_inventory.md` for the current paths. Stage 1 uses
+session-level stats for SSL segment sampling. Stage 2 uses global stats computed
+from the `competition_train` split and applies those same stats to validation.
+
 ## Temporal Patching / Emission Head Clarification
 
 The current POSSM stage-2 decoder is not doing Willett-style pre-GRU temporal patching.

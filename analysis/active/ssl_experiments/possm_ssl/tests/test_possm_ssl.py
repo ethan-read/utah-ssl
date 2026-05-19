@@ -31,10 +31,13 @@ from possm_ssl.phoneme_finetune import (
     _set_train_mode,
     _stage2_decoder_train_modules,
     _willett_gaussian_kernel_1d,
+    find_latest_possm_stage2_run_dir,
     recover_possm_stage1_encoder,
     recover_possm_stage1_sequence_components,
+    recover_possm_stage2_summary,
     run_possm_phoneme_finetuning,
 )
+from possm_ssl.reporting import display_possm_stage2_summary, summarize_possm_stage2_progress
 from possm_ssl.stage1_objectives import (
     MaskedReconstructionObjective,
     PlainReconstructionObjective,
@@ -1092,6 +1095,120 @@ class POSSMSSLTests(unittest.TestCase):
             )
             self.assertEqual(int(payload["model_state"]["gru.weight_ih_l0"].shape[1]), 7)
             self.assertTrue(any(key.startswith("conv.") for key in payload["model_state"].keys()))
+
+    def test_recover_possm_stage2_summary_prefers_latest_step_for_interrupted_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            checkpoint_path = _make_stage1_checkpoint(tmp_path, temporal_gru_hidden_size=7)
+            _write_tiny_canonical_probe_cache(tmp_path)
+            output_root = tmp_path / "stage2_runs"
+            summary = run_possm_phoneme_finetuning(
+                checkpoint_path=checkpoint_path,
+                cache_root=tmp_path,
+                output_root=output_root,
+                run_name="interrupted_run",
+                config=POSSMFinetuneConfig(
+                    seed=7,
+                    mode="probe_frozen",
+                    dataset="brain2text24",
+                    feature_mode="tx_sbp",
+                    data_mode="normalized",
+                    batch_size=1,
+                    num_steps=2,
+                    learning_rate=1e-3,
+                    encoder_learning_rate=3e-4,
+                    checkpoint_every_steps=1,
+                    input_smoothing_sigma_bins=2.0,
+                    gru_hidden_size=8,
+                    gru_num_layers=2,
+                    gru_dropout=0.0,
+                    conv_kernel_size=3,
+                    conv_stride=1,
+                ),
+                device=torch.device("cpu"),
+            )
+            Path(summary["checkpoint_final_path"]).unlink()
+
+            recovered = recover_possm_stage2_summary(output_root)
+            latest_run_dir = find_latest_possm_stage2_run_dir(output_root)
+
+            self.assertEqual(latest_run_dir.name, "interrupted_run")
+            self.assertIsNone(recovered["checkpoint_final_path"])
+            self.assertTrue(str(recovered["resume_checkpoint_path"]).endswith("step_000002.pt"))
+            self.assertEqual(recovered["run_name"], "interrupted_run")
+            self.assertEqual(recovered["stage1_checkpoint_path"], str(checkpoint_path))
+            self.assertEqual(recovered["cache_root"], str(tmp_path))
+            self.assertEqual(int(recovered["steps"]), 2)
+            self.assertEqual(int(recovered["config"]["num_steps"]), 2)
+            self.assertIn("val_ctc_bpphone", recovered["metrics"])
+
+    def test_run_possm_phoneme_finetuning_resume_from_latest_loads_step_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            checkpoint_path = _make_stage1_checkpoint(tmp_path, temporal_gru_hidden_size=7)
+            _write_tiny_canonical_probe_cache(tmp_path)
+            output_root = tmp_path / "stage2_runs"
+            config = POSSMFinetuneConfig(
+                seed=7,
+                mode="probe_frozen",
+                dataset="brain2text24",
+                feature_mode="tx_sbp",
+                data_mode="normalized",
+                batch_size=1,
+                num_steps=1,
+                learning_rate=1e-3,
+                encoder_learning_rate=3e-4,
+                checkpoint_every_steps=1,
+                input_smoothing_sigma_bins=2.0,
+                gru_hidden_size=8,
+                gru_num_layers=2,
+                gru_dropout=0.0,
+                conv_kernel_size=3,
+                conv_stride=1,
+            )
+            first_summary = run_possm_phoneme_finetuning(
+                checkpoint_path=checkpoint_path,
+                cache_root=tmp_path,
+                output_root=output_root,
+                run_name="resume_run",
+                config=config,
+                device=torch.device("cpu"),
+            )
+            step_path = Path(first_summary["checkpoints_dir"]) / "step_000001.pt"
+            self.assertTrue(step_path.exists())
+
+            resumed_summary = run_possm_phoneme_finetuning(
+                checkpoint_path=checkpoint_path,
+                cache_root=tmp_path,
+                output_root=output_root,
+                run_name="resume_run",
+                config=config,
+                device=torch.device("cpu"),
+                resume_from_latest=True,
+            )
+
+            self.assertEqual(resumed_summary["resumed_from_checkpoint"], str(step_path))
+            self.assertTrue(bool(resumed_summary["dynamic_batching_enabled"]))
+            self.assertEqual(int(resumed_summary["steps"]), 1)
+            final_payload = torch.load(resumed_summary["checkpoint_final_path"], map_location="cpu")
+            self.assertIn("optimizer_state", final_payload)
+            self.assertTrue(bool(final_payload["dynamic_batching_enabled"]))
+
+    def test_possm_reporting_helpers_tolerate_missing_progress(self) -> None:
+        summary = {
+            "run_name": "missing_progress",
+            "steps": 0,
+            "progress_log_path": "/tmp/does-not-exist-possm-progress.jsonl",
+            "resume_checkpoint_path": None,
+            "checkpoint_best_path": None,
+            "checkpoint_final_path": None,
+            "metrics": {},
+        }
+
+        self.assertTrue(summarize_possm_stage2_progress(summary).empty)
+        frames = display_possm_stage2_summary(summary)
+        self.assertEqual(len(frames["summary"]), 1)
+        self.assertTrue(frames["collapse"].empty)
 
     def test_run_possm_phoneme_finetuning_flushes_partial_accumulation_at_epoch_end(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

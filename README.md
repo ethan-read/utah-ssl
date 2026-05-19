@@ -12,6 +12,9 @@ Subset repository for the Utah-array SSL / transfer benchmark work.
   - small local smoke-test harness
 - `docs/notes/ssl_architecture_choices.md`
   - current architecture decision log
+- `analysis/active/ssl_experiments/possm_ssl`
+  - active POSSM reconstruction and phoneme fine-tuning helpers
+  - POSSM sweep/launcher scripts live in `possm_ssl/scripts`
 - `docs/paper_notes/`
   - paper architecture notes that informed the benchmark design
 
@@ -25,6 +28,16 @@ Subset repository for the Utah-array SSL / transfer benchmark work.
 ## Data / Outputs
 
 The full scaffold expects data and outputs to live outside the repo and be routed through environment variables.
+
+For the active SSL/POSSM notebooks, reusable Drive artifacts are organized under:
+
+- `/content/drive/MyDrive/utah_ssl/data/`
+  - cache roots such as `cache_v1` and `cache_v1_smoothed_sigma2p0`
+  - reusable normalization stats under `data/stats`
+- `/content/drive/MyDrive/utah_ssl/outputs/ssl_experiments/`
+  - experiment runs, checkpoints, logs, and plots
+
+See [`docs/notes/cache_and_stats_inventory.md`](docs/notes/cache_and_stats_inventory.md) before changing cache roots or normalization-stat paths.
 
 The main ones are:
 

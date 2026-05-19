@@ -37,9 +37,19 @@ from .model import (
 )
 from .phoneme_finetune import (
     POSSMFinetuneConfig,
+    find_latest_possm_stage2_run_dir,
     recover_possm_stage1_encoder,
     recover_possm_stage1_sequence_components,
+    recover_possm_stage2_summary,
     run_possm_phoneme_finetuning,
+)
+from .reporting import (
+    display_possm_stage1_report,
+    display_possm_stage2_report,
+    display_possm_stage2_summary,
+    run_possm_stage1_prediction_diagnostics,
+    run_possm_stage2_prediction_diagnostics,
+    summarize_possm_stage2_progress,
 )
 from .training import (
     POSSMTrainingConfig,
@@ -61,6 +71,10 @@ __all__ = [
     "POSSMTrainingConfig",
     "SessionInputAdapterBank",
     "build_possm_segment_sampler",
+    "display_possm_stage1_report",
+    "display_possm_stage2_report",
+    "display_possm_stage2_summary",
+    "find_latest_possm_stage2_run_dir",
     "list_possm_checkpoints",
     "list_registered_temporal_backbones",
     "load_precomputed_session_feature_stats_into_cache_context",
@@ -68,10 +82,14 @@ __all__ = [
     "recover_possm_run_state_from_checkpoint",
     "recover_possm_stage1_encoder",
     "recover_possm_stage1_sequence_components",
+    "recover_possm_stage2_summary",
     "resolve_possm_checkpoint_path",
     "resume_possm_training",
+    "run_possm_stage1_prediction_diagnostics",
+    "run_possm_stage2_prediction_diagnostics",
     "run_possm_phoneme_finetuning",
     "run_possm_training",
+    "summarize_possm_stage2_progress",
     "causal_conv_output_lengths",
     "register_temporal_backbone",
 ]
