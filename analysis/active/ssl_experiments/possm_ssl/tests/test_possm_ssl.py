@@ -1255,6 +1255,56 @@ class POSSMSSLTests(unittest.TestCase):
             self.assertIn("optimizer_state", final_payload)
             self.assertTrue(bool(final_payload["dynamic_batching_enabled"]))
 
+    def test_run_possm_phoneme_finetuning_resume_tolerates_older_config_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            checkpoint_path = _make_stage1_checkpoint(tmp_path, temporal_gru_hidden_size=7)
+            _write_tiny_canonical_probe_cache(tmp_path)
+            output_root = tmp_path / "stage2_runs"
+            config = POSSMFinetuneConfig(
+                seed=7,
+                mode="probe_frozen",
+                dataset="brain2text24",
+                feature_mode="tx_sbp",
+                data_mode="normalized",
+                batch_size=1,
+                num_steps=1,
+                learning_rate=1e-3,
+                encoder_learning_rate=3e-4,
+                checkpoint_every_steps=1,
+                input_smoothing_sigma_bins=2.0,
+                gru_hidden_size=8,
+                gru_num_layers=2,
+                gru_dropout=0.0,
+                conv_kernel_size=3,
+                conv_stride=1,
+            )
+            first_summary = run_possm_phoneme_finetuning(
+                checkpoint_path=checkpoint_path,
+                cache_root=tmp_path,
+                output_root=output_root,
+                run_name="resume_old_config_run",
+                config=config,
+                device=torch.device("cpu"),
+            )
+            step_path = Path(first_summary["checkpoints_dir"]) / "step_000001.pt"
+            payload = torch.load(step_path, map_location="cpu")
+            assert isinstance(payload["config"], dict)
+            payload["config"].pop("precomputed_split_stats_path", None)
+            torch.save(payload, step_path)
+
+            resumed_summary = run_possm_phoneme_finetuning(
+                checkpoint_path=checkpoint_path,
+                cache_root=tmp_path,
+                output_root=output_root,
+                run_name="resume_old_config_run",
+                config=config,
+                device=torch.device("cpu"),
+                resume_from_latest=True,
+            )
+
+            self.assertEqual(resumed_summary["resumed_from_checkpoint"], str(step_path))
+
     def test_possm_reporting_helpers_tolerate_missing_progress(self) -> None:
         summary = {
             "run_name": "missing_progress",

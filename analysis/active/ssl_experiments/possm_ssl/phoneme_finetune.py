@@ -820,9 +820,10 @@ def _validate_stage2_resume_payload(
             "Resume checkpoint stage-1 path does not match requested stage-1 checkpoint. "
             f"resume={payload_stage1} requested={resolved_checkpoint_path}"
         )
-    payload_config = payload.get("config")
-    if not isinstance(payload_config, dict):
+    raw_payload_config = payload.get("config")
+    if not isinstance(raw_payload_config, dict):
         raise TypeError("Resume checkpoint is missing a valid stage-2 config payload.")
+    payload_config = asdict(POSSMFinetuneConfig(**raw_payload_config))
     expected_config = asdict(resolved_config)
     if payload_config != expected_config:
         raise ValueError(
