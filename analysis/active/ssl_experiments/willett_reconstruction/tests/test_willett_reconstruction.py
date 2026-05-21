@@ -126,6 +126,7 @@ class WillettReconstructionTest(unittest.TestCase):
             vocab_size=4,
             patch_size=3,
             patch_stride=2,
+            input_projection_size=5,
             session_adapter_keys=("t12.2022.08.10",),
             session_adapter_enabled=True,
         )
@@ -137,7 +138,35 @@ class WillettReconstructionTest(unittest.TestCase):
             session_ids=["t12.2022.08.10", "t12.2022.08.10"],
         )
         self.assertEqual(outputs["token_lengths"].tolist(), [patched_length(5, patch_size=3, patch_stride=2), patched_length(2, patch_size=3, patch_stride=2)])
+        self.assertEqual(int(outputs["adapted_input"].shape[-1]), 5)
+        self.assertEqual(int(outputs["patched_inputs"].shape[-1]), 15)
         self.assertEqual(int(outputs["logits"].shape[-1]), 4)
+
+    def test_model_uses_shared_input_network_when_session_adaptation_disabled(self) -> None:
+        model = WillettPhonemeModel(
+            input_dim=3,
+            vocab_size=4,
+            patch_size=2,
+            patch_stride=1,
+            input_projection_size=6,
+            session_adapter_keys=(),
+            session_adapter_enabled=False,
+            gru_hidden_size=8,
+            gru_num_layers=1,
+            gru_dropout=0.0,
+        )
+        x = torch.randn(2, 4, 3)
+        lengths = torch.tensor([4, 3], dtype=torch.long)
+        outputs = model(x, lengths)
+        self.assertEqual(int(outputs["adapted_input"].shape[-1]), 6)
+        self.assertEqual(int(outputs["patched_inputs"].shape[-1]), 12)
+        self.assertEqual(
+            outputs["token_lengths"].tolist(),
+            [
+                patched_length(4, patch_size=2, patch_stride=1),
+                patched_length(3, patch_size=2, patch_stride=1),
+            ],
+        )
 
     def test_short_training_run_writes_outputs_and_can_resume(self) -> None:
         cache_root = Path(self._tmp_dir())
