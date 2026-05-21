@@ -1,0 +1,306 @@
+"""Native cache data helpers for Willett reconstruction."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import torch
+
+try:
+    from masked_ssl.cache import _cache_variant_name, _canonical_stats_root_for_cache
+    from masked_ssl.probe import (
+        CanonicalSequenceDataset,
+        LengthAwareBatchSampler,
+        build_competition_split_problem,
+        canonical_rows_padded_time_percentile,
+        collate_sequence_batch,
+        compute_feature_stats,
+    )
+except ModuleNotFoundError:  # pragma: no cover - repo-root unittest fallback
+    from analysis.active.ssl_experiments.masked_ssl.cache import (
+        _cache_variant_name,
+        _canonical_stats_root_for_cache,
+    )
+    from analysis.active.ssl_experiments.masked_ssl.probe import (
+        CanonicalSequenceDataset,
+        LengthAwareBatchSampler,
+        build_competition_split_problem,
+        canonical_rows_padded_time_percentile,
+        collate_sequence_batch,
+        compute_feature_stats,
+    )
+
+
+@dataclass(frozen=True)
+class WillettInputTransformConfig:
+    input_smoothing_sigma_bins: float = 2.0
+    input_smoothing_kernel_size: int = 100
+    input_smoothing_threshold: float = 0.01
+    white_noise_sd: float = 1.0
+    constant_offset_sd: float = 0.2
+
+
+def normalization_key_for_row(row: Any) -> str:
+    block_num = getattr(row, "block_num", None)
+    if block_num is not None:
+        return f"{row.session_id}::block:{int(block_num)}"
+    normalization_group = getattr(row, "normalization_group", None)
+    if normalization_group is not None:
+        return str(normalization_group)
+    return str(row.session_id)
+
+
+def _willett_gaussian_kernel_1d(
+    *,
+    sigma_bins: float,
+    kernel_size: int,
+    threshold: float,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    sigma = float(sigma_bins)
+    if sigma <= 0.0:
+        return torch.ones((1,), device=device, dtype=dtype)
+    positions = torch.arange(int(kernel_size), device=device, dtype=dtype) - float(int(kernel_size) // 2)
+    kernel = torch.exp(-0.5 * (positions / sigma).pow(2))
+    kernel = kernel / kernel.sum().clamp_min(1e-8)
+    keep = kernel > float(threshold)
+    if not bool(keep.any().item()):
+        keep[int(kernel.numel() // 2)] = True
+    kept_positions = torch.nonzero(keep, as_tuple=False).squeeze(1)
+    start = int(kept_positions.min().item())
+    stop = int(kept_positions.max().item()) + 1
+    kernel = kernel[start:stop]
+    if int(kernel.numel()) % 2 == 0:
+        kernel = torch.cat([kernel, kernel.new_zeros((1,))], dim=0)
+    return kernel / kernel.sum().clamp_min(1e-8)
+
+
+def _sequence_mask_from_lengths(lengths: torch.Tensor, max_time: int) -> torch.Tensor:
+    return torch.arange(max_time, device=lengths.device).unsqueeze(0) < lengths.unsqueeze(1)
+
+
+def smooth_batch_like_willett(
+    x: torch.Tensor,
+    input_lengths: torch.Tensor,
+    *,
+    sigma_bins: float,
+    kernel_size: int,
+    threshold: float,
+) -> torch.Tensor:
+    if float(sigma_bins) <= 0.0 or int(x.shape[1]) <= 1:
+        return x
+    kernel = _willett_gaussian_kernel_1d(
+        sigma_bins=float(sigma_bins),
+        kernel_size=int(kernel_size),
+        threshold=float(threshold),
+        device=x.device,
+        dtype=x.dtype,
+    )
+    channels = int(x.shape[-1])
+    weight = kernel.view(1, 1, -1).expand(channels, 1, -1)
+    smoothed = torch.nn.functional.conv1d(
+        x.transpose(1, 2),
+        weight,
+        padding=int(kernel.numel() // 2),
+        groups=channels,
+    ).transpose(1, 2)
+    valid = _sequence_mask_from_lengths(input_lengths.to(x.device), int(x.shape[1]))
+    return smoothed * valid.unsqueeze(-1).to(smoothed.dtype)
+
+
+def prepare_willett_inputs(
+    x: torch.Tensor,
+    input_lengths: torch.Tensor,
+    *,
+    config: WillettInputTransformConfig,
+    is_training: bool,
+) -> torch.Tensor:
+    transformed = x
+    if is_training and float(config.white_noise_sd) > 0.0:
+        transformed = transformed + torch.randn_like(transformed) * float(config.white_noise_sd)
+    if is_training and float(config.constant_offset_sd) > 0.0:
+        transformed = transformed + torch.randn(
+            (int(transformed.shape[0]), 1, int(transformed.shape[2])),
+            device=transformed.device,
+            dtype=transformed.dtype,
+        ) * float(config.constant_offset_sd)
+    return smooth_batch_like_willett(
+        transformed,
+        input_lengths,
+        sigma_bins=float(config.input_smoothing_sigma_bins),
+        kernel_size=int(config.input_smoothing_kernel_size),
+        threshold=float(config.input_smoothing_threshold),
+    )
+
+
+def build_willett_problem(
+    *,
+    cache_root: str | Path,
+    dataset: str,
+    feature_mode: str,
+    boundary_key_mode: str,
+) -> dict[str, Any]:
+    return build_competition_split_problem(
+        cache_root=Path(cache_root),
+        dataset=str(dataset),
+        feature_mode=str(feature_mode),
+        boundary_key_mode=str(boundary_key_mode),
+    )
+
+
+def compute_willett_normalization_stats(
+    rows: tuple[Any, ...] | list[Any],
+    *,
+    cache_root: Path,
+    feature_mode: str,
+    mode: str,
+) -> dict[str, tuple[np.ndarray, np.ndarray]] | tuple[np.ndarray, np.ndarray] | None:
+    resolved_mode = str(mode)
+    if resolved_mode == "none":
+        return None
+    if resolved_mode == "global":
+        return compute_feature_stats(
+            rows,
+            cache_root=cache_root,
+            mode="global",
+            feature_mode=feature_mode,
+        )
+    if resolved_mode == "per_session":
+        return compute_feature_stats(
+            rows,
+            cache_root=cache_root,
+            mode="per_session",
+            feature_mode=feature_mode,
+        )
+    if resolved_mode != "block":
+        raise ValueError("mode must be one of {'block', 'global', 'per_session', 'none'}")
+
+    accessor = CanonicalSequenceDataset(rows, cache_root=cache_root, stats=None, feature_mode=feature_mode)._accessor
+    try:
+        grouped: dict[str, list[Any]] = {}
+        for row in rows:
+            grouped.setdefault(normalization_key_for_row(row), []).append(row)
+        stats: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        for key, group_rows in grouped.items():
+            total_count = 0
+            sum_x = None
+            sum_x2 = None
+            for row in group_rows:
+                x = accessor.load_features(row, feature_mode=feature_mode)
+                x64 = x.astype(np.float64, copy=False)
+                if sum_x is None:
+                    sum_x = x64.sum(axis=0)
+                    sum_x2 = np.square(x64).sum(axis=0)
+                else:
+                    sum_x += x64.sum(axis=0)
+                    sum_x2 += np.square(x64).sum(axis=0)
+                total_count += int(x.shape[0])
+            if sum_x is None or sum_x2 is None or total_count <= 0:
+                raise ValueError(f"Cannot compute block stats for empty group {key!r}.")
+            mean = sum_x / total_count
+            var = np.maximum(sum_x2 / total_count - np.square(mean), 1e-6)
+            stats[str(key)] = (
+                mean.astype(np.float32, copy=False),
+                np.sqrt(var).astype(np.float32, copy=False),
+            )
+        return stats
+    finally:
+        accessor.close()
+
+
+def resolve_precomputed_split_stats_path(
+    *,
+    cache_root: str | Path,
+    dataset: str,
+    train_split_name: str,
+    feature_mode: str,
+    preferred_path: str | Path | None,
+) -> Path | None:
+    if preferred_path is not None:
+        path = Path(preferred_path)
+        return path if path.exists() else None
+    stats_dir = (
+        _canonical_stats_root_for_cache(cache_root)
+        / "split_feature_stats"
+        / _cache_variant_name(cache_root)
+        / str(dataset)
+        / str(train_split_name)
+        / str(feature_mode)
+    )
+    preferred = stats_dir / "global_v1.pt"
+    if preferred.exists():
+        return preferred
+    candidates = sorted(stats_dir.glob("*.pt"))
+    if len(candidates) == 1:
+        return candidates[0]
+    return None
+
+
+def load_precomputed_split_feature_stats(
+    *,
+    stats_path: str | Path,
+    expected_dim: int,
+) -> tuple[tuple[np.ndarray, np.ndarray], dict[str, Any], Path]:
+    path = Path(stats_path)
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    if not isinstance(payload, dict):
+        raise ValueError(f"Precomputed split stats payload must be a dict: {path}")
+    mean_t = torch.as_tensor(payload.get("mean")).float().cpu()
+    std_t = torch.as_tensor(payload.get("std")).float().cpu()
+    if mean_t.numel() < expected_dim or std_t.numel() < expected_dim:
+        raise ValueError(
+            f"Precomputed split stats payload is too small: expected at least {expected_dim} values, "
+            f"got mean={mean_t.numel()} std={std_t.numel()}."
+        )
+    return (
+        mean_t[:expected_dim].numpy().astype(np.float32, copy=False),
+        std_t[:expected_dim].numpy().astype(np.float32, copy=False),
+    ), dict(payload.get("metadata", {})), path
+
+
+def make_length_aware_batch_sampler(
+    rows: tuple[Any, ...] | list[Any],
+    *,
+    batch_size: int,
+    shuffle: bool,
+    seed: int,
+) -> LengthAwareBatchSampler:
+    p95_train_input_length = canonical_rows_padded_time_percentile(rows, percentile=95.0)
+    max_examples_per_microbatch = int(batch_size)
+    max_padded_time_per_microbatch = int(max_examples_per_microbatch * p95_train_input_length)
+    return LengthAwareBatchSampler(
+        rows,
+        max_examples_per_microbatch=max_examples_per_microbatch,
+        max_padded_time_per_microbatch=max_padded_time_per_microbatch,
+        shuffle=bool(shuffle),
+        seed=int(seed),
+    )
+
+
+def loader_kwargs(device: torch.device) -> dict[str, Any]:
+    return {
+        "num_workers": 0,
+        "pin_memory": device.type == "cuda",
+        "collate_fn": collate_sequence_batch,
+    }
+
+
+__all__ = [
+    "CanonicalSequenceDataset",
+    "WillettInputTransformConfig",
+    "build_willett_problem",
+    "compute_willett_normalization_stats",
+    "collate_sequence_batch",
+    "compute_feature_stats",
+    "load_precomputed_split_feature_stats",
+    "loader_kwargs",
+    "make_length_aware_batch_sampler",
+    "normalization_key_for_row",
+    "prepare_willett_inputs",
+    "resolve_precomputed_split_stats_path",
+    "smooth_batch_like_willett",
+]

@@ -324,6 +324,8 @@ class CanonicalProbeManifestRow:
     target_length: int | None
     transcript: str
     n_time_bins: int | None = None
+    block_num: int | None = None
+    normalization_group: str | None = None
 
 
 @dataclass(frozen=True)
@@ -437,6 +439,12 @@ def _load_canonical_probe_manifest(manifest_path: Path) -> list[CanonicalProbeMa
                     target_length=int(payload["target_length"]) if payload.get("target_length") is not None else None,
                     transcript=str(payload.get("transcript", payload.get("transcription", ""))),
                     n_time_bins=int(payload["n_time_bins"]) if payload.get("n_time_bins") is not None else None,
+                    block_num=int(payload["block_num"]) if payload.get("block_num") is not None else None,
+                    normalization_group=(
+                        str(payload["normalization_group"])
+                        if payload.get("normalization_group") is not None
+                        else None
+                    ),
                 )
             )
     return rows
@@ -712,7 +720,22 @@ def apply_feature_stats(
     stats: dict[str, tuple[np.ndarray, np.ndarray]] | tuple[np.ndarray, np.ndarray],
 ) -> np.ndarray:
     if isinstance(stats, dict):
-        mean, std = stats[row.session_id]
+        candidate_keys: list[str] = []
+        if row.block_num is not None:
+            candidate_keys.append(f"{row.session_id}::block:{int(row.block_num)}")
+        if row.normalization_group is not None:
+            candidate_keys.append(str(row.normalization_group))
+        candidate_keys.append(row.session_id)
+        mean = std = None
+        for key in candidate_keys:
+            pair = stats.get(key)
+            if pair is not None:
+                mean, std = pair
+                break
+        if mean is None or std is None:
+            raise KeyError(
+                f"No feature stats found for row {row.example_id} using keys {candidate_keys!r}."
+            )
     else:
         mean, std = stats
     return ((x - mean) / std).astype(np.float32, copy=False)
