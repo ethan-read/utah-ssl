@@ -4,6 +4,7 @@ import json
 import sys
 import tempfile
 import unittest
+from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -507,6 +508,18 @@ class POSSMSSLTests(unittest.TestCase):
                 path.touch()
 
             self.assertEqual(resolve_latest_possm_checkpoint_path(run_dir=run_dir), step)
+
+    def test_resolve_latest_possm_checkpoint_path_prefers_final_when_it_is_ahead(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            run_dir = Path(tmpdir) / "stage1_run"
+            checkpoints_dir = run_dir / "checkpoints"
+            checkpoints_dir.mkdir(parents=True)
+            step = checkpoints_dir / "step_004000_20260519T000000Z.pt"
+            final = run_dir / "checkpoint_final.pt"
+            torch.save({"step": 4000}, step)
+            torch.save({"step": 4200}, final)
+
+            self.assertEqual(resolve_latest_possm_checkpoint_path(run_dir=run_dir), final)
 
     def test_prune_possm_resumable_checkpoints_keeps_latest_n(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1279,6 +1292,29 @@ class POSSMSSLTests(unittest.TestCase):
             self.assertEqual(int(recovered["steps"]), 2)
             self.assertEqual(int(recovered["config"]["num_steps"]), 2)
             self.assertIn("val_ctc_bpphone", recovered["metrics"])
+
+    def test_recover_possm_stage2_summary_prefers_final_when_it_is_ahead(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_root = Path(tmpdir) / "stage2_runs"
+            run_dir = output_root / "stage2_run"
+            checkpoints_dir = run_dir / "checkpoints"
+            checkpoints_dir.mkdir(parents=True)
+            config = asdict(POSSMFinetuneConfig(num_steps=4200))
+            common_payload = {
+                "stage": "stage2_phoneme_finetune",
+                "stage1_checkpoint_path": "stage1.pt",
+                "cache_root": str(Path(tmpdir) / "cache"),
+                "config": config,
+                "metrics": {"val_ctc_bpphone": 1.0},
+            }
+            torch.save({**common_payload, "steps": 4000}, checkpoints_dir / "step_004000.pt")
+            torch.save({**common_payload, "steps": 4200}, run_dir / "checkpoint_final.pt")
+            torch.save({**common_payload, "steps": 3900}, run_dir / "checkpoint_best.pt")
+
+            recovered = recover_possm_stage2_summary(output_root)
+
+            self.assertEqual(recovered["resume_checkpoint_path"], str(run_dir / "checkpoint_final.pt"))
+            self.assertEqual(int(recovered["steps"]), 4200)
 
     def test_run_possm_phoneme_finetuning_resume_from_latest_loads_step_checkpoint(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

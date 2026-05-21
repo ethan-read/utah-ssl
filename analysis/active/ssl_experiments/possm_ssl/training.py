@@ -420,6 +420,25 @@ def find_latest_possm_step_checkpoint(checkpoints_dir: str | Path) -> Path | Non
     return latest_path
 
 
+def _checkpoint_payload_step(path: Path) -> int | None:
+    parsed_step = _parse_step_from_checkpoint_name(path.name)
+    if parsed_step is not None:
+        return int(parsed_step)
+    try:
+        payload = torch.load(path, map_location="cpu")
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    raw_step = payload.get("step", payload.get("steps"))
+    if raw_step is None:
+        return None
+    try:
+        return int(raw_step)
+    except (TypeError, ValueError):
+        return None
+
+
 def resolve_latest_possm_checkpoint_path(
     *,
     output_root: str | Path | None = None,
@@ -433,16 +452,18 @@ def resolve_latest_possm_checkpoint_path(
         return candidate
 
     def latest_checkpoint_for_run(candidate_run_dir: Path) -> Path | None:
+        candidates: list[tuple[int, int, int, Path]] = []
         latest_step = find_latest_possm_step_checkpoint(candidate_run_dir / "checkpoints")
-        if latest_step is not None:
-            return latest_step
         final = candidate_run_dir / "checkpoint_final.pt"
-        if final.exists():
-            return final
         best = candidate_run_dir / "checkpoint_best.pt"
-        if best.exists():
-            return best
-        return None
+        for priority, candidate_path in ((2, latest_step), (1, final), (0, best)):
+            if candidate_path is None or not candidate_path.exists():
+                continue
+            step = _checkpoint_payload_step(candidate_path)
+            candidates.append((int(step or -1), int(priority), int(candidate_path.stat().st_mtime_ns), candidate_path))
+        if not candidates:
+            return None
+        return max(candidates, key=lambda item: (item[0], item[1], item[2]))[3]
 
     if run_dir is not None:
         resolved = latest_checkpoint_for_run(Path(run_dir))

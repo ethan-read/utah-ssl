@@ -33,7 +33,11 @@ from masked_ssl.probe import (
 )
 
 from .model import POSSMEncoder, POSSMPhonemeModel, build_temporal_backbone
-from .training import find_latest_possm_step_checkpoint, prune_possm_resumable_checkpoints
+from .training import (
+    find_latest_possm_step_checkpoint,
+    prune_possm_resumable_checkpoints,
+    resolve_latest_possm_checkpoint_path,
+)
 
 
 @dataclass
@@ -754,17 +758,10 @@ def recover_possm_stage2_summary(
         resolved_run_dir = _stage2_run_dir_for_checkpoint(resolved_checkpoint_path)
     else:
         resolved_run_dir = Path(run_dir) if run_dir is not None else find_latest_possm_stage2_run_dir(root)
-        latest_step_path = _find_latest_step_checkpoint(resolved_run_dir / "checkpoints")
-        final_candidate = resolved_run_dir / "checkpoint_final.pt"
-        best_candidate = resolved_run_dir / "checkpoint_best.pt"
-        if latest_step_path is not None:
-            resolved_checkpoint_path = latest_step_path
-        elif final_candidate.exists():
-            resolved_checkpoint_path = final_candidate
-        elif best_candidate.exists():
-            resolved_checkpoint_path = best_candidate
-        else:
-            raise FileNotFoundError(f"No POSSM Stage-2 checkpoints found for run dir: {resolved_run_dir}")
+        try:
+            resolved_checkpoint_path = resolve_latest_possm_checkpoint_path(run_dir=resolved_run_dir)
+        except RuntimeError as exc:
+            raise FileNotFoundError(f"No POSSM Stage-2 checkpoints found for run dir: {resolved_run_dir}") from exc
 
     if not resolved_checkpoint_path.exists():
         raise FileNotFoundError(f"Stage-2 checkpoint does not exist: {resolved_checkpoint_path}")
