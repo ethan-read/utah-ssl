@@ -54,6 +54,7 @@ class POSSMFinetuneConfig:
     encoder_learning_rate: float = 3e-4
     weight_decay: float = 1e-2
     max_grad_norm: float = 1.0
+    val_every_steps: int = 100
     checkpoint_every_steps: int = 200
     checkpoint_keep_last: int | None = 2
     progress_every_steps: int = 25
@@ -116,6 +117,8 @@ class POSSMFinetuneConfig:
             raise ValueError("weight_decay must be non-negative")
         if float(self.max_grad_norm) <= 0.0:
             raise ValueError("max_grad_norm must be positive")
+        if int(self.val_every_steps) <= 0:
+            raise ValueError("val_every_steps must be positive")
         if int(self.checkpoint_every_steps) <= 0:
             raise ValueError("checkpoint_every_steps must be positive")
         if self.checkpoint_keep_last is not None and int(self.checkpoint_keep_last) < 0:
@@ -1125,11 +1128,13 @@ def run_possm_phoneme_finetuning(
             )
             start_time = time.time() - resume_elapsed_seconds
 
-    def maybe_evaluate_and_checkpoint(*, force: bool = False) -> dict[str, Any] | None:
-        nonlocal last_eval_step, best_metrics, best_payload, best_step
+    latest_eval_metrics: dict[str, Any] | None = None
+
+    def maybe_evaluate(*, force: bool = False) -> dict[str, Any] | None:
+        nonlocal last_eval_step, best_metrics, best_payload, best_step, latest_eval_metrics
         if steps <= 0:
             return None
-        should_run = force or steps % int(effective_config.checkpoint_every_steps) == 0
+        should_run = force or steps == 1 or steps % int(effective_config.val_every_steps) == 0
         if not should_run or steps == last_eval_step:
             return None
         metrics = evaluate_possm_phoneme_metrics(
@@ -1141,7 +1146,9 @@ def run_possm_phoneme_finetuning(
         )
         metrics["model_num_parameters"] = _count_trainable_parameters(model)
         metrics["encoder_num_parameters"] = _count_trainable_sequence_encoder_parameters(model)
+        collapse = dict(metrics.get("collapse_diagnostics") or {})
         last_eval_step = steps
+        latest_eval_metrics = dict(metrics)
         _emit_progress(
             progress_log_path,
             event="phoneme_val_report",
@@ -1151,26 +1158,52 @@ def run_possm_phoneme_finetuning(
             mode=str(effective_config.mode),
             data_mode=effective_data_mode,
             feature_mode=effective_feature_mode,
+            blank_frame_rate=collapse.get("blank_frame_rate"),
+            predicted_to_reference_token_ratio=collapse.get("predicted_to_reference_token_ratio"),
             **metrics,
         )
-        payload = _checkpoint_payload(
-            model=model,
-            optimizer=optimizer,
-            resolved_config=effective_config,
-            resolved_checkpoint_path=resolved_checkpoint_path,
-            checkpoint_cfg=checkpoint_cfg,
-            problem=problem,
-            train_rows=problem["train_rows"],
-            val_rows=problem["val_rows"],
-            session_adapter_keys=session_adapter_keys,
-            steps=steps,
-            metrics=metrics,
-            checkpoint_kind="step" if not force else "final_eval",
-            elapsed_seconds=round(time.time() - start_time, 3),
-            batching_diagnostics=batching_diagnostics,
-        )
+        if best_metrics is None or float(metrics["val_ctc_bpphone"]) < float(best_metrics["val_ctc_bpphone"]):
+            best_metrics = dict(metrics)
+            best_payload = _checkpoint_payload(
+                model=model,
+                optimizer=optimizer,
+                resolved_config=effective_config,
+                resolved_checkpoint_path=resolved_checkpoint_path,
+                checkpoint_cfg=checkpoint_cfg,
+                problem=problem,
+                train_rows=problem["train_rows"],
+                val_rows=problem["val_rows"],
+                session_adapter_keys=session_adapter_keys,
+                steps=steps,
+                metrics=metrics,
+                checkpoint_kind="best",
+                elapsed_seconds=round(time.time() - start_time, 3),
+                batching_diagnostics=batching_diagnostics,
+            )
+            best_step = int(steps)
+            torch.save(best_payload, checkpoint_best_path)
+        return metrics
+
+    def maybe_save_resumable_checkpoint() -> None:
         if checkpoints_dir is not None and steps % int(effective_config.checkpoint_every_steps) == 0:
             checkpoints_dir.mkdir(parents=True, exist_ok=True)
+            step_metrics = dict(latest_eval_metrics) if latest_eval_metrics is not None else {}
+            payload = _checkpoint_payload(
+                model=model,
+                optimizer=optimizer,
+                resolved_config=effective_config,
+                resolved_checkpoint_path=resolved_checkpoint_path,
+                checkpoint_cfg=checkpoint_cfg,
+                problem=problem,
+                train_rows=problem["train_rows"],
+                val_rows=problem["val_rows"],
+                session_adapter_keys=session_adapter_keys,
+                steps=steps,
+                metrics=step_metrics,
+                checkpoint_kind="step",
+                elapsed_seconds=round(time.time() - start_time, 3),
+                batching_diagnostics=batching_diagnostics,
+            )
             step_checkpoint_path = checkpoints_dir / f"step_{int(steps):06d}.pt"
             torch.save(payload, step_checkpoint_path)
             for deleted_checkpoint in prune_possm_resumable_checkpoints(
@@ -1178,12 +1211,6 @@ def run_possm_phoneme_finetuning(
                 keep_last=effective_config.checkpoint_keep_last,
             ):
                 print("pruned_step_checkpoint:", deleted_checkpoint)
-        if best_metrics is None or float(metrics["val_ctc_bpphone"]) < float(best_metrics["val_ctc_bpphone"]):
-            best_metrics = dict(metrics)
-            best_payload = payload
-            best_step = int(steps)
-            torch.save(best_payload, checkpoint_best_path)
-        return metrics
 
     accumulated_examples = 0
     accumulated_target_count = 0
@@ -1292,7 +1319,8 @@ def run_possm_phoneme_finetuning(
 
             if accumulated_examples >= int(effective_config.batch_size):
                 flush_pending_gradients()
-                maybe_evaluate_and_checkpoint()
+                maybe_evaluate()
+                maybe_save_resumable_checkpoint()
                 if steps >= int(effective_config.num_steps):
                     break
         if not made_progress:
@@ -1300,9 +1328,10 @@ def run_possm_phoneme_finetuning(
         if steps >= int(effective_config.num_steps):
             break
         flush_pending_gradients()
-        maybe_evaluate_and_checkpoint()
+        maybe_evaluate()
+        maybe_save_resumable_checkpoint()
 
-    final_metrics = maybe_evaluate_and_checkpoint(force=True)
+    final_metrics = maybe_evaluate(force=True)
     if final_metrics is None:
         final_metrics = evaluate_possm_phoneme_metrics(
             model=model,
