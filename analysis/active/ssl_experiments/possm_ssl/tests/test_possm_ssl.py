@@ -48,7 +48,10 @@ from possm_ssl.training import (
     POSSMTrainingConfig,
     build_possm_segment_sampler,
     compute_reconstruction_metrics,
+    find_latest_possm_step_checkpoint,
+    prune_possm_resumable_checkpoints,
     recover_possm_run_state_from_checkpoint,
+    resolve_latest_possm_checkpoint_path,
     run_possm_training,
 )
 
@@ -479,6 +482,80 @@ def _make_inconsistent_stage1_checkpoint_missing_temporal_weights(tmp_path: Path
 
 
 class POSSMSSLTests(unittest.TestCase):
+    def test_find_latest_possm_step_checkpoint_prefers_highest_step(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            checkpoints_dir = Path(tmpdir) / "checkpoints"
+            checkpoints_dir.mkdir()
+            older = checkpoints_dir / "step_000003_20260519T000000Z.pt"
+            latest = checkpoints_dir / "checkpoint_final_step_000020_20260519T000000Z.pt"
+            step = checkpoints_dir / "step_000010_20260519T000000Z.pt"
+            malformed = checkpoints_dir / "step_latest.pt"
+            for path in (older, step, latest, malformed):
+                path.touch()
+
+            self.assertEqual(find_latest_possm_step_checkpoint(checkpoints_dir), latest)
+
+    def test_resolve_latest_possm_checkpoint_path_prefers_step_over_best_and_final(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            run_dir = Path(tmpdir) / "stage1_run"
+            checkpoints_dir = run_dir / "checkpoints"
+            checkpoints_dir.mkdir(parents=True)
+            best = run_dir / "checkpoint_best.pt"
+            final = run_dir / "checkpoint_final.pt"
+            step = checkpoints_dir / "step_000005_20260519T000000Z.pt"
+            for path in (best, final, step):
+                path.touch()
+
+            self.assertEqual(resolve_latest_possm_checkpoint_path(run_dir=run_dir), step)
+
+    def test_prune_possm_resumable_checkpoints_keeps_latest_n(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            checkpoints_dir = Path(tmpdir) / "checkpoints"
+            checkpoints_dir.mkdir()
+            old_step = checkpoints_dir / "step_000001_20260519T000000Z.pt"
+            latest_step = checkpoints_dir / "step_000003_20260519T000000Z.pt"
+            old_final_archive = checkpoints_dir / "checkpoint_final_step_000002_20260519T000000Z.pt"
+            for path in (old_step, old_final_archive, latest_step):
+                path.touch()
+
+            deleted = prune_possm_resumable_checkpoints(checkpoints_dir, keep_last=1)
+
+            self.assertEqual({path.name for path in deleted}, {old_step.name, old_final_archive.name})
+            self.assertFalse(old_step.exists())
+            self.assertFalse(old_final_archive.exists())
+            self.assertTrue(latest_step.exists())
+
+    def test_run_possm_training_retains_only_configured_step_checkpoints(self) -> None:
+        cache_context = _make_sampling_cache_context()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            run_state = run_possm_training(
+                cache_context=cache_context,
+                config=POSSMTrainingConfig(
+                    feature_mode="tx_sbp",
+                    data_mode="normalized",
+                    segment_bins=4,
+                    model_dim=4,
+                    latent_count=4,
+                    ffn_hidden_size=16,
+                    dropout=0.0,
+                    batch_size=1,
+                    num_steps=3,
+                    val_every=1,
+                    val_batches=1,
+                    checkpoint_every_steps=1,
+                    checkpoint_keep_last=1,
+                    log_every=1,
+                ),
+                output_root=Path(tmpdir),
+                device=torch.device("cpu"),
+            )
+
+            checkpoint_names = sorted(path.name for path in Path(run_state["checkpoints_dir"]).glob("*.pt"))
+            self.assertEqual(len(checkpoint_names), 1)
+            self.assertTrue(checkpoint_names[0].startswith("step_000003_"))
+            self.assertTrue(Path(run_state["checkpoint_path"]).exists())
+            self.assertTrue(Path(run_state["best_checkpoint_path"]).exists())
+
     def test_stage1_reconstruction_shapes_match_input(self) -> None:
         model = POSSMReconstructionModel(
             input_dim=5,

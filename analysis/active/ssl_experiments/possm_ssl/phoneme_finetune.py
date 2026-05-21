@@ -33,6 +33,7 @@ from masked_ssl.probe import (
 )
 
 from .model import POSSMEncoder, POSSMPhonemeModel, build_temporal_backbone
+from .training import find_latest_possm_step_checkpoint, prune_possm_resumable_checkpoints
 
 
 @dataclass
@@ -50,6 +51,7 @@ class POSSMFinetuneConfig:
     weight_decay: float = 1e-2
     max_grad_norm: float = 1.0
     checkpoint_every_steps: int = 200
+    checkpoint_keep_last: int | None = 2
     progress_every_steps: int = 25
     session_adapter_enabled: bool = True
     input_smoothing_sigma_bins: float = 0.0
@@ -112,6 +114,8 @@ class POSSMFinetuneConfig:
             raise ValueError("max_grad_norm must be positive")
         if int(self.checkpoint_every_steps) <= 0:
             raise ValueError("checkpoint_every_steps must be positive")
+        if self.checkpoint_keep_last is not None and int(self.checkpoint_keep_last) < 0:
+            raise ValueError("checkpoint_keep_last must be non-negative when provided")
         if int(self.progress_every_steps) <= 0:
             raise ValueError("progress_every_steps must be positive")
         if float(self.input_smoothing_sigma_bins) < 0.0:
@@ -703,20 +707,7 @@ def _checkpoint_payload(
 
 
 def _find_latest_step_checkpoint(checkpoints_dir: Path) -> Path | None:
-    if not checkpoints_dir.exists():
-        return None
-    latest_step = -1
-    latest_path: Path | None = None
-    for path in checkpoints_dir.glob("step_*.pt"):
-        stem = path.stem
-        try:
-            step = int(stem.split("_", 1)[1])
-        except (IndexError, ValueError):
-            continue
-        if step > latest_step:
-            latest_step = step
-            latest_path = path
-    return latest_path
+    return find_latest_possm_step_checkpoint(checkpoints_dir)
 
 
 def _checkpoint_mtime(path: Path) -> int:
@@ -1183,7 +1174,13 @@ def run_possm_phoneme_finetuning(
         )
         if checkpoints_dir is not None and steps % int(effective_config.checkpoint_every_steps) == 0:
             checkpoints_dir.mkdir(parents=True, exist_ok=True)
-            torch.save(payload, checkpoints_dir / f"step_{int(steps):06d}.pt")
+            step_checkpoint_path = checkpoints_dir / f"step_{int(steps):06d}.pt"
+            torch.save(payload, step_checkpoint_path)
+            for deleted_checkpoint in prune_possm_resumable_checkpoints(
+                checkpoints_dir,
+                keep_last=effective_config.checkpoint_keep_last,
+            ):
+                print("pruned_step_checkpoint:", deleted_checkpoint)
         if best_metrics is None or float(metrics["val_ctc_bpphone"]) < float(best_metrics["val_ctc_bpphone"]):
             best_metrics = dict(metrics)
             best_payload = payload

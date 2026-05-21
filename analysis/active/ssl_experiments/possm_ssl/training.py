@@ -62,6 +62,7 @@ class POSSMTrainingConfig:
     val_every: int = 50
     val_batches: int = 10
     checkpoint_every_steps: int | None = None
+    checkpoint_keep_last: int | None = 2
     dataset_weight_alpha: float = 0.25
     examples_per_shard: int = 8
     log_every: int = 10
@@ -140,6 +141,8 @@ class POSSMTrainingConfig:
             raise ValueError("val_every and val_batches must be positive")
         if self.checkpoint_every_steps is not None and int(self.checkpoint_every_steps) <= 0:
             raise ValueError("checkpoint_every_steps must be positive when provided")
+        if self.checkpoint_keep_last is not None and int(self.checkpoint_keep_last) < 0:
+            raise ValueError("checkpoint_keep_last must be non-negative when provided")
         if float(self.dataset_weight_alpha) < 0.0:
             raise ValueError("dataset_weight_alpha must be non-negative")
         if int(self.examples_per_shard) <= 0 or int(self.log_every) <= 0:
@@ -394,6 +397,108 @@ def list_possm_checkpoints(run_dir: str | Path) -> list[dict[str, Any]]:
         )
     rows.sort(key=lambda row: (row["kind"] != "best", row["step"] or -1, row["mtime_ns"]))
     return rows
+
+
+def find_latest_possm_step_checkpoint(checkpoints_dir: str | Path) -> Path | None:
+    base = Path(checkpoints_dir)
+    if not base.exists():
+        return None
+
+    latest_step = -1
+    latest_mtime = -1
+    latest_path: Path | None = None
+    for pattern in ("step_*.pt", "checkpoint_final_step_*.pt"):
+        for path in base.glob(pattern):
+            step = _parse_step_from_checkpoint_name(path.name)
+            if step is None:
+                continue
+            mtime = int(path.stat().st_mtime_ns)
+            if step > latest_step or (step == latest_step and mtime > latest_mtime):
+                latest_step = int(step)
+                latest_mtime = mtime
+                latest_path = path
+    return latest_path
+
+
+def resolve_latest_possm_checkpoint_path(
+    *,
+    output_root: str | Path | None = None,
+    run_dir: str | Path | None = None,
+    explicit_checkpoint_path: str | Path | None = None,
+) -> Path:
+    if explicit_checkpoint_path is not None:
+        candidate = Path(explicit_checkpoint_path)
+        if not candidate.exists():
+            raise FileNotFoundError(f"Explicit POSSM checkpoint path does not exist: {candidate}")
+        return candidate
+
+    def latest_checkpoint_for_run(candidate_run_dir: Path) -> Path | None:
+        latest_step = find_latest_possm_step_checkpoint(candidate_run_dir / "checkpoints")
+        if latest_step is not None:
+            return latest_step
+        final = candidate_run_dir / "checkpoint_final.pt"
+        if final.exists():
+            return final
+        best = candidate_run_dir / "checkpoint_best.pt"
+        if best.exists():
+            return best
+        return None
+
+    if run_dir is not None:
+        resolved = latest_checkpoint_for_run(Path(run_dir))
+        if resolved is not None:
+            return resolved
+        raise RuntimeError(f"No POSSM checkpoints found under run_dir={run_dir}")
+
+    if output_root is None:
+        raise ValueError("One of output_root, run_dir, or explicit_checkpoint_path must be provided")
+
+    root = Path(output_root)
+    candidates = sorted((path for path in root.glob("*") if path.is_dir()), key=lambda p: p.stat().st_mtime_ns)
+    for candidate in reversed(candidates):
+        resolved = latest_checkpoint_for_run(candidate)
+        if resolved is not None:
+            return resolved
+    raise RuntimeError(f"No POSSM checkpoints found under output_root={root}")
+
+
+def prune_possm_resumable_checkpoints(
+    checkpoints_dir: str | Path,
+    *,
+    keep_last: int | None,
+) -> list[Path]:
+    if keep_last is None:
+        return []
+    keep_count = int(keep_last)
+    if keep_count < 0:
+        raise ValueError("keep_last must be non-negative when provided")
+
+    base = Path(checkpoints_dir)
+    if not base.exists():
+        return []
+
+    candidates: list[tuple[int, int, Path]] = []
+    for pattern in ("step_*.pt", "checkpoint_final_step_*.pt"):
+        for path in base.glob(pattern):
+            step = _parse_step_from_checkpoint_name(path.name)
+            if step is None:
+                continue
+            candidates.append((int(step), int(path.stat().st_mtime_ns), path))
+    candidates.sort(key=lambda item: (item[0], item[1]))
+
+    if keep_count == 0:
+        to_delete = candidates
+    else:
+        to_delete = candidates[:-keep_count]
+
+    deleted: list[Path] = []
+    for _, _, path in to_delete:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            continue
+        deleted.append(path)
+    return deleted
 
 
 def resolve_possm_checkpoint_path(
@@ -661,6 +766,7 @@ def _train_loop(
     val_every = int(config_payload["val_every"])
     val_batches = int(config_payload["val_batches"])
     checkpoint_every_steps = config_payload.get("checkpoint_every_steps")
+    checkpoint_keep_last = config_payload.get("checkpoint_keep_last", 2)
 
     loop_start = time.time()
     for step in range(start_step + 1, int(target_step) + 1):
@@ -745,6 +851,11 @@ def _train_loop(
             step_checkpoint = checkpoints_dir / _step_checkpoint_filename(step)
             torch.save(step_payload, step_checkpoint)
             print("saved_step_checkpoint:", step_checkpoint)
+            for deleted_checkpoint in prune_possm_resumable_checkpoints(
+                checkpoints_dir,
+                keep_last=checkpoint_keep_last,
+            ):
+                print("pruned_step_checkpoint:", deleted_checkpoint)
 
     if best_state is None:
         best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
@@ -764,7 +875,6 @@ def _train_loop(
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     checkpoints_dir.mkdir(parents=True, exist_ok=True)
     torch.save(final_payload, checkpoint_path)
-    torch.save(final_payload, checkpoints_dir / _final_checkpoint_filename(int(target_step)))
 
     best_payload = dict(final_payload)
     best_payload["model_state"] = best_state
@@ -905,6 +1015,7 @@ def recover_possm_run_state_from_checkpoint(
     recovered_config.setdefault("mask_span_bins", 8)
     recovered_config.setdefault("mask_replace_mode", "zero")
     recovered_config.setdefault("temporal_backbone_kwargs", {})
+    recovered_config.setdefault("checkpoint_keep_last", 2)
     if str(payload.get("model_family", recovered_config.get("model_family", ""))) != "possm":
         raise ValueError("Recovered checkpoint is not a POSSM checkpoint.")
     if str(recovered_config.get("stage", payload.get("stage", ""))) != "stage1_reconstruction":
@@ -984,7 +1095,14 @@ def recover_possm_run_state_from_checkpoint(
     recovered_best_step = payload.get("best_step")
     if best_checkpoint_path.exists():
         best_payload = torch.load(best_checkpoint_path, map_location="cpu")
-        best_config = best_payload.get("config")
+        best_config = dict(best_payload.get("config", {}))
+        best_config.setdefault("stage1_objective_type", "plain_mse")
+        best_config.setdefault("masking_type", "none")
+        best_config.setdefault("mask_prob", 0.0)
+        best_config.setdefault("mask_span_bins", 8)
+        best_config.setdefault("mask_replace_mode", "zero")
+        best_config.setdefault("temporal_backbone_kwargs", {})
+        best_config.setdefault("checkpoint_keep_last", 2)
         if best_config != recovered_config:
             raise ValueError(
                 "Recovered best checkpoint config does not match the resume checkpoint config. "
