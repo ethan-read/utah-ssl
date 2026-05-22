@@ -10,7 +10,11 @@ import numpy as np
 import torch
 
 try:
-    from masked_ssl.cache import _cache_variant_name, _canonical_stats_root_for_cache
+    from masked_ssl.cache import (
+        _cache_variant_name,
+        _canonical_stats_root_for_cache,
+        resolve_boundary_key,
+    )
     from masked_ssl.probe import (
         CanonicalSequenceDataset,
         LengthAwareBatchSampler,
@@ -23,6 +27,7 @@ except ModuleNotFoundError:  # pragma: no cover - repo-root unittest fallback
     from analysis.active.ssl_experiments.masked_ssl.cache import (
         _cache_variant_name,
         _canonical_stats_root_for_cache,
+        resolve_boundary_key,
     )
     from analysis.active.ssl_experiments.masked_ssl.probe import (
         CanonicalSequenceDataset,
@@ -51,6 +56,68 @@ def normalization_key_for_row(row: Any) -> str:
     if normalization_group is not None:
         return str(normalization_group)
     return str(row.session_id)
+
+
+def normalization_stats_missing_rows(
+    stats: dict[str, tuple[np.ndarray, np.ndarray]] | tuple[np.ndarray, np.ndarray] | None,
+    rows: tuple[Any, ...] | list[Any],
+) -> list[str]:
+    if stats is None or not isinstance(stats, dict):
+        return []
+    missing: list[str] = []
+    for row in rows:
+        candidate_keys: list[str] = []
+        block_num = getattr(row, "block_num", None)
+        if block_num is not None:
+            candidate_keys.append(f"{row.session_id}::block:{int(block_num)}")
+        normalization_group = getattr(row, "normalization_group", None)
+        if normalization_group is not None:
+            candidate_keys.append(str(normalization_group))
+        candidate_keys.append(str(row.session_id))
+        if any(candidate_key in stats for candidate_key in candidate_keys):
+            continue
+        missing.append(str(getattr(row, "example_id", row)))
+    return missing
+
+
+def adapter_keys_from_rows(
+    rows: tuple[Any, ...] | list[Any],
+    *,
+    dataset: str,
+    boundary_key_mode: str,
+) -> tuple[str, ...]:
+    keys: list[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        key = resolve_boundary_key(
+            dataset=str(dataset),
+            session_id=str(row.session_id),
+            subject_id=None if getattr(row, "subject_id", None) is None else str(row.subject_id),
+            boundary_key_mode=str(boundary_key_mode),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        keys.append(key)
+    return tuple(keys)
+
+
+def group_rows_by_adapter_key(
+    rows: tuple[Any, ...] | list[Any],
+    *,
+    dataset: str,
+    boundary_key_mode: str,
+) -> dict[str, tuple[Any, ...]]:
+    grouped: dict[str, list[Any]] = {}
+    for row in rows:
+        key = resolve_boundary_key(
+            dataset=str(dataset),
+            session_id=str(row.session_id),
+            subject_id=None if getattr(row, "subject_id", None) is None else str(row.subject_id),
+            boundary_key_mode=str(boundary_key_mode),
+        )
+        grouped.setdefault(key, []).append(row)
+    return {key: tuple(group_rows) for key, group_rows in grouped.items()}
 
 
 def _willett_gaussian_kernel_1d(
@@ -292,14 +359,17 @@ def loader_kwargs(device: torch.device) -> dict[str, Any]:
 __all__ = [
     "CanonicalSequenceDataset",
     "WillettInputTransformConfig",
+    "adapter_keys_from_rows",
     "build_willett_problem",
     "compute_willett_normalization_stats",
     "collate_sequence_batch",
     "compute_feature_stats",
+    "group_rows_by_adapter_key",
     "load_precomputed_split_feature_stats",
     "loader_kwargs",
     "make_length_aware_batch_sampler",
     "normalization_key_for_row",
+    "normalization_stats_missing_rows",
     "prepare_willett_inputs",
     "resolve_precomputed_split_stats_path",
     "smooth_batch_like_willett",

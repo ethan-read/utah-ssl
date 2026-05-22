@@ -10,7 +10,11 @@ import torch
 
 from analysis.active.ssl_experiments.willett_reconstruction.data import (
     WillettInputTransformConfig,
+    adapter_keys_from_rows,
     build_willett_problem,
+    compute_willett_normalization_stats,
+    group_rows_by_adapter_key,
+    normalization_stats_missing_rows,
     prepare_willett_inputs,
 )
 from analysis.active.ssl_experiments.willett_reconstruction.model import (
@@ -102,6 +106,40 @@ class WillettReconstructionTest(unittest.TestCase):
         self.assertEqual(len(problem["train_rows"]), 3)
         self.assertEqual(len(problem["val_rows"]), 2)
 
+    def test_adapter_keys_follow_boundary_key_mode(self) -> None:
+        cache_root = Path(self._tmp_dir())
+        _write_tiny_competition_probe_cache(cache_root)
+        problem = build_willett_problem(
+            cache_root=cache_root,
+            dataset="brain2text24",
+            feature_mode="tx_only",
+            boundary_key_mode="subject_if_available",
+        )
+        adapter_keys = adapter_keys_from_rows(
+            problem["train_rows"],
+            dataset="brain2text24",
+            boundary_key_mode="subject_if_available",
+        )
+        self.assertEqual(adapter_keys, ("brain2text24:t12",))
+
+    def test_group_rows_by_adapter_key_matches_session_partition(self) -> None:
+        cache_root = Path(self._tmp_dir())
+        _write_tiny_competition_probe_cache(cache_root)
+        problem = build_willett_problem(
+            cache_root=cache_root,
+            dataset="brain2text24",
+            feature_mode="tx_only",
+            boundary_key_mode="session",
+        )
+        grouped = group_rows_by_adapter_key(
+            problem["train_rows"],
+            dataset="brain2text24",
+            boundary_key_mode="session",
+        )
+        self.assertEqual(sorted(grouped), ["brain2text24:t12.2022.08.10", "brain2text24:t12.2022.08.11"])
+        self.assertEqual(len(grouped["brain2text24:t12.2022.08.10"]), 2)
+        self.assertEqual(len(grouped["brain2text24:t12.2022.08.11"]), 1)
+
     def test_prepare_inputs_preserves_shape(self) -> None:
         x = torch.arange(24, dtype=torch.float32).view(2, 4, 3)
         lengths = torch.tensor([4, 3], dtype=torch.long)
@@ -119,6 +157,24 @@ class WillettReconstructionTest(unittest.TestCase):
         )
         self.assertEqual(tuple(transformed.shape), (2, 4, 3))
         self.assertTrue(torch.allclose(transformed[1, 3], torch.zeros_like(transformed[1, 3])))
+
+    def test_train_derived_block_stats_do_not_cover_val_blocks(self) -> None:
+        cache_root = Path(self._tmp_dir())
+        _write_tiny_competition_probe_cache(cache_root)
+        problem = build_willett_problem(
+            cache_root=cache_root,
+            dataset="brain2text24",
+            feature_mode="tx_only",
+            boundary_key_mode="session",
+        )
+        train_stats = compute_willett_normalization_stats(
+            problem["train_rows"],
+            cache_root=cache_root,
+            feature_mode="tx_only",
+            mode="block",
+        )
+        missing = normalization_stats_missing_rows(train_stats, problem["val_rows"])
+        self.assertEqual(sorted(missing), ["test-0", "test-1"])
 
     def test_model_forward_shapes_and_lengths(self) -> None:
         model = WillettPhonemeModel(
@@ -141,6 +197,8 @@ class WillettReconstructionTest(unittest.TestCase):
         self.assertEqual(int(outputs["adapted_input"].shape[-1]), 5)
         self.assertEqual(int(outputs["patched_inputs"].shape[-1]), 15)
         self.assertEqual(int(outputs["logits"].shape[-1]), 4)
+        self.assertEqual(tuple(model.initial_state.shape), (1, model.gru_hidden_size))
+        self.assertTrue(model.initial_state.requires_grad)
 
     def test_model_uses_shared_input_network_when_session_adaptation_disabled(self) -> None:
         model = WillettPhonemeModel(
@@ -195,6 +253,7 @@ class WillettReconstructionTest(unittest.TestCase):
             gru_num_layers=1,
             gru_dropout=0.0,
         )
+        self.assertEqual(config.normalization_mode, "global")
         summary = run_willett_reconstruction(config)
         run_dir = output_root / "tiny_run"
         self.assertTrue((run_dir / "progress.jsonl").exists())
@@ -204,6 +263,7 @@ class WillettReconstructionTest(unittest.TestCase):
         self.assertTrue(any((run_dir / "checkpoints").glob("step_*.pt")))
         self.assertIn("collapse_diagnostics", summary["metrics"])
         self.assertIn("predicted_to_reference_token_ratio", summary["metrics"]["collapse_diagnostics"])
+        self.assertEqual(summary["train_sampling_mode"], "uniform_single_boundary_key_per_step")
 
         resumed_summary = run_willett_reconstruction(
             WillettReconstructionConfig(
@@ -215,6 +275,7 @@ class WillettReconstructionTest(unittest.TestCase):
             )
         )
         self.assertGreaterEqual(int(resumed_summary["steps"]), 3)
+        self.assertGreaterEqual(int(resumed_summary["best_step"]), 1)
 
 
 if __name__ == "__main__":

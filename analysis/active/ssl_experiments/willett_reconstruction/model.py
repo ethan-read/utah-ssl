@@ -169,7 +169,27 @@ class WillettPhonemeModel(nn.Module):
             batch_first=True,
             bidirectional=False,
         )
+        self.initial_state = nn.Parameter(torch.empty((1, self.gru_hidden_size)))
+        nn.init.xavier_uniform_(self.initial_state)
         self.classifier = nn.Linear(self.gru_hidden_size, self.vocab_size)
+
+    def _initial_hidden_state(
+        self,
+        *,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        # Stanford learns the first-layer recurrent state and leaves deeper
+        # layers unset; mirror that by tiling one learned state and keeping the
+        # remaining layers zero-initialized.
+        hidden = torch.zeros(
+            (self.gru_num_layers, int(batch_size), self.gru_hidden_size),
+            device=device,
+            dtype=dtype,
+        )
+        hidden[0] = self.initial_state.to(device=device, dtype=dtype).expand(int(batch_size), -1)
+        return hidden
 
     def _patch_one(self, sample: torch.Tensor, length: int) -> torch.Tensor:
         valid = sample[:length]
@@ -227,7 +247,12 @@ class WillettPhonemeModel(nn.Module):
             batch_first=True,
             enforce_sorted=False,
         )
-        packed_hidden, _ = self.gru(packed)
+        initial_hidden = self._initial_hidden_state(
+            batch_size=int(x.shape[0]),
+            device=patched_inputs.device,
+            dtype=patched_inputs.dtype,
+        )
+        packed_hidden, _ = self.gru(packed, initial_hidden)
         hidden, _ = nn.utils.rnn.pad_packed_sequence(
             packed_hidden,
             batch_first=True,

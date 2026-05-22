@@ -26,11 +26,14 @@ except ModuleNotFoundError:  # pragma: no cover - repo-root unittest fallback
 
 from .data import (
     WillettInputTransformConfig,
+    adapter_keys_from_rows,
     build_willett_problem,
     compute_willett_normalization_stats,
+    group_rows_by_adapter_key,
     load_precomputed_split_feature_stats,
     loader_kwargs,
     make_length_aware_batch_sampler,
+    normalization_stats_missing_rows,
     prepare_willett_inputs,
     resolve_precomputed_split_stats_path,
 )
@@ -44,7 +47,7 @@ class WillettReconstructionConfig:
     dataset: str = "brain2text24"
     feature_mode: str = "tx_only"
     boundary_key_mode: str = "session"
-    normalization_mode: str = "block"
+    normalization_mode: str = "global"
     batch_size: int = 64
     max_steps: int = 120000
     learning_rate: float = 1e-2
@@ -194,6 +197,8 @@ def _save_checkpoint(
     scheduler: torch.optim.lr_scheduler.LambdaLR,
     step: int,
     metrics: dict[str, Any] | None,
+    best_step: int,
+    best_progress_payload: dict[str, Any] | None,
     problem: dict[str, Any],
 ) -> None:
     config_payload = json.loads(json.dumps(asdict(config), default=str))
@@ -207,6 +212,8 @@ def _save_checkpoint(
         "cache_root": str(problem["cache_root"]),
         "vocab": dict(problem["vocab"]),
         "metrics": dict(metrics or {}),
+        "best_step": int(best_step),
+        "best_progress_payload": dict(best_progress_payload) if best_progress_payload is not None else None,
         "train_split_name": str(problem["train_split_name"]),
         "val_split_name": str(problem["val_split_name"]),
         "train_session_ids": list(problem["train_session_ids"]),
@@ -266,7 +273,6 @@ def run_willett_reconstruction(config: WillettReconstructionConfig) -> dict[str,
                 mode="global",
                 feature_mode=str(problem["feature_mode"]),
             )
-        val_stats = train_stats
     else:
         train_stats = compute_willett_normalization_stats(
             problem["train_rows"],
@@ -274,21 +280,18 @@ def run_willett_reconstruction(config: WillettReconstructionConfig) -> dict[str,
             mode=str(config.normalization_mode),
             feature_mode=str(problem["feature_mode"]),
         )
-        val_stats = compute_willett_normalization_stats(
-            problem["val_rows"],
-            cache_root=Path(problem["cache_root"]),
-            mode=str(config.normalization_mode),
-            feature_mode=str(problem["feature_mode"]),
+    val_stats = train_stats
+    missing_val_examples = normalization_stats_missing_rows(val_stats, problem["val_rows"])
+    if missing_val_examples:
+        preview = ", ".join(missing_val_examples[:5])
+        raise ValueError(
+            "Train-derived normalization stats do not cover the validation rows for "
+            f"normalization_mode={config.normalization_mode!r}. "
+            "Use train-split global stats for the Stanford/POSSM-style setup, or choose "
+            "a normalization scheme whose keys are shared between train and validation. "
+            f"First missing examples: {preview}"
         )
 
-    train_dataset = CanonicalSequenceDataset(
-        problem["train_rows"],
-        cache_root=Path(problem["cache_root"]),
-        stats=train_stats,
-        feature_mode=str(problem["feature_mode"]),
-        boundary_key_mode=str(problem["boundary_key_mode"]),
-        dataset=str(problem["dataset"]),
-    )
     val_dataset = CanonicalSequenceDataset(
         problem["val_rows"],
         cache_root=Path(problem["cache_root"]),
@@ -296,16 +299,6 @@ def run_willett_reconstruction(config: WillettReconstructionConfig) -> dict[str,
         feature_mode=str(problem["feature_mode"]),
         boundary_key_mode=str(problem["boundary_key_mode"]),
         dataset=str(problem["dataset"]),
-    )
-    train_loader = DataLoader(
-        train_dataset,
-        batch_sampler=make_length_aware_batch_sampler(
-            problem["train_rows"],
-            batch_size=int(config.batch_size),
-            shuffle=True,
-            seed=int(config.seed),
-        ),
-        **loader_kwargs(device),
     )
     val_loader = DataLoader(
         val_dataset,
@@ -317,7 +310,42 @@ def run_willett_reconstruction(config: WillettReconstructionConfig) -> dict[str,
         ),
         **loader_kwargs(device),
     )
-    session_adapter_keys = tuple(problem["train_session_ids"])
+    train_adapter_keys = adapter_keys_from_rows(
+        problem["train_rows"],
+        dataset=str(problem["dataset"]),
+        boundary_key_mode=str(problem["boundary_key_mode"]),
+    )
+    val_adapter_keys = adapter_keys_from_rows(
+        problem["val_rows"],
+        dataset=str(problem["dataset"]),
+        boundary_key_mode=str(problem["boundary_key_mode"]),
+    )
+    train_rows_by_adapter_key = group_rows_by_adapter_key(
+        problem["train_rows"],
+        dataset=str(problem["dataset"]),
+        boundary_key_mode=str(problem["boundary_key_mode"]),
+    )
+    session_adapter_keys = tuple(dict.fromkeys(train_adapter_keys + val_adapter_keys))
+    train_loaders_by_adapter_key = {
+        adapter_key: DataLoader(
+            CanonicalSequenceDataset(
+                adapter_rows,
+                cache_root=Path(problem["cache_root"]),
+                stats=train_stats,
+                feature_mode=str(problem["feature_mode"]),
+                boundary_key_mode=str(problem["boundary_key_mode"]),
+                dataset=str(problem["dataset"]),
+            ),
+            batch_sampler=make_length_aware_batch_sampler(
+                adapter_rows,
+                batch_size=int(config.batch_size),
+                shuffle=True,
+                seed=int(config.seed) + adapter_idx,
+            ),
+            **loader_kwargs(device),
+        )
+        for adapter_idx, (adapter_key, adapter_rows) in enumerate(train_rows_by_adapter_key.items(), start=1)
+    }
     model = WillettPhonemeModel(
         input_dim=sample_dim,
         vocab_size=int(problem["vocab"]["num_classes"]),
@@ -353,7 +381,11 @@ def run_willett_reconstruction(config: WillettReconstructionConfig) -> dict[str,
     best_metrics: dict[str, Any] | None = None
     best_payload: dict[str, Any] | None = None
     best_step = 0
-    train_iterator = iter(train_loader)
+    train_rng = random.Random(int(config.seed))
+    train_iterators_by_adapter_key = {
+        adapter_key: iter(loader)
+        for adapter_key, loader in train_loaders_by_adapter_key.items()
+    }
 
     resume_checkpoint = _resolve_resume_checkpoint(run_dir, config)
     if resume_checkpoint is not None:
@@ -363,6 +395,10 @@ def run_willett_reconstruction(config: WillettReconstructionConfig) -> dict[str,
         scheduler.load_state_dict(payload["scheduler_state"])
         step = int(payload.get("step", 0))
         best_metrics = dict(payload.get("metrics", {})) if payload.get("metrics") else None
+        best_step = int(payload.get("best_step", best_step))
+        restored_best_payload = payload.get("best_progress_payload")
+        if isinstance(restored_best_payload, dict):
+            best_payload = dict(restored_best_payload)
         print(f"resumed Willett reconstruction from {resume_checkpoint}")
 
     while step < int(config.max_steps):
@@ -370,15 +406,18 @@ def run_willett_reconstruction(config: WillettReconstructionConfig) -> dict[str,
         accumulated_loss_sum = 0.0
         accumulated_target_count = 0
         accumulation_microbatches = 0
+        current_adapter_key = train_rng.choice(train_adapter_keys)
         optimizer.zero_grad(set_to_none=True)
         model.train()
 
         while accumulated_examples < int(config.batch_size):
             try:
-                batch = next(train_iterator)
+                batch = next(train_iterators_by_adapter_key[current_adapter_key])
             except StopIteration:
-                train_iterator = iter(train_loader)
-                batch = next(train_iterator)
+                train_iterators_by_adapter_key[current_adapter_key] = iter(
+                    train_loaders_by_adapter_key[current_adapter_key]
+                )
+                batch = next(train_iterators_by_adapter_key[current_adapter_key])
             x = batch["x"].to(device)
             input_lengths = batch["input_lengths"].to(device)
             labels = batch["labels"].to(device)
@@ -422,6 +461,7 @@ def run_willett_reconstruction(config: WillettReconstructionConfig) -> dict[str,
                 "optimizer_target_examples": int(config.batch_size),
                 "accumulated_examples": int(accumulated_examples),
                 "accumulation_microbatches": int(accumulation_microbatches),
+                "train_boundary_key": str(current_adapter_key),
                 "learning_rate": float(optimizer.param_groups[0]["lr"]),
                 "elapsed_seconds": float(time.time() - start_time),
             }
@@ -464,6 +504,8 @@ def run_willett_reconstruction(config: WillettReconstructionConfig) -> dict[str,
                     scheduler=scheduler,
                     step=step,
                     metrics=metrics,
+                    best_step=best_step,
+                    best_progress_payload=best_payload,
                     problem=problem,
                 )
 
@@ -477,6 +519,8 @@ def run_willett_reconstruction(config: WillettReconstructionConfig) -> dict[str,
                 scheduler=scheduler,
                 step=step,
                 metrics=best_metrics,
+                best_step=best_step,
+                best_progress_payload=best_payload,
                 problem=problem,
             )
             _prune_step_checkpoints(checkpoints_dir, config.checkpoint_keep_last)
@@ -502,6 +546,8 @@ def run_willett_reconstruction(config: WillettReconstructionConfig) -> dict[str,
         scheduler=scheduler,
         step=step,
         metrics=final_metrics,
+        best_step=best_step,
+        best_progress_payload=best_payload,
         problem=problem,
     )
     summary = {
@@ -516,6 +562,10 @@ def run_willett_reconstruction(config: WillettReconstructionConfig) -> dict[str,
         "val_examples": int(len(problem["val_rows"])),
         "train_session_ids": list(problem["train_session_ids"]),
         "val_session_ids": list(problem["val_session_ids"]),
+        "train_adapter_keys": list(train_adapter_keys),
+        "val_adapter_keys": list(val_adapter_keys),
+        "model_adapter_keys": list(session_adapter_keys),
+        "train_sampling_mode": "uniform_single_boundary_key_per_step",
         "train_split_name": str(problem["train_split_name"]),
         "val_split_name": str(problem["val_split_name"]),
         "steps": int(step),
