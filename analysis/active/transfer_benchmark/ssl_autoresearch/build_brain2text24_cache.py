@@ -24,7 +24,8 @@ from prepare import CACHE_ROOT, BRAINTOTEXT24_ROOT, relative_to_root, source_roo
 
 CACHE_VERSION = "v1"
 BIN_SIZE_MS = 20
-N_FEATURES = 256
+RAW_FEATURES = 256
+AREA6V_FEATURES = 128
 TX_VARIANT = "tx2"
 DEFAULT_DATASET_FAMILY = "brain2text24"
 RAW_TASK_DIRS = ("sentences", "diagnosticBlocks", "tuningTasks")
@@ -287,9 +288,9 @@ def _write_file_shard(
     speaking_mode = _normalize_text(mat.get("speakingMode"))
     trial_delay_times = np.asarray(mat["trialDelayTimes"]).reshape(-1) if "trialDelayTimes" in mat else None
 
-    if tx_all.ndim != 2 or tx_all.shape[1] != N_FEATURES:
+    if tx_all.ndim != 2 or tx_all.shape[1] != RAW_FEATURES:
         raise ValueError(
-            f"{header.source_filename} expected {TX_VARIANT} shape (*, {N_FEATURES}), got {tx_all.shape}"
+            f"{header.source_filename} expected {TX_VARIANT} shape (*, {RAW_FEATURES}), got {tx_all.shape}"
         )
     if sbp_all.ndim != 2 or sbp_all.shape != tx_all.shape:
         raise ValueError(
@@ -306,8 +307,8 @@ def _write_file_shard(
     labeled_examples = 0
 
     for example_index, epoch in enumerate(go_epochs):
-        tx_trial = _extract_epoch_slice(tx_all, epoch).astype(np.uint8, copy=False)
-        sbp_trial = _extract_epoch_slice(sbp_all, epoch).astype(np.float32, copy=False)
+        tx_trial = _extract_epoch_slice(tx_all, epoch)[:, :AREA6V_FEATURES].astype(np.uint8, copy=False)
+        sbp_trial = _extract_epoch_slice(sbp_all, epoch)[:, :AREA6V_FEATURES].astype(np.float32, copy=False)
         if tx_trial.shape != sbp_trial.shape:
             raise ValueError(
                 f"{header.source_filename} trial {example_index} TX/SBP mismatch: "
@@ -593,10 +594,12 @@ def main(argv: list[str] | None = None) -> int:
         "bin_size_ms": BIN_SIZE_MS,
         "modalities": ["tx", "sbp"],
         "feature_layout": {
-            "n_total_features": 512,
-            "n_tx_features": N_FEATURES,
-            "n_sbp_features": N_FEATURES,
+            "n_total_features": AREA6V_FEATURES * 2,
+            "n_tx_features": AREA6V_FEATURES,
+            "n_sbp_features": AREA6V_FEATURES,
             "tx_variant": TX_VARIANT,
+            "area6v_only": True,
+            "retained_feature_columns": [0, AREA6V_FEATURES],
         },
         "num_subjects": len(subject_ids),
         "num_sessions": len(session_ids),
@@ -624,6 +627,7 @@ def main(argv: list[str] | None = None) -> int:
             "competitionData is used only to recover sentence block split annotations.",
             "Utterance-level trial boundaries are preserved via time_offsets.npy.",
             "Threshold crossings and spike band power are stored as separate arrays.",
+            "Only first 128 columns are retained for each modality, matching the Stanford area-6v decoder recipe.",
             (
                 "Phoneme labels were derived from transcripts with g2p_en and stored via "
                 "phoneme_offsets.npy + phoneme_ids.npy."

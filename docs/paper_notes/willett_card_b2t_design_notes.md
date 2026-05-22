@@ -24,7 +24,9 @@ They are not reproduction instructions.
 
 - Utah-array features are binned at `20 ms`
 - the standard speech-decoding input is `TX + SBP`
-- for `256` electrodes this becomes `512` input features per timestep
+- the full release exposes `256` columns per modality, but the Stanford speech
+  decoder recipe uses only the first `128` area-6v columns from each modality
+  for `256` input features per timestep
 - in the competition README they explicitly suggest starting with:
   - `spikePow`
   - `tx1`
@@ -80,11 +82,14 @@ In the `brain2text25` code:
 - there is one day-specific input network per session
 - the day-specific layer is part of the model, not just an offline preprocessing step
 
-The model summary in the repo describes this as:
+The original full-array model summary in the repo describes this as:
 
 - `512 -> 512` day-specific linear transform
 - `Softsign` nonlinearity
 - one such layer per day / session
+
+For the area-6v-only speech baseline, the equivalent input-network width is
+`256` when using `TX + SBP`.
 
 Why this matters:
 

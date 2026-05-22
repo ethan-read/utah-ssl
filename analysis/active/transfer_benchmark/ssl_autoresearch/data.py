@@ -223,7 +223,7 @@ def load_b2t25_canonical_inventory(cache_dataset_root: Path = CANONICAL_B2T25_RO
                 sbp_relpath=str(cache_dataset_root.relative_to(CACHE_ROOT)) if meta["has_sbp"] else None,
                 tx_windows=int(meta["total_examples"]) if meta["has_tx"] else None,
                 sbp_windows=int(meta["total_examples"]) if meta["has_sbp"] else None,
-                n_channels=512 if (meta["has_tx"] and meta["has_sbp"]) else 256,
+                    n_channels=256 if (meta["has_tx"] and meta["has_sbp"]) else 128,
                 has_tx=bool(meta["has_tx"]),
                 has_sbp=bool(meta["has_sbp"]),
             )

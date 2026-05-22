@@ -11,7 +11,8 @@ focus on convergence behavior and remaining discrepancies from the Stanford
 
 - data source: canonical Utah cache, not Stanford TFRecords
 - split: `competition_train -> competition_test`
-- default feature mode: `tx_only`
+- default feature mode: `tx_only`, now defined as first `128` area-6v TX
+  features after the cache migration
 - model family: pre-GRU temporal patching + GRU + CTC
 - session/day adaptation: per-boundary-key `Linear -> Softsign -> Dropout`
   input network applied before patching
@@ -75,12 +76,27 @@ This is a moderate architecture discrepancy that could affect convergence.
 
 ### Feature Set Difference
 
-The local baseline still defaults to `tx_only`, whereas Stanford/Willett uses
-threshold crossings plus spike-band power together in the standard speech
-decoder path.
+The Stanford/Willett TFRecord converter uses only the first `128` columns from
+each modality:
 
-This is an intentional simplification for comparison against the current POSSM
-stage-2 setup, but it still makes the run less faithful to the original.
+- `tx1[:, 0:128]`
+- `spikePow[:, 0:128]`
+
+The converter comments identify those columns as area 6v. This matters because
+the paper reports little decodable information in area 44; keeping the
+BA44/IFG columns doubles input width and training cost without matching the
+published baseline.
+
+The active cache policy has therefore changed:
+
+- `tx_only` means area-6v TX only, `128` features
+- `tx_sbp` means area-6v TX plus area-6v SBP, `256` features
+- older full-array `256` TX / `256` SBP caches and stats should be treated as
+  stale and migrated/recomputed before interpreting new runs
+
+The local Willett baseline still defaults to `tx_only` for direct comparison
+against current POSSM stage-2 runs. A faithful Stanford-style feature run should
+use `tx_sbp` after the area-6v migration.
 
 ## Assessment Of The Per-day Sampling Issue
 
@@ -117,4 +133,4 @@ So the best summary is:
   recomputing them on `val_rows`
 - add learned GRU initial states to the PyTorch model
 - consider an optional Stanford-style per-day training sampler
-- run a direct `tx_sbp` baseline after the `tx_only` path is stable
+- run a direct area-6v `tx_sbp` baseline after the `tx_only` path is stable

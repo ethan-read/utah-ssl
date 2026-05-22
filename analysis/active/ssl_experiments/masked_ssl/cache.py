@@ -32,6 +32,7 @@ RUNTIME_SMOOTHING_MIGRATION_MESSAGE = (
 
 # Fixed stride for session-stat computation to match the normalized cache artifacts.
 SESSION_STATS_BIN_STRIDE = 2
+AREA6V_FEATURE_DIM = 128
 
 
 @dataclass
@@ -44,8 +45,8 @@ class CacheAccessConfig:
     segment_bins: int = 64
     use_normalization: bool = True
     examples_per_shard: int = 8
-    tx_dim: int = 256
-    sbp_dim: int = 256
+    tx_dim: int = 128
+    sbp_dim: int = 128
     feature_mode: str = "tx_only"
     boundary_key_mode: str = "session"
     gaussian_smoothing_sigma_bins: float = 0.0
@@ -770,15 +771,12 @@ def _load_precomputed_session_feature_stats(
         mean, std = value
         mean_t = torch.as_tensor(mean).float().cpu()
         std_t = torch.as_tensor(std).float().cpu()
-        if mean_t.numel() < expected_dim or std_t.numel() < expected_dim:
+        if mean_t.numel() != expected_dim or std_t.numel() != expected_dim:
             raise ValueError(
-                f"Session stats entry for {key!r} is too small for feature_mode={feature_mode!r}: "
-                f"expected at least {expected_dim} values, got mean={mean_t.numel()} std={std_t.numel()}."
+                f"Session stats entry for {key!r} has the wrong size for feature_mode={feature_mode!r}: "
+                f"expected exactly {expected_dim} values after the area-6v migration, "
+                f"got mean={mean_t.numel()} std={std_t.numel()}. Recompute stats from the migrated cache."
             )
-        if mean_t.numel() != expected_dim:
-            mean_t = mean_t[:expected_dim].clone()
-        if std_t.numel() != expected_dim:
-            std_t = std_t[:expected_dim].clone()
         session_feature_stats[str(key)] = (mean_t, std_t)
 
     metadata = dict(payload.get("metadata", {}))
@@ -1148,6 +1146,21 @@ def prepare_cache_context(
                     )
                 )
         rows_by_dataset[dataset] = rows
+        if dataset == "brain2text24":
+            full_width_rows = [
+                row
+                for row in rows
+                if int(row.n_tx_features) > AREA6V_FEATURE_DIM
+                or int(row.n_sbp_features) > AREA6V_FEATURE_DIM
+            ]
+            if full_width_rows:
+                row = full_width_rows[0]
+                raise ValueError(
+                    "brain2text24 cache is still full-array width. Run "
+                    "analysis/active/ssl_experiments/trim_area6v_cache.py before training. "
+                    f"Example {row.shard_relpath}:{row.example_index} reports "
+                    f"n_tx_features={row.n_tx_features}, n_sbp_features={row.n_sbp_features}."
+                )
 
         session_ids = sorted({row.session_id for row in rows})
         if len(session_ids) < 2:

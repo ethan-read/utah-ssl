@@ -37,8 +37,8 @@ class CacheAccessConfig:
     segment_bins: int = 64
     use_normalization: bool = True
     examples_per_shard: int = 8
-    tx_dim: int = 256
-    sbp_dim: int = 256
+    tx_dim: int = 128
+    sbp_dim: int = 128
     shard_cache_ram_gb: float | None = None
 
     def __post_init__(self) -> None:

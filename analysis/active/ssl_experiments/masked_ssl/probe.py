@@ -27,6 +27,7 @@ from .model_mae import S5ContrastiveEncoder as MAES5ContrastiveEncoder
 from .training import resolve_ssl_checkpoint_path
 
 
+AREA6V_FEATURE_DIM = 128
 DEFAULT_PROBE_SUMMARY_BASENAME = "downstream_probe_summary.json"
 DEFAULT_PHONEME_VOCABULARY = {
     "index_to_symbol": [
@@ -302,7 +303,7 @@ def _load_canonical_inventory_from_manifest(
                 sbp_relpath=dataset_relpath if meta["has_sbp"] else None,
                 tx_windows=int(meta["total_examples"]) if meta["has_tx"] else None,
                 sbp_windows=int(meta["total_examples"]) if meta["has_sbp"] else None,
-                n_channels=512 if (meta["has_tx"] and meta["has_sbp"]) else 256,
+                n_channels=256 if (meta["has_tx"] and meta["has_sbp"]) else 128,
                 has_tx=bool(meta["has_tx"]),
                 has_sbp=bool(meta["has_sbp"]),
             )
@@ -604,6 +605,21 @@ def build_competition_split_problem(
     )
     manifest_rows = _load_canonical_probe_manifest(manifest_path)
     metadata = _load_probe_metadata_json(metadata_path)
+    if str(dataset) == "brain2text24":
+        full_width_rows = [
+            row
+            for row in manifest_rows
+            if int(row.n_tx_features) > AREA6V_FEATURE_DIM
+            or int(row.n_sbp_features) > AREA6V_FEATURE_DIM
+        ]
+        if full_width_rows:
+            row = full_width_rows[0]
+            raise ValueError(
+                "brain2text24 cache is still full-array width. Run "
+                "analysis/active/ssl_experiments/trim_area6v_cache.py before building "
+                f"competition splits. Example {row.shard_relpath}:{row.example_index} "
+                f"reports n_tx_features={row.n_tx_features}, n_sbp_features={row.n_sbp_features}."
+            )
 
     if feature_mode not in {"tx_only", "tx_sbp"}:
         raise ValueError("feature_mode must be one of {'tx_only', 'tx_sbp'}")

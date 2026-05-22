@@ -274,8 +274,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--value-mlp-hidden-size", type=int, default=None)
     parser.add_argument("--ffn-hidden-size", type=int, default=512)
     parser.add_argument("--use-token-norm", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--tx-dim", type=int, default=256)
-    parser.add_argument("--sbp-dim", type=int, default=256)
+    parser.add_argument("--tx-dim", type=int, default=128)
+    parser.add_argument("--sbp-dim", type=int, default=128)
     parser.add_argument("--excluded-dataset", action="append", default=["brain2text25"])
 
     parser.add_argument("--stage1-steps", type=int, default=4000)

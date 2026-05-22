@@ -3,6 +3,27 @@
 This note records the cache roots and normalization-stat artifacts that are
 still relevant for current Utah SSL notebook work.
 
+## Area-6v-Only Feature Policy
+
+Active Brain2Text24 cache roots should now be hard-migrated to area 6v only.
+The Stanford `speechBCI` converter documents that the first `128` columns of
+both `tx1` and `spikePow` are area 6v. The paper reports little decodable
+information in area 44, so active SSL/POSSM/Willett runs should not spend
+training time on the BA44/IFG columns.
+
+Current feature-mode semantics are therefore:
+
+- `tx_only`: first `128` area-6v TX features
+- `tx_sbp`: first `128` area-6v TX features plus first `128` area-6v SBP
+  features, for `256` total input features
+
+Older full-array cache artifacts with `256` TX + `256` SBP columns should be
+trimmed in place with
+`analysis/active/ssl_experiments/trim_area6v_cache.py`. Recompute all reusable
+normalization stats after trimming; checkpoints trained with the old
+`256`-dimensional `tx_only` or `512`-dimensional `tx_sbp` layouts should not be
+resumed.
+
 ## Canonical Raw Cache
 
 ### Local
@@ -12,7 +33,8 @@ still relevant for current Utah SSL notebook work.
 - notes:
   - `brain2text24` has `16088` rows and `28` sessions
   - supports `segment_bins=80`
-  - both `tx_only` and `tx_sbp` sampling checks passed
+  - after area-6v migration, both `tx_only` and `tx_sbp` sampling should use
+    `128` TX columns and `128` SBP columns at most
 
 ### Google Drive
 - path: `/content/drive/MyDrive/utah_ssl/data/cache_v1`
@@ -123,3 +145,5 @@ dataset list, and creation time.
 - Keep `gaussian_smoothing_sigma_bins=0.0` whenever using a pre-smoothed cache.
 - Before long Colab runs, verify that the selected cache root contains `brain2text24/manifest.jsonl`, `brain2text24/metadata.json`, and `brain2text24/shards/`.
 - If normalized samples look shifted, recompute stats from the exact cache root being used rather than mixing stats across cache variants.
+- If a Brain2Text24 cache reports `256` TX or `256` SBP feature columns, treat
+  it as stale full-array data and run the area-6v migration before training.

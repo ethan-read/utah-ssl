@@ -258,7 +258,7 @@ def _load_canonical_inventory_from_manifest(
                 sbp_relpath=dataset_relpath if meta["has_sbp"] else None,
                 tx_windows=int(meta["total_examples"]) if meta["has_tx"] else None,
                 sbp_windows=int(meta["total_examples"]) if meta["has_sbp"] else None,
-                n_channels=512 if (meta["has_tx"] and meta["has_sbp"]) else 256,
+                n_channels=256 if (meta["has_tx"] and meta["has_sbp"]) else 128,
                 has_tx=bool(meta["has_tx"]),
                 has_sbp=bool(meta["has_sbp"]),
             )

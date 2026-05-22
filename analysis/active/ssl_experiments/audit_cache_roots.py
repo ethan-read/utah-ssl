@@ -521,8 +521,8 @@ def _classify_stats_feature_modes(unique_dims: Iterable[int]) -> dict[str, bool]
     dims = sorted({int(dim) for dim in unique_dims if int(dim) > 0})
     smallest_dim = min(dims) if dims else 0
     return {
-        "tx_only": bool(smallest_dim >= 256),
-        "tx_sbp": bool(smallest_dim >= 512),
+        "tx_only": bool(smallest_dim == 128),
+        "tx_sbp": bool(smallest_dim == 256),
     }
 
 

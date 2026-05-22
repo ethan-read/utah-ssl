@@ -596,7 +596,7 @@ def _parse_args() -> WillettReconstructionConfig:
     parser.add_argument("--dataset", type=str, default="brain2text24")
     parser.add_argument("--feature-mode", choices=("tx_only", "tx_sbp"), default="tx_only")
     parser.add_argument("--boundary-key-mode", choices=("session", "subject_if_available"), default="session")
-    parser.add_argument("--normalization-mode", choices=("block", "global", "per_session", "none"), default="block")
+    parser.add_argument("--normalization-mode", choices=("block", "global", "per_session", "none"), default="global")
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--max-steps", type=int, default=120000)
     parser.add_argument("--learning-rate", type=float, default=1e-2)

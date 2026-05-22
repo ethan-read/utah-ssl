@@ -318,14 +318,15 @@ def load_precomputed_split_feature_stats(
         raise ValueError(f"Precomputed split stats payload must be a dict: {path}")
     mean_t = torch.as_tensor(payload.get("mean")).float().cpu()
     std_t = torch.as_tensor(payload.get("std")).float().cpu()
-    if mean_t.numel() < expected_dim or std_t.numel() < expected_dim:
+    if mean_t.numel() != expected_dim or std_t.numel() != expected_dim:
         raise ValueError(
-            f"Precomputed split stats payload is too small: expected at least {expected_dim} values, "
-            f"got mean={mean_t.numel()} std={std_t.numel()}."
+            f"Precomputed split stats payload has the wrong size: expected exactly {expected_dim} values "
+            f"after the area-6v migration, got mean={mean_t.numel()} std={std_t.numel()}. "
+            "Recompute stats from the migrated cache."
         )
     return (
-        mean_t[:expected_dim].numpy().astype(np.float32, copy=False),
-        std_t[:expected_dim].numpy().astype(np.float32, copy=False),
+        mean_t.numpy().astype(np.float32, copy=False),
+        std_t.numpy().astype(np.float32, copy=False),
     ), dict(payload.get("metadata", {})), path
 
 

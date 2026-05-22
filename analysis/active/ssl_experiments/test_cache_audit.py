@@ -24,8 +24,8 @@ def _write_dataset(
     dataset_name: str,
     *,
     lengths_by_session: dict[str, list[int]],
-    tx_dim: int = 256,
-    sbp_dim: int = 256,
+    tx_dim: int = 128,
+    sbp_dim: int = 128,
     include_metadata: bool = True,
     smoothing_sigma: float | None = None,
     tx_offset: float = 0.0,
@@ -162,29 +162,29 @@ class CacheAuditTests(unittest.TestCase):
             self.assertIn("no_manifest_rows_support_segment_bins_80", ds["findings"])
             self.assertFalse(ds["feature_mode_audits"]["tx_only"]["train_sampling_ok"])
 
-    def test_256_dim_stats_flagged_incompatible_with_tx_sbp(self) -> None:
+    def test_128_dim_stats_flagged_tx_only_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
             raw_root = tmp / "cache"
             _write_dataset(raw_root, "brain2text24", lengths_by_session={"t00.2025.01.01": [120], "t00.2025.01.02": [160]})
             stats_path = tmp / "stats.pt"
-            _write_stats(stats_path, session_ids=["t00.2025.01.01", "t00.2025.01.02"], dim=256)
+            _write_stats(stats_path, session_ids=["t00.2025.01.01", "t00.2025.01.02"], dim=128)
             report = run_audit(cache_roots=[raw_root], stats_paths=[stats_path], dataset="brain2text24", segment_bins=80)
             stats = report["stats_audits"][0]
             self.assertTrue(stats["compatible_feature_modes"]["tx_only"])
             self.assertFalse(stats["compatible_feature_modes"]["tx_sbp"])
             self.assertIn("tx_only_only_not_tx_sbp", stats["findings"])
 
-    def test_matching_stats_are_marked_usable(self) -> None:
+    def test_256_dim_stats_are_tx_sbp_only_after_area6v_migration(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
             raw_root = tmp / "cache"
             _write_dataset(raw_root, "brain2text24", lengths_by_session={"t00.2025.01.01": [120], "t00.2025.01.02": [160]})
             stats_path = tmp / "stats.pt"
-            _write_stats(stats_path, session_ids=["t00.2025.01.01", "t00.2025.01.02"], dim=512, sigma=2.0)
+            _write_stats(stats_path, session_ids=["t00.2025.01.01", "t00.2025.01.02"], dim=256, sigma=2.0)
             report = run_audit(cache_roots=[raw_root], stats_paths=[stats_path], dataset="brain2text24", segment_bins=80)
             stats = report["stats_audits"][0]
-            self.assertTrue(stats["compatible_feature_modes"]["tx_only"])
+            self.assertFalse(stats["compatible_feature_modes"]["tx_only"])
             self.assertTrue(stats["compatible_feature_modes"]["tx_sbp"])
 
     def test_mixed_dimension_stats_are_not_marked_tx_sbp_compatible(self) -> None:
@@ -196,8 +196,8 @@ class CacheAuditTests(unittest.TestCase):
             _write_stats(
                 stats_path,
                 session_ids=["t00.2025.01.01", "t00.2025.01.02"],
-                dim=512,
-                per_session_dims={"t00.2025.01.01": 512, "t00.2025.01.02": 256},
+                dim=256,
+                per_session_dims={"t00.2025.01.01": 256, "t00.2025.01.02": 128},
             )
             report = run_audit(cache_roots=[raw_root], stats_paths=[stats_path], dataset="brain2text24", segment_bins=80)
             stats = report["stats_audits"][0]
@@ -210,7 +210,7 @@ class CacheAuditTests(unittest.TestCase):
             raw_root = tmp / "cache"
             _write_dataset(raw_root, "brain2text24", lengths_by_session={"t00.2025.01.01": [120], "t00.2025.01.02": [160]})
             stats_path = tmp / "stats.pt"
-            _write_stats(stats_path, session_ids=["t00.2025.01.01", "t00.2099.12.31"], dim=512)
+            _write_stats(stats_path, session_ids=["t00.2025.01.01", "t00.2099.12.31"], dim=256)
             report = run_audit(cache_roots=[raw_root], stats_paths=[stats_path], dataset="brain2text24", segment_bins=80)
             comparison = report["stats_root_comparisons"][0]["datasets"]["brain2text24"]
             findings = report["stats_root_comparisons"][0]["findings"]

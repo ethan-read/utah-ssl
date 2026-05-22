@@ -13,8 +13,8 @@ import torch
 from masked_ssl.cache import CacheAccessConfig, prepare_cache_context
 
 
-DEFAULT_TX_DIM = 256
-DEFAULT_SBP_DIM = 256
+DEFAULT_TX_DIM = 128
+DEFAULT_SBP_DIM = 128
 DEFAULT_EXCLUDED_DATASETS = ("brain2text25",)
 
 
@@ -52,6 +52,11 @@ def recompute_session_feature_stats(
         raise FileNotFoundError(f"Cache root does not exist: {cache_root}")
     if output_path.exists() and not overwrite:
         raise FileExistsError(f"Output file already exists: {output_path}")
+    if output_path.exists() and overwrite:
+        output_path.unlink()
+    metadata_path = output_path.with_suffix(".json")
+    if metadata_path.exists() and overwrite:
+        metadata_path.unlink()
 
     requested_datasets = _normalize_dataset_args(datasets)
     available_datasets = sorted(
@@ -115,9 +120,11 @@ def recompute_session_feature_stats(
     }
     output_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(payload, output_path)
+    metadata_path.write_text(json.dumps(metadata, indent=2) + "\n")
 
     return {
         "output_path": output_path,
+        "metadata_path": metadata_path,
         "metadata": metadata,
         "session_count": int(len(session_feature_stats)),
         "dataset_count": int(len(context.pretrain_datasets)),

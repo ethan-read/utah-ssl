@@ -245,7 +245,7 @@ Implementation note:
 - all channels in a bin are treated as simultaneous measurements, so the per-bin attention is mainly compressing cross-channel structure
 - temporal modeling is mainly handled across bins by the `GRU`
 - whether channel masking is needed for this dataset should be checked from the saved cache rather than assumed
-- for the cached `brain2text24` data, the feature axis is structurally dense (`256` `TX` + `256` `SBP`), so we do not currently need a missing-unit mask for structural absence
+- for the active cached `brain2text24` data, the feature axis should be structurally dense after the area-6v migration (`128` `TX` + `128` `SBP`), so we do not currently need a missing-unit mask for structural absence
 
 ## Working Stage-1 Reconstruction Choice
 
@@ -334,7 +334,7 @@ Data and targets:
 - dataset: `brain2text24`
 - bin size: `20 ms`
 - input modalities: `TX + SBP`
-- feature width: `512 = 256 TX + 256 SBP`
+- feature width after the area-6v cache migration: `256 = 128 TX + 128 SBP`
 - no structural missing-unit mask
 - phoneme vocabulary: use the cached `CTC` targets from the canonical dataset
 
