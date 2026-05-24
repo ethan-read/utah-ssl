@@ -24,6 +24,7 @@ from masked_ssl.cache import (
     CacheAccessConfig,
     _apply_gaussian_smoothing,
     _compute_session_feature_stats,
+    _compute_cache_source_signature,
     load_precomputed_session_feature_stats_into_cache_context,
     prepare_cache_context,
     sample_base_segment,
@@ -55,6 +56,9 @@ from masked_ssl.training import recover_ssl_run_state_from_checkpoint
 from s5 import BidirectionalS5SequenceBackbone, S5SequenceBackbone, reverse_padded_sequence
 from build_smoothed_cache import build_smoothed_cache
 from recompute_session_feature_stats import recompute_session_feature_stats
+from analysis.active.ssl_experiments.stats_artifact_test_utils import (
+    write_valid_session_stats_artifact as _write_valid_session_stats_artifact,
+)
 
 
 def _make_model(
@@ -756,15 +760,18 @@ class MaskedSSLTests(unittest.TestCase):
             cache_root = tmp_path / "cache_v1"
             stats_path = tmp_path / "session_stats.pt"
             _write_tiny_pretrain_cache(cache_root, dataset="toyset")
-            torch.save(
-                {
-                    "session_feature_stats": {
-                        "toyset:toy.2025.01.01": (torch.zeros(4), torch.ones(4)),
-                        "toyset:toy.2025.01.02": (torch.full((4,), 2.0), torch.ones(4)),
-                    },
-                    "metadata": {"kind": "test"},
+            _write_valid_session_stats_artifact(
+                cache_root=cache_root,
+                stats_path=stats_path,
+                stats_entries={
+                    "toyset:toy.2025.01.01": (torch.zeros(4), torch.ones(4)),
+                    "toyset:toy.2025.01.02": (torch.full((4,), 2.0), torch.ones(4)),
                 },
-                stats_path,
+                feature_mode="tx_sbp",
+                boundary_key_mode="session",
+                tx_dim=2,
+                sbp_dim=2,
+                excluded_datasets=(),
             )
 
             with mock.patch(
@@ -806,16 +813,18 @@ class MaskedSSLTests(unittest.TestCase):
                 / "ssl_pretrain_all_datasets_v1.pt"
             )
             _write_tiny_pretrain_cache(cache_root, dataset="toyset")
-            stats_path.parent.mkdir(parents=True, exist_ok=True)
-            torch.save(
-                {
-                    "session_feature_stats": {
-                        "toyset:toy.2025.01.01": (torch.zeros(4), torch.ones(4)),
-                        "toyset:toy.2025.01.02": (torch.full((4,), 3.0), torch.ones(4)),
-                    },
-                    "metadata": {"kind": "test"},
+            _write_valid_session_stats_artifact(
+                cache_root=cache_root,
+                stats_path=stats_path,
+                stats_entries={
+                    "toyset:toy.2025.01.01": (torch.zeros(4), torch.ones(4)),
+                    "toyset:toy.2025.01.02": (torch.full((4,), 3.0), torch.ones(4)),
                 },
-                stats_path,
+                feature_mode="tx_sbp",
+                boundary_key_mode="session",
+                tx_dim=2,
+                sbp_dim=2,
+                excluded_datasets=(),
             )
 
             with mock.patch(
@@ -837,6 +846,112 @@ class MaskedSSLTests(unittest.TestCase):
             mean, std = context.session_feature_stats["toyset:toy.2025.01.02"]
             self.assertTrue(torch.equal(mean, torch.full((4,), 3.0)))
             self.assertTrue(torch.equal(std, torch.ones(4)))
+
+    def test_prepare_cache_context_fails_for_missing_canonical_session_stats(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            cache_root = tmp_path / "cache_v1"
+            _write_tiny_pretrain_cache(cache_root, dataset="toyset")
+
+            with self.assertRaisesRegex(FileNotFoundError, "recompute_command:"):
+                prepare_cache_context(
+                    cache_candidates=[cache_root],
+                    config=CacheAccessConfig(
+                        mode="drive_direct",
+                        excluded_datasets=(),
+                        feature_mode="tx_sbp",
+                        tx_dim=2,
+                        sbp_dim=2,
+                        use_normalization=True,
+                    ),
+                )
+
+    def test_prepare_cache_context_fails_for_missing_session_stats_sidecar(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            cache_root = tmp_path / "cache_v1"
+            stats_path = (
+                tmp_path
+                / "stats"
+                / "session_feature_stats"
+                / "raw"
+                / "tx_sbp"
+                / "session"
+                / "ssl_pretrain_all_datasets_v1.pt"
+            )
+            _write_tiny_pretrain_cache(cache_root, dataset="toyset")
+            _write_valid_session_stats_artifact(
+                cache_root=cache_root,
+                stats_path=stats_path,
+                stats_entries={
+                    "toyset:toy.2025.01.01": (torch.zeros(4), torch.ones(4)),
+                    "toyset:toy.2025.01.02": (torch.full((4,), 3.0), torch.ones(4)),
+                },
+                feature_mode="tx_sbp",
+                boundary_key_mode="session",
+                tx_dim=2,
+                sbp_dim=2,
+                excluded_datasets=(),
+            )
+            stats_path.with_suffix(".json").unlink()
+
+            with self.assertRaisesRegex(FileNotFoundError, "missing_sidecar"):
+                prepare_cache_context(
+                    cache_candidates=[cache_root],
+                    config=CacheAccessConfig(
+                        mode="drive_direct",
+                        excluded_datasets=(),
+                        feature_mode="tx_sbp",
+                        tx_dim=2,
+                        sbp_dim=2,
+                        use_normalization=True,
+                    ),
+                )
+
+    def test_prepare_cache_context_fails_for_stale_session_stats_signature(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            cache_root = tmp_path / "cache_v1"
+            stats_path = (
+                tmp_path
+                / "stats"
+                / "session_feature_stats"
+                / "raw"
+                / "tx_sbp"
+                / "session"
+                / "ssl_pretrain_all_datasets_v1.pt"
+            )
+            _write_tiny_pretrain_cache(cache_root, dataset="toyset")
+            _write_valid_session_stats_artifact(
+                cache_root=cache_root,
+                stats_path=stats_path,
+                stats_entries={
+                    "toyset:toy.2025.01.01": (torch.zeros(4), torch.ones(4)),
+                    "toyset:toy.2025.01.02": (torch.full((4,), 3.0), torch.ones(4)),
+                },
+                feature_mode="tx_sbp",
+                boundary_key_mode="session",
+                tx_dim=2,
+                sbp_dim=2,
+                excluded_datasets=(),
+            )
+            payload = torch.load(stats_path, map_location="cpu")
+            payload["metadata"]["source_cache_signature"] = "stale"
+            torch.save(payload, stats_path)
+            stats_path.with_suffix(".json").write_text(json.dumps(payload["metadata"], indent=2) + "\n")
+
+            with self.assertRaisesRegex(ValueError, "source_cache_signature"):
+                prepare_cache_context(
+                    cache_candidates=[cache_root],
+                    config=CacheAccessConfig(
+                        mode="drive_direct",
+                        excluded_datasets=(),
+                        feature_mode="tx_sbp",
+                        tx_dim=2,
+                        sbp_dim=2,
+                        use_normalization=True,
+                    ),
+                )
 
     def test_resolve_cache_candidates_for_sigma_finds_sibling_smoothed_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -946,6 +1061,7 @@ class MaskedSSLTests(unittest.TestCase):
                 sbp_dim=2,
                 segment_bins=3,
                 use_normalization=True,
+                precomputed_session_stats_path=output_path,
             )
             context = prepare_cache_context(cache_candidates=[cache_root], config=cache_context)
             loaded = load_precomputed_session_feature_stats_into_cache_context(
@@ -954,6 +1070,48 @@ class MaskedSSLTests(unittest.TestCase):
             )
             self.assertEqual(int(loaded["session_count"]), 2)
             self.assertEqual(len(context.session_feature_stats), 2)
+
+    def test_recompute_session_feature_stats_sidecar_only_requires_overwrite(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            cache_root = tmp_path / "cache_v1"
+            output_path = tmp_path / "session_stats.pt"
+            _write_tiny_pretrain_cache(cache_root, dataset="toyset")
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.with_suffix(".json").write_text("{}\n")
+
+            with self.assertRaisesRegex(FileExistsError, "Output already exists"):
+                recompute_session_feature_stats(
+                    cache_root=cache_root,
+                    output_path=output_path,
+                    feature_mode="tx_sbp",
+                    boundary_key_mode="session",
+                    datasets=("toyset",),
+                    tx_dim=2,
+                    sbp_dim=2,
+                    segment_bins=3,
+                    seed=7,
+                    examples_per_shard=1,
+                    excluded_datasets=(),
+                    overwrite=False,
+                )
+
+            result = recompute_session_feature_stats(
+                cache_root=cache_root,
+                output_path=output_path,
+                feature_mode="tx_sbp",
+                boundary_key_mode="session",
+                datasets=("toyset",),
+                tx_dim=2,
+                sbp_dim=2,
+                segment_bins=3,
+                seed=7,
+                examples_per_shard=1,
+                excluded_datasets=(),
+                overwrite=True,
+            )
+            self.assertTrue(output_path.exists())
+            self.assertEqual(int(result["session_count"]), 2)
 
     def test_sample_mask_indices_one_span_is_contiguous_and_matches_target_count(self) -> None:
         random.seed(0)

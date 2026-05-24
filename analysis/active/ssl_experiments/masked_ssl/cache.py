@@ -33,6 +33,7 @@ RUNTIME_SMOOTHING_MIGRATION_MESSAGE = (
 # Fixed stride for session-stat computation to match the normalized cache artifacts.
 SESSION_STATS_BIN_STRIDE = 2
 AREA6V_FEATURE_DIM = 128
+FEATURE_POLICY = "area6v_v1"
 
 
 @dataclass
@@ -258,15 +259,119 @@ def resolve_precomputed_session_stats_path(
         feature_mode=feature_mode,
         boundary_key_mode=boundary_key_mode,
     )
-    preferred = stats_dir / (
+    return stats_dir / (
         f"{_canonical_session_stats_stem(excluded_datasets=excluded_datasets)}.pt"
     )
-    if preferred.exists():
-        return preferred
-    candidates = sorted(stats_dir.glob("*.pt"))
-    if len(candidates) == 1:
-        return candidates[0]
-    return None
+
+
+def _load_artifact_payload_and_sidecar(
+    *,
+    path: str | Path,
+    canonical_path: str | Path,
+    recompute_cmd: str,
+    artifact_name: str,
+    expected_kind: str | None = None,
+) -> tuple[dict[str, Any], dict[str, Any], Path, Path]:
+    resolved_path = Path(path)
+    expected_path = Path(canonical_path)
+    if not resolved_path.exists():
+        raise FileNotFoundError(
+            f"Precomputed {artifact_name} file does not exist.\n"
+            f"expected_path: {expected_path}\n"
+            f"requested_path: {resolved_path}\n"
+            f"recompute_command: {recompute_cmd}"
+        )
+    metadata_path = resolved_path.with_suffix(".json")
+    if not metadata_path.exists():
+        raise FileNotFoundError(
+            f"Precomputed {artifact_name} sidecar is missing.\n"
+            f"expected_path: {expected_path}\n"
+            f"requested_path: {resolved_path}\n"
+            f"missing_sidecar: {metadata_path}\n"
+            f"recompute_command: {recompute_cmd}"
+        )
+
+    payload = torch.load(resolved_path, map_location="cpu", weights_only=False)
+    if not isinstance(payload, dict):
+        raise ValueError(f"Precomputed {artifact_name} payload must be a dict: {resolved_path}")
+
+    sidecar_metadata = json.loads(metadata_path.read_text())
+    if not isinstance(sidecar_metadata, dict):
+        raise ValueError(
+            f"Precomputed {artifact_name} sidecar must be a JSON object.\n"
+            f"requested_path: {resolved_path}\n"
+            f"metadata_path: {metadata_path}\n"
+            f"recompute_command: {recompute_cmd}"
+        )
+
+    metadata = dict(payload.get("metadata", {}))
+    if metadata != sidecar_metadata:
+        raise ValueError(
+            f"Precomputed {artifact_name} payload metadata does not match the JSON sidecar.\n"
+            f"expected_path: {expected_path}\n"
+            f"requested_path: {resolved_path}\n"
+            f"metadata_path: {metadata_path}\n"
+            f"recompute_command: {recompute_cmd}"
+        )
+    if expected_kind is not None and metadata.get("kind") != str(expected_kind):
+        raise ValueError(
+            f"Precomputed {artifact_name} artifact has the wrong kind.\n"
+            f"expected_path: {expected_path}\n"
+            f"requested_path: {resolved_path}\n"
+            f"reason: kind={metadata.get('kind')!r} expected {str(expected_kind)!r}\n"
+            f"recompute_command: {recompute_cmd}"
+        )
+    return payload, metadata, resolved_path, metadata_path
+
+
+def _validate_common_artifact_metadata(
+    *,
+    metadata: dict[str, Any],
+    expected_metadata: dict[str, Any],
+) -> list[str]:
+    return [
+        f"{key}={metadata.get(key)!r} expected {value!r}"
+        for key, value in expected_metadata.items()
+        if metadata.get(key) != value
+    ]
+
+
+def build_recompute_session_feature_stats_command(
+    *,
+    cache_root: str | Path,
+    output_path: str | Path,
+    feature_mode: str,
+    boundary_key_mode: str,
+    tx_dim: int,
+    sbp_dim: int,
+    segment_bins: int,
+    examples_per_shard: int,
+    excluded_datasets: Sequence[str],
+) -> str:
+    cmd = [
+        "python",
+        "analysis/active/ssl_experiments/recompute_session_feature_stats.py",
+        "--cache-root",
+        str(Path(cache_root)),
+        "--output-path",
+        str(Path(output_path)),
+        "--feature-mode",
+        str(feature_mode),
+        "--boundary-key-mode",
+        str(boundary_key_mode),
+        "--tx-dim",
+        str(int(tx_dim)),
+        "--sbp-dim",
+        str(int(sbp_dim)),
+        "--segment-bins",
+        str(int(segment_bins)),
+        "--examples-per-shard",
+        str(int(examples_per_shard)),
+    ]
+    for dataset in excluded_datasets:
+        cmd.extend(["--excluded-dataset", str(dataset)])
+    cmd.append("--overwrite")
+    return " ".join(cmd)
 
 
 def _format_bytes(num_bytes: int) -> str:
@@ -304,7 +409,11 @@ def _compute_cache_source_signature(src_root: Path) -> str:
         raise last_error
 
     datasets = []
-    for dataset_root in (path for path in list_dir_with_retries(src_root) if path.is_dir()):
+    for dataset_root in (
+        path
+        for path in list_dir_with_retries(src_root)
+        if path.is_dir() and (path / "metadata.json").exists()
+    ):
         shard_root = dataset_root / "shards"
         shard_names: list[str] = []
         shard_scan_error: str | None = None
@@ -734,8 +843,15 @@ def load_precomputed_session_feature_stats_into_cache_context(
 ) -> dict[str, Any]:
     session_feature_stats, metadata, path = _load_precomputed_session_feature_stats(
         stats_path=stats_path,
+        cache_root=cache_context.drive_cache_root,
         expected_dim=int(cache_context.full_dim),
         feature_mode=str(cache_context.feature_mode),
+        boundary_key_mode=str(cache_context.boundary_key_mode),
+        excluded_datasets=cache_context.config.excluded_datasets,
+        tx_dim=int(cache_context.tx_dim),
+        sbp_dim=int(cache_context.sbp_dim),
+        segment_bins=int(cache_context.config.segment_bins),
+        examples_per_shard=int(cache_context.config.examples_per_shard),
     )
     cache_context.session_feature_stats = dict(session_feature_stats)
     return {
@@ -750,14 +866,41 @@ def load_precomputed_session_feature_stats_into_cache_context(
 def _load_precomputed_session_feature_stats(
     *,
     stats_path: str | Path,
+    cache_root: str | Path,
     expected_dim: int,
     feature_mode: str,
+    boundary_key_mode: str,
+    excluded_datasets: Sequence[str],
+    tx_dim: int,
+    sbp_dim: int,
+    segment_bins: int,
+    examples_per_shard: int,
 ) -> tuple[dict[str, tuple[torch.Tensor, torch.Tensor]], dict[str, Any], Path]:
     path = Path(stats_path)
-    if not path.exists():
-        raise FileNotFoundError(f"Precomputed session stats file does not exist: {path}")
-
-    payload = torch.load(path, map_location="cpu")
+    canonical_path = resolve_precomputed_session_stats_path(
+        cache_root=cache_root,
+        feature_mode=str(feature_mode),
+        boundary_key_mode=str(boundary_key_mode),
+        excluded_datasets=excluded_datasets,
+    )
+    recompute_cmd = build_recompute_session_feature_stats_command(
+        cache_root=cache_root,
+        output_path=canonical_path,
+        feature_mode=str(feature_mode),
+        boundary_key_mode=str(boundary_key_mode),
+        tx_dim=int(tx_dim),
+        sbp_dim=int(sbp_dim),
+        segment_bins=int(segment_bins),
+        examples_per_shard=int(examples_per_shard),
+        excluded_datasets=excluded_datasets,
+    )
+    payload, metadata, path, _ = _load_artifact_payload_and_sidecar(
+        path=path,
+        canonical_path=canonical_path,
+        recompute_cmd=recompute_cmd,
+        artifact_name="session stats",
+        expected_kind="session_featurewise_zscore_stats",
+    )
     raw_stats = payload.get("session_feature_stats")
     if not isinstance(raw_stats, dict):
         raise KeyError("Precomputed session stats payload is missing 'session_feature_stats'.")
@@ -773,13 +916,50 @@ def _load_precomputed_session_feature_stats(
         std_t = torch.as_tensor(std).float().cpu()
         if mean_t.numel() != expected_dim or std_t.numel() != expected_dim:
             raise ValueError(
-                f"Session stats entry for {key!r} has the wrong size for feature_mode={feature_mode!r}: "
-                f"expected exactly {expected_dim} values after the area-6v migration, "
-                f"got mean={mean_t.numel()} std={std_t.numel()}. Recompute stats from the migrated cache."
+                "Precomputed session stats artifact is stale or incompatible.\n"
+                f"expected_path: {canonical_path}\n"
+                f"requested_path: {path}\n"
+                f"reason: entry {key!r} has dim mean:{mean_t.numel()} std:{std_t.numel()} expected {expected_dim}\n"
+                f"recompute_command: {recompute_cmd}"
             )
         session_feature_stats[str(key)] = (mean_t, std_t)
 
-    metadata = dict(payload.get("metadata", {}))
+    expected_cache_root = str(Path(cache_root).resolve())
+    expected_cache_variant = _cache_variant_name(cache_root)
+    expected_cache_signature = _compute_cache_source_signature(Path(cache_root))
+    common_metadata = {
+        "source_cache_root": expected_cache_root,
+        "source_cache_variant": expected_cache_variant,
+        "source_cache_signature": expected_cache_signature,
+        "feature_mode": str(feature_mode),
+        "feature_policy": FEATURE_POLICY,
+    }
+    session_metadata = {
+        "boundary_key_mode": str(boundary_key_mode),
+        "tx_dim": int(tx_dim),
+        "sbp_dim": int(sbp_dim),
+        "full_dim": int(expected_dim),
+        "excluded_datasets": list(str(item) for item in excluded_datasets),
+    }
+    mismatches = _validate_common_artifact_metadata(
+        metadata=metadata,
+        expected_metadata=common_metadata,
+    )
+    mismatches.extend(
+        _validate_common_artifact_metadata(
+            metadata=metadata,
+            expected_metadata=session_metadata,
+        )
+    )
+    if mismatches:
+        mismatch_text = "; ".join(mismatches)
+        raise ValueError(
+            "Precomputed session stats artifact is stale or incompatible.\n"
+            f"expected_path: {canonical_path}\n"
+            f"requested_path: {path}\n"
+            f"reason: {mismatch_text}\n"
+            f"recompute_command: {recompute_cmd}"
+        )
     return session_feature_stats, metadata, path
 
 
@@ -1204,25 +1384,25 @@ def prepare_cache_context(
             Path(config.precomputed_session_stats_path)
             if config.precomputed_session_stats_path is not None
             else resolve_precomputed_session_stats_path(
-                cache_root=cache_root,
+                cache_root=drive_cache_root,
                 feature_mode=str(config.feature_mode),
                 boundary_key_mode=str(config.boundary_key_mode),
                 excluded_datasets=config.excluded_datasets,
             )
         )
-        if resolved_stats_path is not None:
-            session_feature_stats, _, stats_path = _load_precomputed_session_feature_stats(
-                stats_path=resolved_stats_path,
-                expected_dim=int(config.full_dim),
-                feature_mode=str(config.feature_mode),
-            )
-            print(f"loaded precomputed SSL session-level featurewise z-scoring stats: {stats_path}")
-        else:
-            session_feature_stats = _compute_session_feature_stats(
-                shard_store=shard_store,
-                rows_by_dataset=rows_by_dataset,
-                config=config,
-            )
+        session_feature_stats, _, stats_path = _load_precomputed_session_feature_stats(
+            stats_path=resolved_stats_path,
+            cache_root=drive_cache_root,
+            expected_dim=int(config.full_dim),
+            feature_mode=str(config.feature_mode),
+            boundary_key_mode=str(config.boundary_key_mode),
+            excluded_datasets=config.excluded_datasets,
+            tx_dim=int(config.tx_dim),
+            sbp_dim=int(config.sbp_dim),
+            segment_bins=int(config.segment_bins),
+            examples_per_shard=int(config.examples_per_shard),
+        )
+        print(f"loaded precomputed SSL session-level featurewise z-scoring stats: {stats_path}")
 
     return CacheContext(
         config=config,

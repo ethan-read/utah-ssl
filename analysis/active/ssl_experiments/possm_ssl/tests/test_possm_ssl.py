@@ -12,6 +12,14 @@ from unittest import mock
 import numpy as np
 import torch
 
+from masked_ssl.cache import _compute_cache_source_signature
+from recompute_split_feature_stats import (
+    resolve_precomputed_split_stats_path as resolve_canonical_split_stats_path,
+)
+from analysis.active.ssl_experiments.stats_artifact_test_utils import (
+    write_valid_split_stats_artifact as _write_valid_split_stats_artifact,
+)
+
 
 REPO_ROOT = Path(__file__).resolve().parents[5]
 EXPERIMENTS_DIR = REPO_ROOT / "analysis" / "active" / "ssl_experiments"
@@ -289,6 +297,23 @@ def _write_tiny_canonical_probe_cache(cache_root: Path) -> None:
         },
     }
     (dataset_root / "metadata.json").write_text(json.dumps(metadata))
+    for feature_mode, dim in (("tx_sbp", 5), ("tx_only", 3)):
+        _write_valid_split_stats_artifact(
+            cache_root=cache_root,
+            stats_path=resolve_canonical_split_stats_path(
+                cache_root=cache_root,
+                dataset="brain2text24",
+                train_split_name="competition_train",
+                feature_mode=feature_mode,
+                preferred_path=None,
+            ),
+            dataset="brain2text24",
+            feature_mode=feature_mode,
+            boundary_key_mode="session",
+            train_split_name="competition_train",
+            val_split_name="competition_test",
+            dim=dim,
+        )
 
 
 def _make_stage1_checkpoint(
@@ -1203,14 +1228,15 @@ class POSSMSSLTests(unittest.TestCase):
                 / "tx_sbp"
                 / "global_v1.pt"
             )
-            stats_path.parent.mkdir(parents=True, exist_ok=True)
-            torch.save(
-                {
-                    "mean": torch.zeros(5),
-                    "std": torch.ones(5),
-                    "metadata": {"kind": "split_feature_stats", "source": "test"},
-                },
-                stats_path,
+            _write_valid_split_stats_artifact(
+                cache_root=cache_root,
+                stats_path=stats_path,
+                dataset="brain2text24",
+                feature_mode="tx_sbp",
+                boundary_key_mode="session",
+                train_split_name="competition_train",
+                val_split_name="competition_test",
+                dim=5,
             )
 
             with mock.patch(
@@ -1243,9 +1269,186 @@ class POSSMSSLTests(unittest.TestCase):
 
             self.assertEqual(summary["precomputed_split_stats_path"], str(stats_path))
             self.assertEqual(
-                summary["precomputed_split_stats_metadata"],
-                {"kind": "split_feature_stats", "source": "test"},
+                summary["precomputed_split_stats_metadata"]["feature_mode"],
+                "tx_sbp",
             )
+            self.assertEqual(
+                int(summary["precomputed_split_stats_metadata"]["feature_dim"]),
+                5,
+            )
+
+    def test_run_possm_phoneme_finetuning_fails_for_missing_split_stats_sidecar(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            cache_root = tmp_path / "cache_v1"
+            checkpoint_path = _make_stage1_checkpoint(tmp_path, temporal_gru_hidden_size=7)
+            _write_tiny_canonical_probe_cache(cache_root)
+            stats_path = (
+                tmp_path
+                / "stats"
+                / "split_feature_stats"
+                / "raw"
+                / "brain2text24"
+                / "competition_train"
+                / "tx_sbp"
+                / "global_v1.pt"
+            )
+            _write_valid_split_stats_artifact(
+                cache_root=cache_root,
+                stats_path=stats_path,
+                dataset="brain2text24",
+                feature_mode="tx_sbp",
+                boundary_key_mode="session",
+                train_split_name="competition_train",
+                val_split_name="competition_test",
+                dim=5,
+            )
+            stats_path.with_suffix(".json").unlink()
+
+            with self.assertRaisesRegex(FileNotFoundError, "missing_sidecar"):
+                run_possm_phoneme_finetuning(
+                    checkpoint_path=checkpoint_path,
+                    cache_root=cache_root,
+                    config=POSSMFinetuneConfig(
+                        seed=7,
+                        mode="probe_frozen",
+                        dataset="brain2text24",
+                        feature_mode="tx_sbp",
+                        data_mode="normalized",
+                        batch_size=1,
+                        num_steps=1,
+                        learning_rate=1e-3,
+                        encoder_learning_rate=3e-4,
+                        checkpoint_every_steps=1,
+                        input_smoothing_sigma_bins=0.0,
+                        gru_hidden_size=8,
+                        gru_num_layers=2,
+                        gru_dropout=0.0,
+                        conv_kernel_size=3,
+                        conv_stride=1,
+                    ),
+                    device=torch.device("cpu"),
+                )
+
+    def test_run_possm_phoneme_finetuning_fails_for_wrong_split_stats_kind(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            cache_root = tmp_path / "cache_v1"
+            checkpoint_path = _make_stage1_checkpoint(tmp_path, temporal_gru_hidden_size=7)
+            _write_tiny_canonical_probe_cache(cache_root)
+            stats_path = (
+                tmp_path
+                / "stats"
+                / "split_feature_stats"
+                / "raw"
+                / "brain2text24"
+                / "competition_train"
+                / "tx_sbp"
+                / "global_v1.pt"
+            )
+            payload = {
+                "session_feature_stats": {
+                    "brain2text24:t00.2025.01.01": (torch.zeros(5), torch.ones(5)),
+                },
+                "metadata": {
+                    "kind": "session_featurewise_zscore_stats",
+                    "source_cache_root": str(cache_root.resolve()),
+                    "source_cache_name": cache_root.name,
+                    "source_cache_variant": "raw",
+                    "source_cache_signature": _compute_cache_source_signature(cache_root),
+                    "feature_mode": "tx_sbp",
+                    "boundary_key_mode": "session",
+                    "tx_dim": 3,
+                    "sbp_dim": 2,
+                    "full_dim": 5,
+                    "feature_policy": "area6v_v1",
+                    "excluded_datasets": [],
+                },
+            }
+            stats_path.parent.mkdir(parents=True, exist_ok=True)
+            torch.save(payload, stats_path)
+            stats_path.with_suffix(".json").write_text(json.dumps(payload["metadata"], indent=2) + "\n")
+
+            with self.assertRaisesRegex(ValueError, "wrong kind"):
+                run_possm_phoneme_finetuning(
+                    checkpoint_path=checkpoint_path,
+                    cache_root=cache_root,
+                    config=POSSMFinetuneConfig(
+                        seed=7,
+                        mode="probe_frozen",
+                        dataset="brain2text24",
+                        feature_mode="tx_sbp",
+                        data_mode="normalized",
+                        batch_size=1,
+                        num_steps=1,
+                        learning_rate=1e-3,
+                        encoder_learning_rate=3e-4,
+                        checkpoint_every_steps=1,
+                        input_smoothing_sigma_bins=0.0,
+                        gru_hidden_size=8,
+                        gru_num_layers=2,
+                        gru_dropout=0.0,
+                        conv_kernel_size=3,
+                        conv_stride=1,
+                    ),
+                    device=torch.device("cpu"),
+                )
+
+    def test_run_possm_phoneme_finetuning_fails_for_stale_split_stats_signature(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            cache_root = tmp_path / "cache_v1"
+            checkpoint_path = _make_stage1_checkpoint(tmp_path, temporal_gru_hidden_size=7)
+            _write_tiny_canonical_probe_cache(cache_root)
+            stats_path = (
+                tmp_path
+                / "stats"
+                / "split_feature_stats"
+                / "raw"
+                / "brain2text24"
+                / "competition_train"
+                / "tx_sbp"
+                / "global_v1.pt"
+            )
+            _write_valid_split_stats_artifact(
+                cache_root=cache_root,
+                stats_path=stats_path,
+                dataset="brain2text24",
+                feature_mode="tx_sbp",
+                boundary_key_mode="session",
+                train_split_name="competition_train",
+                val_split_name="competition_test",
+                dim=5,
+            )
+            payload = torch.load(stats_path, map_location="cpu")
+            payload["metadata"]["source_cache_signature"] = "stale"
+            torch.save(payload, stats_path)
+            stats_path.with_suffix(".json").write_text(json.dumps(payload["metadata"], indent=2) + "\n")
+
+            with self.assertRaisesRegex(ValueError, "source_cache_signature"):
+                run_possm_phoneme_finetuning(
+                    checkpoint_path=checkpoint_path,
+                    cache_root=cache_root,
+                    config=POSSMFinetuneConfig(
+                        seed=7,
+                        mode="probe_frozen",
+                        dataset="brain2text24",
+                        feature_mode="tx_sbp",
+                        data_mode="normalized",
+                        batch_size=1,
+                        num_steps=1,
+                        learning_rate=1e-3,
+                        encoder_learning_rate=3e-4,
+                        checkpoint_every_steps=1,
+                        input_smoothing_sigma_bins=0.0,
+                        gru_hidden_size=8,
+                        gru_num_layers=2,
+                        gru_dropout=0.0,
+                        conv_kernel_size=3,
+                        conv_stride=1,
+                    ),
+                    device=torch.device("cpu"),
+                )
 
     def test_recover_possm_stage2_summary_prefers_latest_step_for_interrupted_run(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1532,6 +1735,22 @@ class POSSMSSLTests(unittest.TestCase):
                 if row["example_id"] == "holdout-0":
                     row["source_split"] = "competition_train"
             manifest_path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            _write_valid_split_stats_artifact(
+                cache_root=tmp_path,
+                stats_path=resolve_canonical_split_stats_path(
+                    cache_root=tmp_path,
+                    dataset="brain2text24",
+                    train_split_name="competition_train",
+                    feature_mode="tx_sbp",
+                    preferred_path=None,
+                ),
+                dataset="brain2text24",
+                feature_mode="tx_sbp",
+                boundary_key_mode="session",
+                train_split_name="competition_train",
+                val_split_name="competition_test",
+                dim=5,
+            )
 
             summary = run_possm_phoneme_finetuning(
                 checkpoint_path=checkpoint_path,

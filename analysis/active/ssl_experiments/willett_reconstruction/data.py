@@ -11,8 +11,6 @@ import torch
 
 try:
     from masked_ssl.cache import (
-        _cache_variant_name,
-        _canonical_stats_root_for_cache,
         resolve_boundary_key,
     )
     from masked_ssl.probe import (
@@ -25,8 +23,6 @@ try:
     )
 except ModuleNotFoundError:  # pragma: no cover - repo-root unittest fallback
     from analysis.active.ssl_experiments.masked_ssl.cache import (
-        _cache_variant_name,
-        _canonical_stats_root_for_cache,
         resolve_boundary_key,
     )
     from analysis.active.ssl_experiments.masked_ssl.probe import (
@@ -278,58 +274,6 @@ def compute_willett_normalization_stats(
     finally:
         accessor.close()
 
-
-def resolve_precomputed_split_stats_path(
-    *,
-    cache_root: str | Path,
-    dataset: str,
-    train_split_name: str,
-    feature_mode: str,
-    preferred_path: str | Path | None,
-) -> Path | None:
-    if preferred_path is not None:
-        path = Path(preferred_path)
-        return path if path.exists() else None
-    stats_dir = (
-        _canonical_stats_root_for_cache(cache_root)
-        / "split_feature_stats"
-        / _cache_variant_name(cache_root)
-        / str(dataset)
-        / str(train_split_name)
-        / str(feature_mode)
-    )
-    preferred = stats_dir / "global_v1.pt"
-    if preferred.exists():
-        return preferred
-    candidates = sorted(stats_dir.glob("*.pt"))
-    if len(candidates) == 1:
-        return candidates[0]
-    return None
-
-
-def load_precomputed_split_feature_stats(
-    *,
-    stats_path: str | Path,
-    expected_dim: int,
-) -> tuple[tuple[np.ndarray, np.ndarray], dict[str, Any], Path]:
-    path = Path(stats_path)
-    payload = torch.load(path, map_location="cpu", weights_only=False)
-    if not isinstance(payload, dict):
-        raise ValueError(f"Precomputed split stats payload must be a dict: {path}")
-    mean_t = torch.as_tensor(payload.get("mean")).float().cpu()
-    std_t = torch.as_tensor(payload.get("std")).float().cpu()
-    if mean_t.numel() != expected_dim or std_t.numel() != expected_dim:
-        raise ValueError(
-            f"Precomputed split stats payload has the wrong size: expected exactly {expected_dim} values "
-            f"after the area-6v migration, got mean={mean_t.numel()} std={std_t.numel()}. "
-            "Recompute stats from the migrated cache."
-        )
-    return (
-        mean_t.numpy().astype(np.float32, copy=False),
-        std_t.numpy().astype(np.float32, copy=False),
-    ), dict(payload.get("metadata", {})), path
-
-
 def make_length_aware_batch_sampler(
     rows: tuple[Any, ...] | list[Any],
     *,
@@ -366,12 +310,10 @@ __all__ = [
     "collate_sequence_batch",
     "compute_feature_stats",
     "group_rows_by_adapter_key",
-    "load_precomputed_split_feature_stats",
     "loader_kwargs",
     "make_length_aware_batch_sampler",
     "normalization_key_for_row",
     "normalization_stats_missing_rows",
     "prepare_willett_inputs",
-    "resolve_precomputed_split_stats_path",
     "smooth_batch_like_willett",
 ]

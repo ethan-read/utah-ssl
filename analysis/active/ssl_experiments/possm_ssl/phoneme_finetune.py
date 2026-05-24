@@ -19,8 +19,6 @@ from torch.utils.data import DataLoader
 from masked_ssl.cache import (
     load_cache_smoothing_provenance,
     resolve_boundary_key,
-    _cache_variant_name,
-    _canonical_stats_root_for_cache,
 )
 from masked_ssl.probe import (
     CanonicalSequenceDataset,
@@ -30,6 +28,10 @@ from masked_ssl.probe import (
     collate_sequence_batch,
     compute_ctc_loss_sum,
     compute_feature_stats,
+)
+from recompute_split_feature_stats import (
+    load_precomputed_split_feature_stats,
+    resolve_precomputed_split_stats_path,
 )
 
 from .model import POSSMEncoder, POSSMPhonemeModel, build_temporal_backbone
@@ -141,62 +143,6 @@ class POSSMFinetuneConfig:
             raise ValueError("Conv kernel and stride must be positive")
         if not (0.0 <= float(self.conv_dropout) < 1.0):
             raise ValueError("conv_dropout must be in [0, 1)")
-
-
-def _load_precomputed_split_feature_stats(
-    *,
-    stats_path: str | Path,
-    expected_dim: int,
-    feature_mode: str,
-) -> tuple[tuple[np.ndarray, np.ndarray], dict[str, Any], Path]:
-    path = Path(stats_path)
-    if not path.exists():
-        raise FileNotFoundError(f"Precomputed split stats file does not exist: {path}")
-    payload = torch.load(path, map_location="cpu")
-    if not isinstance(payload, dict):
-        raise ValueError(f"Precomputed split stats payload must be a dict: {path}")
-    mean_t = torch.as_tensor(payload.get("mean")).float().cpu()
-    std_t = torch.as_tensor(payload.get("std")).float().cpu()
-    if mean_t.numel() != expected_dim or std_t.numel() != expected_dim:
-        raise ValueError(
-            f"Precomputed split stats payload has the wrong size for feature_mode={feature_mode!r}: "
-            f"expected exactly {expected_dim} values after the area-6v migration, "
-            f"got mean={mean_t.numel()} std={std_t.numel()}. Recompute stats from the migrated cache."
-        )
-    metadata = dict(payload.get("metadata", {}))
-    return (
-        mean_t.numpy().astype(np.float32, copy=False),
-        std_t.numpy().astype(np.float32, copy=False),
-    ), metadata, path
-
-
-def _resolve_precomputed_split_stats_path(
-    *,
-    cache_root: str | Path,
-    dataset: str,
-    train_split_name: str,
-    feature_mode: str,
-    preferred_path: str | Path | None,
-) -> Path | None:
-    if preferred_path is not None:
-        path = Path(preferred_path)
-        return path if path.exists() else None
-    stats_dir = (
-        _canonical_stats_root_for_cache(cache_root)
-        / "split_feature_stats"
-        / _cache_variant_name(cache_root)
-        / str(dataset)
-        / str(train_split_name)
-        / str(feature_mode)
-    )
-    preferred = stats_dir / "global_v1.pt"
-    if preferred.exists():
-        return preferred
-    candidates = sorted(stats_dir.glob("*.pt"))
-    if len(candidates) == 1:
-        return candidates[0]
-    return None
-
 
 def _seed_all(seed: int) -> None:
     torch.manual_seed(int(seed))
@@ -891,29 +837,28 @@ def run_possm_phoneme_finetuning(
     problem["cache_smoothing_provenance"] = cache_smoothing_provenance
 
     if effective_data_mode == "normalized":
-        resolved_split_stats_path = _resolve_precomputed_split_stats_path(
+        resolved_split_stats_path = resolve_precomputed_split_stats_path(
             cache_root=problem["cache_root"],
             dataset=str(problem["dataset"]),
             train_split_name=str(problem.get("train_split_name", "competition_train")),
             feature_mode=str(problem["feature_mode"]),
             preferred_path=effective_config.precomputed_split_stats_path,
         )
-        if resolved_split_stats_path is not None:
-            target_stats, target_stats_metadata, loaded_stats_path = _load_precomputed_split_feature_stats(
-                stats_path=resolved_split_stats_path,
-                expected_dim=int(base_encoder.input_dim),
-                feature_mode=str(problem["feature_mode"]),
-            )
-            print(f"loaded precomputed POSSM stage-2 split stats: {loaded_stats_path}")
-        else:
-            target_stats = compute_feature_stats(
-                problem["train_rows"],
-                cache_root=Path(problem["cache_root"]),
-                mode="global",
-                feature_mode=str(problem["feature_mode"]),
-            )
-            target_stats_metadata = None
-            loaded_stats_path = None
+        (mean_t, std_t), target_stats_metadata, loaded_stats_path = load_precomputed_split_feature_stats(
+            stats_path=resolved_split_stats_path,
+            cache_root=problem["cache_root"],
+            dataset=str(problem["dataset"]),
+            feature_mode=str(problem["feature_mode"]),
+            boundary_key_mode=str(problem.get("boundary_key_mode", effective_boundary_key_mode)),
+            train_split_name=str(problem.get("train_split_name", "competition_train")),
+            val_split_name=str(problem.get("val_split_name", "competition_test")),
+            expected_dim=int(base_encoder.input_dim),
+        )
+        target_stats = (
+            mean_t.numpy().astype(np.float32, copy=False),
+            std_t.numpy().astype(np.float32, copy=False),
+        )
+        print(f"loaded precomputed POSSM stage-2 split stats: {loaded_stats_path}")
     else:
         target_stats = None
         target_stats_metadata = None

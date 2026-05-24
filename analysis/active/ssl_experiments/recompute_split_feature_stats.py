@@ -10,14 +10,34 @@ from typing import Any
 
 import torch
 
-from masked_ssl.cache import _cache_variant_name, _canonical_stats_root_for_cache
-from masked_ssl.probe import build_competition_split_problem, compute_feature_stats
+try:
+    from masked_ssl.cache import (
+        _cache_variant_name,
+        _canonical_stats_root_for_cache,
+        _compute_cache_source_signature,
+        _load_artifact_payload_and_sidecar,
+        _validate_common_artifact_metadata,
+    )
+    from masked_ssl.probe import build_competition_split_problem, compute_feature_stats
+except ModuleNotFoundError:  # pragma: no cover - repo-root unittest fallback
+    from analysis.active.ssl_experiments.masked_ssl.cache import (
+        _cache_variant_name,
+        _canonical_stats_root_for_cache,
+        _compute_cache_source_signature,
+        _load_artifact_payload_and_sidecar,
+        _validate_common_artifact_metadata,
+    )
+    from analysis.active.ssl_experiments.masked_ssl.probe import (
+        build_competition_split_problem,
+        compute_feature_stats,
+    )
 
 
 DEFAULT_DATASET = "brain2text24"
 DEFAULT_FEATURE_MODE = "tx_only"
 DEFAULT_BOUNDARY_KEY_MODE = "session"
 DEFAULT_SPLIT_NAME = "competition_train"
+FEATURE_POLICY = "area6v_v1"
 
 
 def _timestamp_utc() -> str:
@@ -40,6 +60,136 @@ def _default_output_path(
         / str(feature_mode)
         / "global_v1.pt"
     )
+
+
+def build_recompute_split_feature_stats_command(
+    *,
+    cache_root: str | Path,
+    dataset: str,
+    feature_mode: str,
+    boundary_key_mode: str,
+    output_path: str | Path,
+) -> str:
+    return " ".join(
+        [
+            "python",
+            "analysis/active/ssl_experiments/recompute_split_feature_stats.py",
+            "--cache-root",
+            str(Path(cache_root)),
+            "--dataset",
+            str(dataset),
+            "--feature-mode",
+            str(feature_mode),
+            "--boundary-key-mode",
+            str(boundary_key_mode),
+            "--output-path",
+            str(Path(output_path)),
+            "--overwrite",
+        ]
+    )
+
+
+def resolve_precomputed_split_stats_path(
+    *,
+    cache_root: str | Path,
+    dataset: str,
+    train_split_name: str,
+    feature_mode: str,
+    preferred_path: str | Path | None,
+) -> Path:
+    if preferred_path is not None:
+        return Path(preferred_path)
+    return _default_output_path(
+        cache_root=Path(cache_root),
+        dataset=str(dataset),
+        train_split_name=str(train_split_name),
+        feature_mode=str(feature_mode),
+    )
+
+
+def load_precomputed_split_feature_stats(
+    *,
+    stats_path: str | Path,
+    cache_root: str | Path,
+    dataset: str,
+    feature_mode: str,
+    boundary_key_mode: str,
+    train_split_name: str,
+    val_split_name: str,
+    expected_dim: int,
+) -> tuple[tuple[torch.Tensor, torch.Tensor], dict[str, Any], Path]:
+    path = Path(stats_path)
+    canonical_path = _default_output_path(
+        cache_root=Path(cache_root),
+        dataset=str(dataset),
+        train_split_name=str(train_split_name),
+        feature_mode=str(feature_mode),
+    )
+    recompute_cmd = build_recompute_split_feature_stats_command(
+        cache_root=cache_root,
+        dataset=str(dataset),
+        feature_mode=str(feature_mode),
+        boundary_key_mode=str(boundary_key_mode),
+        output_path=canonical_path,
+    )
+    payload, metadata, path, _ = _load_artifact_payload_and_sidecar(
+        path=path,
+        canonical_path=canonical_path,
+        recompute_cmd=recompute_cmd,
+        artifact_name="split stats",
+        expected_kind="split_feature_stats",
+    )
+    if "mean" not in payload or "std" not in payload:
+        raise ValueError(
+            "Precomputed split stats payload is missing mean/std tensors.\n"
+            f"expected_path: {canonical_path}\n"
+            f"requested_path: {path}\n"
+            f"recompute_command: {recompute_cmd}"
+        )
+    mean_t = torch.as_tensor(payload.get("mean")).float().cpu()
+    std_t = torch.as_tensor(payload.get("std")).float().cpu()
+
+    expected_cache_root = str(Path(cache_root).resolve())
+    expected_cache_variant = _cache_variant_name(cache_root)
+    expected_cache_signature = _compute_cache_source_signature(Path(cache_root))
+    common_metadata = {
+        "source_cache_root": expected_cache_root,
+        "source_cache_variant": expected_cache_variant,
+        "source_cache_signature": expected_cache_signature,
+        "feature_policy": FEATURE_POLICY,
+        "feature_mode": str(feature_mode),
+    }
+    split_metadata = {
+        "dataset": str(dataset),
+        "boundary_key_mode": str(boundary_key_mode),
+        "train_split_name": str(train_split_name),
+        "val_split_name": str(val_split_name),
+        "feature_dim": int(expected_dim),
+    }
+    mismatches = _validate_common_artifact_metadata(
+        metadata=metadata,
+        expected_metadata=common_metadata,
+    )
+    mismatches.extend(
+        _validate_common_artifact_metadata(
+            metadata=metadata,
+            expected_metadata=split_metadata,
+        )
+    )
+    if mean_t.numel() != expected_dim or std_t.numel() != expected_dim:
+        mismatches.append(
+            f"tensor_dim=mean:{mean_t.numel()} std:{std_t.numel()} expected {expected_dim}"
+        )
+    if mismatches:
+        mismatch_text = "; ".join(mismatches)
+        raise ValueError(
+            "Precomputed split stats artifact is stale or incompatible.\n"
+            f"expected_path: {canonical_path}\n"
+            f"requested_path: {path}\n"
+            f"reason: {mismatch_text}\n"
+            f"recompute_command: {recompute_cmd}"
+        )
+    return (mean_t, std_t), metadata, path
 
 
 def recompute_split_feature_stats(
@@ -96,6 +246,7 @@ def recompute_split_feature_stats(
         "source_cache_root": str(cache_root.resolve()),
         "source_cache_name": cache_root.name,
         "source_cache_variant": _cache_variant_name(cache_root),
+        "source_cache_signature": _compute_cache_source_signature(cache_root),
         "dataset": str(dataset),
         "feature_mode": str(feature_mode),
         "boundary_key_mode": str(boundary_key_mode),
@@ -107,6 +258,7 @@ def recompute_split_feature_stats(
         "train_session_ids": list(problem.get("train_session_ids", ())),
         "val_session_ids": list(problem.get("val_session_ids", ())),
         "feature_dim": int(mean.shape[0]),
+        "feature_policy": FEATURE_POLICY,
     }
 
     payload = {
@@ -116,7 +268,7 @@ def recompute_split_feature_stats(
     }
     resolved_output_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(payload, resolved_output_path)
-    metadata_path.write_text(json.dumps(metadata, indent=2))
+    metadata_path.write_text(json.dumps(metadata, indent=2) + "\n")
 
     return {
         "output_path": resolved_output_path,

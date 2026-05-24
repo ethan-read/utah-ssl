@@ -8,6 +8,12 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from analysis.active.ssl_experiments.recompute_split_feature_stats import (
+    resolve_precomputed_split_stats_path as resolve_canonical_split_stats_path,
+)
+from analysis.active.ssl_experiments.stats_artifact_test_utils import (
+    write_valid_split_stats_artifact as _write_valid_split_stats_artifact,
+)
 from analysis.active.ssl_experiments.willett_reconstruction.data import (
     WillettInputTransformConfig,
     adapter_keys_from_rows,
@@ -86,7 +92,6 @@ def _write_tiny_competition_probe_cache(cache_root: Path) -> None:
         },
     }
     (dataset_dir / "metadata.json").write_text(json.dumps(metadata))
-
 
 class WillettReconstructionTest(unittest.TestCase):
     def _tmp_dir(self) -> str:
@@ -230,6 +235,23 @@ class WillettReconstructionTest(unittest.TestCase):
         cache_root = Path(self._tmp_dir())
         _write_tiny_competition_probe_cache(cache_root)
         output_root = Path(self._tmp_dir())
+        stats_path = resolve_canonical_split_stats_path(
+            cache_root=cache_root,
+            dataset="brain2text24",
+            train_split_name="competition_train",
+            feature_mode="tx_only",
+            preferred_path=None,
+        )
+        _write_valid_split_stats_artifact(
+            cache_root=cache_root,
+            stats_path=stats_path,
+            dataset="brain2text24",
+            feature_mode="tx_only",
+            boundary_key_mode="session",
+            train_split_name="competition_train",
+            val_split_name="competition_test",
+            dim=3,
+        )
         config = WillettReconstructionConfig(
             cache_root=cache_root,
             output_root=output_root,
@@ -276,6 +298,88 @@ class WillettReconstructionTest(unittest.TestCase):
         )
         self.assertGreaterEqual(int(resumed_summary["steps"]), 3)
         self.assertGreaterEqual(int(resumed_summary["best_step"]), 1)
+
+    def test_willett_global_normalization_fails_without_canonical_split_stats(self) -> None:
+        cache_root = Path(self._tmp_dir())
+        _write_tiny_competition_probe_cache(cache_root)
+        output_root = Path(self._tmp_dir())
+        config = WillettReconstructionConfig(
+            cache_root=cache_root,
+            output_root=output_root,
+            run_name="missing_stats",
+            max_steps=1,
+            batch_size=2,
+            learning_rate=1e-3,
+            min_learning_rate=1e-4,
+            warmup_steps=0,
+            adam_epsilon=1e-1,
+            val_every_steps=1,
+            checkpoint_every_steps=1,
+            progress_every_steps=1,
+            input_smoothing_sigma_bins=0.0,
+            white_noise_sd=0.0,
+            constant_offset_sd=0.0,
+            patch_size=2,
+            patch_stride=1,
+            input_projection_size=8,
+            gru_hidden_size=16,
+            gru_num_layers=1,
+            gru_dropout=0.0,
+        )
+        with self.assertRaisesRegex(FileNotFoundError, "recompute_command:"):
+            run_willett_reconstruction(config)
+
+    def test_willett_global_normalization_fails_for_stale_split_stats_signature(self) -> None:
+        cache_root = Path(self._tmp_dir())
+        _write_tiny_competition_probe_cache(cache_root)
+        output_root = Path(self._tmp_dir())
+        stats_path = resolve_canonical_split_stats_path(
+            cache_root=cache_root,
+            dataset="brain2text24",
+            train_split_name="competition_train",
+            feature_mode="tx_only",
+            preferred_path=None,
+        )
+        _write_valid_split_stats_artifact(
+            cache_root=cache_root,
+            stats_path=stats_path,
+            dataset="brain2text24",
+            feature_mode="tx_only",
+            boundary_key_mode="session",
+            train_split_name="competition_train",
+            val_split_name="competition_test",
+            dim=3,
+        )
+        payload = torch.load(stats_path, map_location="cpu")
+        payload["metadata"]["source_cache_signature"] = "stale"
+        torch.save(payload, stats_path)
+        stats_path.with_suffix(".json").write_text(json.dumps(payload["metadata"], indent=2) + "\n")
+
+        config = WillettReconstructionConfig(
+            cache_root=cache_root,
+            output_root=output_root,
+            run_name="stale_stats",
+            max_steps=1,
+            batch_size=2,
+            learning_rate=1e-3,
+            min_learning_rate=1e-4,
+            warmup_steps=0,
+            adam_epsilon=1e-1,
+            val_every_steps=1,
+            checkpoint_every_steps=1,
+            progress_every_steps=1,
+            input_smoothing_sigma_bins=0.0,
+            white_noise_sd=0.0,
+            constant_offset_sd=0.0,
+            patch_size=2,
+            patch_stride=1,
+            input_projection_size=8,
+            gru_hidden_size=16,
+            gru_num_layers=1,
+            gru_dropout=0.0,
+        )
+        with self.assertRaisesRegex(ValueError, "source_cache_signature"):
+            run_willett_reconstruction(config)
 
 
 if __name__ == "__main__":

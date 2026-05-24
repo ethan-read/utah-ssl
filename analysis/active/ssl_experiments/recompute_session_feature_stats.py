@@ -10,7 +10,13 @@ from typing import Any, Sequence
 
 import torch
 
-from masked_ssl.cache import CacheAccessConfig, prepare_cache_context
+from masked_ssl.cache import (
+    FEATURE_POLICY,
+    CacheAccessConfig,
+    _cache_variant_name,
+    _compute_session_feature_stats,
+    prepare_cache_context,
+)
 
 
 DEFAULT_TX_DIM = 128
@@ -50,13 +56,15 @@ def recompute_session_feature_stats(
     output_path = Path(output_path)
     if not cache_root.is_dir():
         raise FileNotFoundError(f"Cache root does not exist: {cache_root}")
-    if output_path.exists() and not overwrite:
-        raise FileExistsError(f"Output file already exists: {output_path}")
-    if output_path.exists() and overwrite:
-        output_path.unlink()
     metadata_path = output_path.with_suffix(".json")
-    if metadata_path.exists() and overwrite:
-        metadata_path.unlink()
+    if (output_path.exists() or metadata_path.exists()) and not overwrite:
+        raise FileExistsError(
+            f"Output already exists: {output_path} or {metadata_path}. "
+            "Pass overwrite=True to replace existing artifacts."
+        )
+    if overwrite:
+        output_path.unlink(missing_ok=True)
+        metadata_path.unlink(missing_ok=True)
 
     requested_datasets = _normalize_dataset_args(datasets)
     available_datasets = sorted(
@@ -78,7 +86,7 @@ def recompute_session_feature_stats(
         excluded_datasets=tuple(str(name) for name in excluded_datasets),
         seed=int(seed),
         segment_bins=int(segment_bins),
-        use_normalization=True,
+        use_normalization=False,
         examples_per_shard=int(examples_per_shard),
         tx_dim=int(tx_dim),
         sbp_dim=int(sbp_dim),
@@ -88,7 +96,11 @@ def recompute_session_feature_stats(
 
     context = prepare_cache_context(cache_candidates=[cache_root], config=config)
 
-    session_feature_stats = dict(context.session_feature_stats)
+    session_feature_stats = _compute_session_feature_stats(
+        shard_store=context.shard_store,
+        rows_by_dataset=context.rows_by_dataset,
+        config=config,
+    )
     if not session_feature_stats:
         raise RuntimeError("No session feature stats were computed from the selected cache root.")
 
@@ -97,6 +109,7 @@ def recompute_session_feature_stats(
         "created_utc": _timestamp_utc(),
         "source_cache_root": str(cache_root.resolve()),
         "source_cache_name": cache_root.name,
+        "source_cache_variant": _cache_variant_name(cache_root),
         "source_cache_signature": context.source_cache_signature,
         "feature_mode": str(context.feature_mode),
         "boundary_key_mode": str(boundary_key_mode),
@@ -104,6 +117,7 @@ def recompute_session_feature_stats(
         "tx_dim": int(tx_dim),
         "sbp_dim": int(sbp_dim),
         "full_dim": int(config.full_dim),
+        "feature_policy": FEATURE_POLICY,
         "segment_bins": int(segment_bins),
         "examples_per_shard": int(examples_per_shard),
         "excluded_datasets": list(excluded_datasets),

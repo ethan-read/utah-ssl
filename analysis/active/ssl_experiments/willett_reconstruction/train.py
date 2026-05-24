@@ -18,10 +18,18 @@ from torch.utils.data import DataLoader
 
 try:
     from masked_ssl.probe import CanonicalSequenceDataset, compute_ctc_loss_sum
+    from recompute_split_feature_stats import (
+        load_precomputed_split_feature_stats,
+        resolve_precomputed_split_stats_path,
+    )
 except ModuleNotFoundError:  # pragma: no cover - repo-root unittest fallback
     from analysis.active.ssl_experiments.masked_ssl.probe import (
         CanonicalSequenceDataset,
         compute_ctc_loss_sum,
+    )
+    from analysis.active.ssl_experiments.recompute_split_feature_stats import (
+        load_precomputed_split_feature_stats,
+        resolve_precomputed_split_stats_path,
     )
 
 from .data import (
@@ -30,12 +38,10 @@ from .data import (
     build_willett_problem,
     compute_willett_normalization_stats,
     group_rows_by_adapter_key,
-    load_precomputed_split_feature_stats,
     loader_kwargs,
     make_length_aware_batch_sampler,
     normalization_stats_missing_rows,
     prepare_willett_inputs,
-    resolve_precomputed_split_stats_path,
 )
 from .model import WillettPhonemeModel
 from .reporting import evaluate_willett_phoneme_metrics
@@ -260,19 +266,21 @@ def run_willett_reconstruction(config: WillettReconstructionConfig) -> dict[str,
             feature_mode=str(config.feature_mode),
             preferred_path=config.precomputed_split_stats_path,
         )
-        if resolved_stats_path is not None:
-            train_stats, stats_metadata, loaded_stats_path = load_precomputed_split_feature_stats(
-                stats_path=resolved_stats_path,
-                expected_dim=sample_dim,
-            )
-            print(f"loaded precomputed Willett global split stats: {loaded_stats_path}")
-        else:
-            train_stats = compute_willett_normalization_stats(
-                problem["train_rows"],
-                cache_root=Path(problem["cache_root"]),
-                mode="global",
-                feature_mode=str(problem["feature_mode"]),
-            )
+        (mean_t, std_t), stats_metadata, loaded_stats_path = load_precomputed_split_feature_stats(
+            stats_path=resolved_stats_path,
+            cache_root=Path(problem["cache_root"]),
+            dataset=str(problem["dataset"]),
+            feature_mode=str(problem["feature_mode"]),
+            boundary_key_mode=str(problem["boundary_key_mode"]),
+            train_split_name=str(problem["train_split_name"]),
+            val_split_name=str(problem["val_split_name"]),
+            expected_dim=sample_dim,
+        )
+        train_stats = (
+            mean_t.numpy().astype(np.float32, copy=False),
+            std_t.numpy().astype(np.float32, copy=False),
+        )
+        print(f"loaded precomputed Willett global split stats: {loaded_stats_path}")
     else:
         train_stats = compute_willett_normalization_stats(
             problem["train_rows"],
