@@ -35,6 +35,22 @@ def _normalize_dataset_args(datasets: Sequence[str] | None) -> tuple[str, ...] |
     return normalized if normalized else None
 
 
+def _normalize_excluded_dataset_args(datasets: Sequence[str] | None) -> tuple[str, ...]:
+    if datasets is None:
+        return tuple(DEFAULT_EXCLUDED_DATASETS)
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for item in datasets:
+        value = str(item).strip()
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        deduped.append(value)
+    if not deduped:
+        return tuple(DEFAULT_EXCLUDED_DATASETS)
+    return tuple(sorted(deduped))
+
+
 def recompute_session_feature_stats(
     *,
     cache_root: str | Path,
@@ -66,6 +82,7 @@ def recompute_session_feature_stats(
         output_path.unlink(missing_ok=True)
         metadata_path.unlink(missing_ok=True)
 
+    excluded_datasets = _normalize_excluded_dataset_args(excluded_datasets)
     requested_datasets = _normalize_dataset_args(datasets)
     available_datasets = sorted(
         path.name for path in cache_root.iterdir() if path.is_dir() and (path / "metadata.json").exists()
@@ -176,7 +193,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--excluded-dataset",
         action="append",
-        default=list(DEFAULT_EXCLUDED_DATASETS),
+        default=None,
         help="Dataset names to exclude. May be repeated.",
     )
     parser.add_argument("--overwrite", action="store_true", help="Replace an existing output file.")
@@ -185,6 +202,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    excluded_datasets = _normalize_excluded_dataset_args(args.excluded_dataset)
     result = recompute_session_feature_stats(
         cache_root=args.cache_root,
         output_path=args.output_path,
@@ -196,7 +214,7 @@ def main() -> None:
         segment_bins=int(args.segment_bins),
         seed=int(args.seed),
         examples_per_shard=int(args.examples_per_shard),
-        excluded_datasets=tuple(args.excluded_dataset),
+        excluded_datasets=excluded_datasets,
         overwrite=bool(args.overwrite),
     )
     print(json.dumps({k: str(v) if isinstance(v, Path) else v for k, v in result.items()}, indent=2))

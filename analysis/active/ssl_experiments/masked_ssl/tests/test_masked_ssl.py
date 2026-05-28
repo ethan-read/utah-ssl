@@ -562,7 +562,7 @@ class MaskedSSLTests(unittest.TestCase):
         self.assertTrue(torch.allclose(bidirectional_out[0, 3:], torch.zeros_like(bidirectional_out[0, 3:])))
 
     def test_tx_only_sampling_returns_only_tx_channels_and_featurewise_normalization(self) -> None:
-        session_key = "toy:sess0"
+        session_key = "toy:subj0"
 
         class _DummyShardStore:
             def get(self, _shard_relpath):
@@ -602,6 +602,7 @@ class MaskedSSLTests(unittest.TestCase):
         self.assertEqual(tuple(sample["x"].shape), (6, 4))
         self.assertTrue(torch.equal(sample["feature_mask"], torch.ones(4)))
         self.assertEqual(sample["boundary_key"], "toy:subj0")
+        self.assertEqual(sample["session_key"], "toy:subj0")
         expected = (
             torch.tensor(np.arange(24, dtype=np.float32).reshape(6, 4))
             - torch.tensor([1.0, 2.0, 3.0, 4.0])
@@ -650,7 +651,7 @@ class MaskedSSLTests(unittest.TestCase):
         self.assertEqual(sample["boundary_key"], "toy:sess0")
 
     def test_sampling_ignores_legacy_runtime_smoothing_field(self) -> None:
-        session_key = "toy:sess0"
+        session_key = "toy:subj0"
         tx_series = np.arange(10, dtype=np.float32).reshape(10, 1)
 
         class _DummyShardStore:
@@ -727,6 +728,7 @@ class MaskedSSLTests(unittest.TestCase):
             tx_dim=1,
             sbp_dim=1,
             feature_mode="tx_only",
+            boundary_key_mode="subject_if_available",
             gaussian_smoothing_sigma_bins=0.0,
         )
 
@@ -735,7 +737,8 @@ class MaskedSSLTests(unittest.TestCase):
             rows_by_dataset={"toy": [row]},
             config=config,
         )
-        mean, std = stats["toy:sess0"]
+        self.assertNotIn("toy:sess0", stats)
+        mean, std = stats["toy:subj0"]
         self.assertAlmostEqual(float(mean[0]), 4.0, places=6)
         self.assertAlmostEqual(float(std[0]), float(np.sqrt(8.0)), places=6)
 

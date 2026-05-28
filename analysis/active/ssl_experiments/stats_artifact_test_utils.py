@@ -78,7 +78,9 @@ def write_valid_session_stats_artifact(
         "sbp_dim": resolved_sbp_dim,
         "full_dim": int(resolved_tx_dim if feature_mode == "tx_only" else resolved_tx_dim + resolved_sbp_dim),
         "feature_policy": SESSION_FEATURE_POLICY,
-        "excluded_datasets": list(str(item) for item in excluded_datasets),
+        "excluded_datasets": list(
+            sorted({str(item).strip() for item in excluded_datasets if str(item).strip()})
+        ),
     }
     payload = {
         "session_feature_stats": stats_entries,

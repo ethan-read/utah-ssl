@@ -161,7 +161,6 @@ def load_precomputed_split_feature_stats(
     }
     split_metadata = {
         "dataset": str(dataset),
-        "boundary_key_mode": str(boundary_key_mode),
         "train_split_name": str(train_split_name),
         "val_split_name": str(val_split_name),
         "feature_dim": int(expected_dim),

@@ -55,6 +55,10 @@ class CacheAccessConfig:
     precomputed_session_stats_path: str | Path | None = None
 
     def __post_init__(self) -> None:
+        normalized_excluded = tuple(
+            sorted({str(item).strip() for item in self.excluded_datasets if str(item).strip()})
+        )
+        self.excluded_datasets = normalized_excluded
         if self.mode not in {"copy_to_local", "drive_direct"}:
             raise ValueError("mode must be either 'copy_to_local' or 'drive_direct'")
         if self.segment_bins <= 0:
@@ -240,7 +244,7 @@ def _canonical_session_stats_stem(
     *,
     excluded_datasets: Sequence[str],
 ) -> str:
-    excluded = tuple(sorted(str(item) for item in excluded_datasets))
+    excluded = tuple(sorted({str(item).strip() for item in excluded_datasets if str(item).strip()}))
     if excluded:
         joined = "_".join(item.replace("/", "_") for item in excluded)
         return f"ssl_pretrain_excluding_{joined}_v1"
@@ -368,7 +372,7 @@ def build_recompute_session_feature_stats_command(
         "--examples-per-shard",
         str(int(examples_per_shard)),
     ]
-    for dataset in excluded_datasets:
+    for dataset in tuple(sorted({str(item).strip() for item in excluded_datasets if str(item).strip()})):
         cmd.extend(["--excluded-dataset", str(dataset)])
     cmd.append("--overwrite")
     return " ".join(cmd)
@@ -780,7 +784,14 @@ def _compute_session_feature_stats(
     session_rows: dict[str, list[ExampleRow]] = defaultdict(list)
     for dataset, rows in rows_by_dataset.items():
         for row in rows:
-            session_rows[_session_stat_key(dataset, row.session_id)].append(row)
+            session_rows[
+                resolve_boundary_key(
+                    dataset=dataset,
+                    session_id=row.session_id,
+                    subject_id=row.subject_id,
+                    boundary_key_mode=config.boundary_key_mode,
+                )
+            ].append(row)
 
     full_dim = int(config.full_dim)
     session_stats: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
@@ -939,7 +950,9 @@ def _load_precomputed_session_feature_stats(
         "tx_dim": int(tx_dim),
         "sbp_dim": int(sbp_dim),
         "full_dim": int(expected_dim),
-        "excluded_datasets": list(str(item) for item in excluded_datasets),
+        "excluded_datasets": list(
+            sorted({str(item).strip() for item in excluded_datasets if str(item).strip()})
+        ),
     }
     mismatches = _validate_common_artifact_metadata(
         metadata=metadata,
@@ -969,13 +982,13 @@ def sample_base_segment(
     segment_bins: int,
     py_rng: random.Random,
 ) -> dict[str, Any]:
-    session_key = _session_stat_key(example.dataset, example.session_id)
     boundary_key = resolve_boundary_key(
         dataset=example.dataset,
         session_id=example.session_id,
         subject_id=example.subject_id,
         boundary_key_mode=cache_context.boundary_key_mode,
     )
+    session_key = boundary_key
     shard = cache_context.shard_store.get(example.shard_relpath)
     time_offsets = shard["time_offsets"]
     assert isinstance(time_offsets, np.ndarray)
