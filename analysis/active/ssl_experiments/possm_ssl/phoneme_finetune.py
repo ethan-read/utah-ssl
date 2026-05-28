@@ -46,6 +46,7 @@ from .training import (
 class POSSMFinetuneConfig:
     seed: int = 7
     mode: str = "finetune_full"
+    init_source: str = "stage1"
     dataset: str = "brain2text24"
     feature_mode: str | None = None
     data_mode: str | None = None
@@ -100,6 +101,8 @@ class POSSMFinetuneConfig:
         self.temporal_patch_stride = int(self.conv_stride)
         if self.mode not in {"probe_frozen", "finetune_full"}:
             raise ValueError("mode must be one of {'probe_frozen', 'finetune_full'}")
+        if self.init_source not in {"stage1", "random"}:
+            raise ValueError("init_source must be one of {'stage1', 'random'}")
         if self.feature_mode is not None and self.feature_mode not in {"tx_only", "tx_sbp"}:
             raise ValueError("feature_mode must be one of {'tx_only', 'tx_sbp'} when provided")
         if self.data_mode is not None and self.data_mode not in {"raw", "normalized"}:
@@ -448,7 +451,7 @@ def _load_stage1_checkpoint(
     *,
     map_location: str | torch.device,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], Path]:
-    payload = torch.load(checkpoint_path, map_location=map_location)
+    payload = torch.load(checkpoint_path, map_location=map_location, weights_only=False)
     checkpoint_cfg = dict(payload.get("config", {}))
     if str(payload.get("model_family", checkpoint_cfg.get("model_family", ""))) != "possm":
         raise ValueError("Checkpoint is not a POSSM checkpoint.")
@@ -466,6 +469,7 @@ def _build_stage1_encoder_from_checkpoint_state(
     checkpoint_cfg: dict[str, Any],
     model_state: dict[str, Any],
 ) -> POSSMEncoder:
+    encoder = _build_stage1_encoder_from_checkpoint_config(checkpoint_cfg=checkpoint_cfg)
     encoder_state = {
         key.split("encoder.", 1)[1]: value
         for key, value in model_state.items()
@@ -473,7 +477,15 @@ def _build_stage1_encoder_from_checkpoint_state(
     }
     if not encoder_state:
         raise KeyError("Stage-1 POSSM checkpoint does not contain encoder weights.")
-    encoder = POSSMEncoder(
+    encoder.load_state_dict(encoder_state)
+    return encoder
+
+
+def _build_stage1_encoder_from_checkpoint_config(
+    *,
+    checkpoint_cfg: dict[str, Any],
+) -> POSSMEncoder:
+    return POSSMEncoder(
         input_dim=int(checkpoint_cfg["input_dim"]),
         model_dim=int(checkpoint_cfg["model_dim"]),
         latent_count=int(checkpoint_cfg["latent_count"]),
@@ -488,8 +500,26 @@ def _build_stage1_encoder_from_checkpoint_state(
         use_token_norm=bool(checkpoint_cfg.get("use_token_norm", True)),
         feature_mode=str(checkpoint_cfg.get("feature_mode", "tx_sbp")),
     )
-    encoder.load_state_dict(encoder_state)
-    return encoder
+
+
+def _build_stage1_temporal_backbone_from_checkpoint_config(
+    *,
+    checkpoint_cfg: dict[str, Any],
+    input_size: int,
+) -> torch.nn.Module:
+    return build_temporal_backbone(
+        backbone_type=str(checkpoint_cfg.get("temporal_backbone_type", "gru")),
+        input_size=int(input_size),
+        gru_hidden_size=(
+            None
+            if checkpoint_cfg.get("temporal_gru_hidden_size") is None
+            else int(checkpoint_cfg["temporal_gru_hidden_size"])
+        ),
+        gru_num_layers=int(checkpoint_cfg.get("temporal_gru_num_layers", 1)),
+        gru_dropout=float(checkpoint_cfg.get("temporal_gru_dropout", 0.0)),
+        gru_bidirectional=bool(checkpoint_cfg.get("temporal_gru_bidirectional", False)),
+        backbone_kwargs=dict(checkpoint_cfg.get("temporal_backbone_kwargs", {})),
+    )
 
 
 def recover_possm_stage1_encoder(
@@ -521,6 +551,10 @@ def recover_possm_stage1_sequence_components(
         checkpoint_cfg=checkpoint_cfg,
         model_state=model_state,
     )
+    temporal_backbone = _build_stage1_temporal_backbone_from_checkpoint_config(
+        checkpoint_cfg=checkpoint_cfg,
+        input_size=int(encoder.hidden_size),
+    )
     temporal_state = {
         key.split("temporal_backbone.", 1)[1]: value
         for key, value in model_state.items()
@@ -533,25 +567,34 @@ def recover_possm_stage1_sequence_components(
                 "Stage-1 POSSM checkpoint declares a temporal backbone but contains no "
                 "'temporal_backbone.*' weights."
             )
-        temporal_backbone = build_temporal_backbone(
-            backbone_type="identity",
-            input_size=int(encoder.hidden_size),
-        )
         return encoder, temporal_backbone, checkpoint_cfg, run_dir
-    temporal_backbone = build_temporal_backbone(
-        backbone_type=str(checkpoint_cfg.get("temporal_backbone_type", "gru")),
-        input_size=int(encoder.hidden_size),
-        gru_hidden_size=(
-            None
-            if checkpoint_cfg.get("temporal_gru_hidden_size") is None
-            else int(checkpoint_cfg["temporal_gru_hidden_size"])
-        ),
-        gru_num_layers=int(checkpoint_cfg.get("temporal_gru_num_layers", 1)),
-        gru_dropout=float(checkpoint_cfg.get("temporal_gru_dropout", 0.0)),
-        gru_bidirectional=bool(checkpoint_cfg.get("temporal_gru_bidirectional", False)),
-        backbone_kwargs=dict(checkpoint_cfg.get("temporal_backbone_kwargs", {})),
-    )
     temporal_backbone.load_state_dict(temporal_state)
+    return encoder, temporal_backbone, checkpoint_cfg, run_dir
+
+
+def initialize_possm_stage2_sequence_components(
+    *,
+    checkpoint_path: Path,
+    init_source: str,
+    map_location: str | torch.device = "cpu",
+) -> tuple[POSSMEncoder, torch.nn.Module, dict[str, Any], Path]:
+    resolved_init_source = str(init_source)
+    if resolved_init_source not in {"stage1", "random"}:
+        raise ValueError("init_source must be one of {'stage1', 'random'}")
+    if resolved_init_source == "stage1":
+        return recover_possm_stage1_sequence_components(
+            checkpoint_path=checkpoint_path,
+            map_location=map_location,
+        )
+    _, checkpoint_cfg, _, run_dir = _load_stage1_checkpoint(
+        checkpoint_path,
+        map_location=map_location,
+    )
+    encoder = _build_stage1_encoder_from_checkpoint_config(checkpoint_cfg=checkpoint_cfg)
+    temporal_backbone = _build_stage1_temporal_backbone_from_checkpoint_config(
+        checkpoint_cfg=checkpoint_cfg,
+        input_size=int(encoder.hidden_size),
+    )
     return encoder, temporal_backbone, checkpoint_cfg, run_dir
 
 
@@ -714,7 +757,7 @@ def recover_possm_stage2_summary(
     if not resolved_run_dir.exists():
         raise FileNotFoundError(f"Stage-2 run dir does not exist: {resolved_run_dir}")
 
-    payload = torch.load(resolved_checkpoint_path, map_location="cpu")
+    payload = torch.load(resolved_checkpoint_path, map_location="cpu", weights_only=False)
     if str(payload.get("stage", "")) != "stage2_phoneme_finetune":
         raise ValueError(f"Checkpoint is not a POSSM Stage-2 checkpoint: {resolved_checkpoint_path}")
     config = dict(payload.get("config", {}))
@@ -786,8 +829,9 @@ def run_possm_phoneme_finetuning(
     resolved_cache_root = Path(cache_root)
     resolved_device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    base_encoder, pre_decoder_backbone, checkpoint_cfg, stage1_run_dir = recover_possm_stage1_sequence_components(
+    base_encoder, pre_decoder_backbone, checkpoint_cfg, stage1_run_dir = initialize_possm_stage2_sequence_components(
         checkpoint_path=resolved_checkpoint_path,
+        init_source=str(resolved_config.init_source),
         map_location="cpu",
     )
     effective_feature_mode = (
@@ -1002,6 +1046,8 @@ def run_possm_phoneme_finetuning(
         if run_name is not None
         else f"possm_stage2_{effective_config.mode}_{effective_feature_mode}_{_timestamp_utc()}"
     )
+    if run_name is None and str(effective_config.init_source) == "random":
+        resolved_run_name = f"{resolved_run_name}_randominit"
     run_dir = base_output_root / resolved_run_name
     run_dir.mkdir(parents=True, exist_ok=True)
     progress_log_path = run_dir / "progress.jsonl"
@@ -1023,7 +1069,7 @@ def run_possm_phoneme_finetuning(
     if resume_from_latest:
         latest_checkpoint_path = _find_latest_step_checkpoint(checkpoints_dir)
         if latest_checkpoint_path is not None:
-            payload = torch.load(latest_checkpoint_path, map_location="cpu")
+            payload = torch.load(latest_checkpoint_path, map_location="cpu", weights_only=False)
             _validate_stage2_resume_payload(
                 payload,
                 resolved_config=effective_config,
@@ -1046,7 +1092,7 @@ def run_possm_phoneme_finetuning(
                 best_payload = payload
                 best_step = int(steps)
             if checkpoint_best_path.exists():
-                best_payload_disk = torch.load(checkpoint_best_path, map_location="cpu")
+                best_payload_disk = torch.load(checkpoint_best_path, map_location="cpu", weights_only=False)
                 _validate_stage2_resume_payload(
                     best_payload_disk,
                     resolved_config=effective_config,
@@ -1065,6 +1111,7 @@ def run_possm_phoneme_finetuning(
                 elapsed_seconds=round(resume_elapsed_seconds, 3),
                 resumed_from_checkpoint=resumed_from_checkpoint,
                 mode=str(effective_config.mode),
+                init_source=str(effective_config.init_source),
                 data_mode=effective_data_mode,
                 feature_mode=effective_feature_mode,
             )
@@ -1098,6 +1145,7 @@ def run_possm_phoneme_finetuning(
             step=int(steps),
             elapsed_seconds=round(time.time() - start_time, 3),
             mode=str(effective_config.mode),
+            init_source=str(effective_config.init_source),
             data_mode=effective_data_mode,
             feature_mode=effective_feature_mode,
             blank_frame_rate=collapse.get("blank_frame_rate"),
@@ -1192,6 +1240,7 @@ def run_possm_phoneme_finetuning(
                 accumulation_microbatches=int(accumulation_microbatches),
                 optimizer_target_examples=int(effective_config.batch_size),
                 mode=str(effective_config.mode),
+                init_source=str(effective_config.init_source),
                 data_mode=effective_data_mode,
                 feature_mode=effective_feature_mode,
                 dynamic_batching_enabled=True,
@@ -1318,6 +1367,7 @@ def run_possm_phoneme_finetuning(
         "stage1_checkpoint_path": str(resolved_checkpoint_path),
         "stage1_run_dir": str(stage1_run_dir),
         "mode": str(effective_config.mode),
+        "init_source": str(effective_config.init_source),
         "feature_mode": effective_feature_mode,
         "data_mode": effective_data_mode,
         "boundary_key_mode": effective_boundary_key_mode,
