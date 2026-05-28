@@ -222,6 +222,24 @@ Follow-up continuation:
 - train CTC continued to fall strongly during the extension, from roughly `2.27` near step `3000` to roughly `1.54` at step `4000`
 - this looks like emerging overfitting: the extra training can occasionally find a slightly lower PER point, but the average continued checkpoint is not clearly better than the pre-extension run, and the train/validation CTC gap widens
 
+### 2026-05-27 Area-6v `tx_only` Fresh Run (Step 12000)
+
+Latest recovered stage-2 run from the active notebook:
+
+- run: `possm_stage2_finetune_full_tx_only_20260527T140748Z`
+- mode: `finetune_full`
+- steps: `12000`
+- validation CTC: `2.406`
+- validation PER: `0.467`
+- blank frame rate: `0.587`
+- prediction/reference token ratio: `0.848`
+
+Interpretation:
+
+- this is materially stronger than earlier collapsed/near-collapsed runs
+- the loss curves still appeared to have room to keep decreasing, so this run should be treated as promising but likely not fully converged
+- next comparison should keep the same config and extend training further (resume from latest checkpoint) to test whether PER continues improving beyond the current plateau region
+
 ## Current Interpretation
 
 The reconstruction-pretrained POSSM initialization appears to help CTC fine-tuning materially:
