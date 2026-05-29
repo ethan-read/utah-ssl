@@ -146,6 +146,10 @@ def display_possm_stage2_summary(summary: dict[str, Any] | None) -> dict[str, pd
             {
                 "run_name": summary.get("run_name"),
                 "mode": summary.get("mode") or dict(summary.get("config", {})).get("mode"),
+                "decoder_backbone_type": summary.get("decoder_backbone_type")
+                or dict(summary.get("config", {})).get("decoder_backbone_type"),
+                "s5_direction": summary.get("s5_direction")
+                or dict(summary.get("config", {})).get("s5_direction"),
                 "steps": summary.get("steps"),
                 "val_ctc_bpphone": metrics.get("val_ctc_bpphone"),
                 "val_phoneme_error_rate": metrics.get("val_phoneme_error_rate"),
@@ -244,7 +248,7 @@ def run_possm_stage2_prediction_diagnostics(
     checkpoint_path = summary.get("checkpoint_best_path") or summary.get("resume_checkpoint_path")
     if checkpoint_path is None:
         raise ValueError("Stage-2 summary does not include a checkpoint path for diagnostics.")
-    payload = torch.load(Path(checkpoint_path), map_location="cpu")
+    payload = torch.load(Path(checkpoint_path), map_location="cpu", weights_only=False)
     config = POSSMFinetuneConfig(**dict(payload["config"]))
     vocab = dict(payload["vocab"])
     blank_index = int(vocab["blank_index"])
@@ -292,6 +296,13 @@ def run_possm_stage2_prediction_diagnostics(
         gru_hidden_size=int(config.gru_hidden_size),
         gru_num_layers=int(config.gru_num_layers),
         gru_dropout=float(config.gru_dropout),
+        decoder_backbone_type=str(config.decoder_backbone_type),
+        s5_hidden_size=int(config.s5_hidden_size),
+        s5_state_size=int(config.s5_state_size),
+        s5_num_layers=int(config.s5_num_layers),
+        s5_dropout=float(config.s5_dropout),
+        s5_direction=str(config.s5_direction),
+        s5_ffn_multiplier=float(config.s5_ffn_multiplier),
         conv_hidden_size=config.conv_hidden_size,
         conv_kernel_size=int(config.conv_kernel_size),
         conv_stride=int(config.conv_stride),

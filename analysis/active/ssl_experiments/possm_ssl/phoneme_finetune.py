@@ -70,6 +70,13 @@ class POSSMFinetuneConfig:
     gru_hidden_size: int = 768
     gru_num_layers: int = 5
     gru_dropout: float = 0.4
+    decoder_backbone_type: str = "gru"
+    s5_hidden_size: int = 768
+    s5_state_size: int = 128
+    s5_num_layers: int = 5
+    s5_dropout: float = 0.2
+    s5_direction: str = "causal"
+    s5_ffn_multiplier: float = 2.0
     # Backward-compatible aliases for old notebooks/checkpoints that briefly used
     # Willett-style pre-GRU temporal patching names for the POSSM output conv.
     temporal_patch_kernel_size: int | None = None
@@ -138,10 +145,20 @@ class POSSMFinetuneConfig:
             raise ValueError("input_smoothing_threshold must be in [0, 1)")
         if float(self.white_noise_sd) < 0.0 or float(self.constant_offset_sd) < 0.0:
             raise ValueError("input augmentation standard deviations must be non-negative")
+        if self.decoder_backbone_type not in {"gru", "s5"}:
+            raise ValueError("decoder_backbone_type must be one of {'gru', 's5'}")
         if int(self.gru_hidden_size) <= 0 or int(self.gru_num_layers) <= 0:
             raise ValueError("GRU sizes must be positive")
         if not (0.0 <= float(self.gru_dropout) < 1.0):
             raise ValueError("gru_dropout must be in [0, 1)")
+        if int(self.s5_hidden_size) <= 0 or int(self.s5_state_size) <= 0 or int(self.s5_num_layers) <= 0:
+            raise ValueError("S5 sizes must be positive")
+        if not (0.0 <= float(self.s5_dropout) < 1.0):
+            raise ValueError("s5_dropout must be in [0, 1)")
+        if self.s5_direction not in {"causal", "bidirectional"}:
+            raise ValueError("s5_direction must be one of {'causal', 'bidirectional'}")
+        if float(self.s5_ffn_multiplier) <= 0.0:
+            raise ValueError("s5_ffn_multiplier must be positive")
         if int(self.conv_kernel_size) <= 0 or int(self.conv_stride) <= 0:
             raise ValueError("Conv kernel and stride must be positive")
         if not (0.0 <= float(self.conv_dropout) < 1.0):
@@ -191,7 +208,7 @@ def _set_train_mode(
     model.eval()
     if model.session_adapter_enabled:
         model.session_input_adapter.train()
-    model.gru.train()
+    model.sequence_decoder.train()
     model.conv.train()
     model.conv_dropout.train()
     model.classifier.train()
@@ -205,7 +222,7 @@ def _stage2_decoder_train_modules(
     modules: list[torch.nn.Module] = []
     if bool(session_adapter_enabled):
         modules.append(model.session_input_adapter)
-    modules.extend((model.gru, model.conv, model.classifier))
+    modules.extend((model.sequence_decoder, model.conv, model.classifier))
     return tuple(modules)
 
 
@@ -975,6 +992,13 @@ def run_possm_phoneme_finetuning(
         gru_hidden_size=int(effective_config.gru_hidden_size),
         gru_num_layers=int(effective_config.gru_num_layers),
         gru_dropout=float(effective_config.gru_dropout),
+        decoder_backbone_type=str(effective_config.decoder_backbone_type),
+        s5_hidden_size=int(effective_config.s5_hidden_size),
+        s5_state_size=int(effective_config.s5_state_size),
+        s5_num_layers=int(effective_config.s5_num_layers),
+        s5_dropout=float(effective_config.s5_dropout),
+        s5_direction=str(effective_config.s5_direction),
+        s5_ffn_multiplier=float(effective_config.s5_ffn_multiplier),
         conv_hidden_size=effective_config.conv_hidden_size,
         conv_kernel_size=int(effective_config.conv_kernel_size),
         conv_stride=int(effective_config.conv_stride),
@@ -991,7 +1015,7 @@ def run_possm_phoneme_finetuning(
             parameter.requires_grad = bool(train_encoder)
     for parameter in model.session_input_adapter.parameters():
         parameter.requires_grad = bool(effective_config.session_adapter_enabled)
-    for parameter in model.gru.parameters():
+    for parameter in model.sequence_decoder.parameters():
         parameter.requires_grad = True
     for parameter in model.conv.parameters():
         parameter.requires_grad = True
@@ -1384,6 +1408,13 @@ def run_possm_phoneme_finetuning(
         "max_padded_time_per_microbatch": int(batching_diagnostics["max_padded_time_per_microbatch"]),
         "session_adapter_enabled": bool(effective_config.session_adapter_enabled),
         "session_adapter_keys": list(session_adapter_keys),
+        "decoder_backbone_type": str(effective_config.decoder_backbone_type),
+        "s5_hidden_size": int(effective_config.s5_hidden_size),
+        "s5_state_size": int(effective_config.s5_state_size),
+        "s5_num_layers": int(effective_config.s5_num_layers),
+        "s5_dropout": float(effective_config.s5_dropout),
+        "s5_direction": str(effective_config.s5_direction),
+        "s5_ffn_multiplier": float(effective_config.s5_ffn_multiplier),
         "train_split_name": str(problem.get("train_split_name", "competition_train")),
         "val_split_name": str(problem.get("val_split_name", "competition_test")),
         "train_session_ids": [str(session_id) for session_id in tuple(problem.get("train_session_ids", ()))],

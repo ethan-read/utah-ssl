@@ -10,6 +10,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from s5 import BidirectionalS5SequenceBackbone, S5SequenceBackbone
 
 
 @dataclass(frozen=True)
@@ -324,6 +325,64 @@ class GRUTemporalBackbone(nn.Module):
         return unpacked_hidden
 
 
+class S5Stage2SequenceDecoder(nn.Module):
+    """S5 sequence decoder for POSSM stage-2 phoneme fine-tuning."""
+
+    def __init__(
+        self,
+        *,
+        input_size: int,
+        hidden_size: int = 768,
+        state_size: int = 128,
+        num_layers: int = 5,
+        dropout: float = 0.2,
+        direction: str = "causal",
+        ffn_multiplier: float = 2.0,
+    ) -> None:
+        super().__init__()
+        resolved_direction = str(direction)
+        if resolved_direction not in {"causal", "bidirectional"}:
+            raise ValueError("S5 direction must be one of {'causal', 'bidirectional'}")
+        if int(input_size) <= 0 or int(hidden_size) <= 0 or int(state_size) <= 0:
+            raise ValueError("S5 input, hidden, and state sizes must be positive")
+        if int(num_layers) <= 0:
+            raise ValueError("S5 num_layers must be positive")
+        if not (0.0 <= float(dropout) < 1.0):
+            raise ValueError("S5 dropout must be in [0, 1)")
+        if float(ffn_multiplier) <= 0.0:
+            raise ValueError("S5 ffn_multiplier must be positive")
+
+        self.input_size = int(input_size)
+        self.hidden_size = int(hidden_size)
+        self.state_size = int(state_size)
+        self.num_layers = int(num_layers)
+        self.dropout = float(dropout)
+        self.direction = resolved_direction
+        self.ffn_multiplier = float(ffn_multiplier)
+        self.output_size = self.hidden_size
+        self.input_projection = nn.Sequential(
+            nn.LayerNorm(self.input_size),
+            nn.Linear(self.input_size, self.hidden_size),
+            nn.LayerNorm(self.hidden_size),
+        )
+        backbone_cls = (
+            S5SequenceBackbone
+            if self.direction == "causal"
+            else BidirectionalS5SequenceBackbone
+        )
+        self.backbone = backbone_cls(
+            d_model=self.hidden_size,
+            d_state=self.state_size,
+            num_layers=self.num_layers,
+            dropout=self.dropout,
+            ffn_multiplier=self.ffn_multiplier,
+        )
+
+    def forward(self, hidden: torch.Tensor, input_lengths: torch.Tensor) -> torch.Tensor:
+        projected = self.input_projection(hidden)
+        return self.backbone(projected, input_lengths)
+
+
 _TEMPORAL_BACKBONE_REGISTRY: dict[str, type[nn.Module]] = {
     "identity": IdentityTemporalBackbone,
     "gru": GRUTemporalBackbone,
@@ -579,6 +638,13 @@ class POSSMPhonemeModel(nn.Module):
         gru_hidden_size: int = 768,
         gru_num_layers: int = 5,
         gru_dropout: float = 0.4,
+        decoder_backbone_type: str = "gru",
+        s5_hidden_size: int = 768,
+        s5_state_size: int = 128,
+        s5_num_layers: int = 5,
+        s5_dropout: float = 0.2,
+        s5_direction: str = "causal",
+        s5_ffn_multiplier: float = 2.0,
         temporal_patch_kernel_size: int | None = None,
         temporal_patch_stride: int | None = None,
         conv_hidden_size: int | None = None,
@@ -594,13 +660,19 @@ class POSSMPhonemeModel(nn.Module):
         self.vocab_size = int(vocab_size)
         self.gru_hidden_size = int(gru_hidden_size)
         self.gru_num_layers = int(gru_num_layers)
+        self.decoder_backbone_type = str(decoder_backbone_type)
+        if self.decoder_backbone_type not in {"gru", "s5"}:
+            raise ValueError("decoder_backbone_type must be one of {'gru', 's5'}")
+        self.s5_hidden_size = int(s5_hidden_size)
+        self.s5_state_size = int(s5_state_size)
+        self.s5_num_layers = int(s5_num_layers)
+        self.s5_dropout = float(s5_dropout)
+        self.s5_direction = str(s5_direction)
+        self.s5_ffn_multiplier = float(s5_ffn_multiplier)
         self.session_adapter_enabled = bool(session_adapter_enabled)
         self.session_input_adapter = SessionInputAdapterBank(
             tuple(session_adapter_keys),
             input_dim=int(base_encoder.input_dim),
-        )
-        self.conv_hidden_size = (
-            int(conv_hidden_size) if conv_hidden_size is not None else int(gru_hidden_size)
         )
         self.conv_kernel_size = (
             int(conv_kernel_size)
@@ -622,18 +694,38 @@ class POSSMPhonemeModel(nn.Module):
             else int(base_encoder.hidden_size)
         )
         self.sequence_input_size = int(encoder_output_size)
-        self.gru_input_size = self.sequence_input_size
-        effective_gru_dropout = float(gru_dropout) if int(gru_num_layers) > 1 else 0.0
-        self.gru = nn.GRU(
-            input_size=self.gru_input_size,
-            hidden_size=self.gru_hidden_size,
-            num_layers=self.gru_num_layers,
-            dropout=effective_gru_dropout,
-            batch_first=True,
-            bidirectional=False,
+        if self.decoder_backbone_type == "gru":
+            self.gru_input_size = self.sequence_input_size
+            effective_gru_dropout = float(gru_dropout) if int(gru_num_layers) > 1 else 0.0
+            self.gru = nn.GRU(
+                input_size=self.gru_input_size,
+                hidden_size=self.gru_hidden_size,
+                num_layers=self.gru_num_layers,
+                dropout=effective_gru_dropout,
+                batch_first=True,
+                bidirectional=False,
+            )
+            decoder_output_size = self.gru_hidden_size
+            self.s5_sequence_decoder: S5Stage2SequenceDecoder | None = None
+        else:
+            self.gru_input_size = self.sequence_input_size
+            self.gru = None
+            self.s5_sequence_decoder = S5Stage2SequenceDecoder(
+                input_size=self.sequence_input_size,
+                hidden_size=self.s5_hidden_size,
+                state_size=self.s5_state_size,
+                num_layers=self.s5_num_layers,
+                dropout=self.s5_dropout,
+                direction=self.s5_direction,
+                ffn_multiplier=self.s5_ffn_multiplier,
+            )
+            decoder_output_size = int(self.s5_sequence_decoder.output_size)
+        self.decoder_output_size = int(decoder_output_size)
+        self.conv_hidden_size = (
+            int(conv_hidden_size) if conv_hidden_size is not None else self.decoder_output_size
         )
         self.conv = nn.Conv1d(
-            in_channels=self.gru_hidden_size,
+            in_channels=self.decoder_output_size,
             out_channels=self.conv_hidden_size,
             kernel_size=self.conv_kernel_size,
             stride=self.conv_stride,
@@ -649,6 +741,37 @@ class POSSMPhonemeModel(nn.Module):
     @property
     def feature_mode(self) -> str:
         return str(self.base_encoder.feature_mode)
+
+    @property
+    def sequence_decoder(self) -> nn.Module:
+        if self.decoder_backbone_type == "gru":
+            if self.gru is None:
+                raise RuntimeError("GRU decoder was not initialized")
+            return self.gru
+        if self.s5_sequence_decoder is None:
+            raise RuntimeError("S5 decoder was not initialized")
+        return self.s5_sequence_decoder
+
+    def _decode_sequence(
+        self,
+        hidden: torch.Tensor,
+        input_lengths: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.decoder_backbone_type == "gru":
+            packed = nn.utils.rnn.pack_padded_sequence(
+                hidden,
+                input_lengths.cpu(),
+                batch_first=True,
+                enforce_sorted=False,
+            )
+            packed_hidden, _ = self.sequence_decoder(packed)
+            decoded, _ = nn.utils.rnn.pad_packed_sequence(
+                packed_hidden,
+                batch_first=True,
+                total_length=hidden.shape[1],
+            )
+            return decoded
+        return self.sequence_decoder(hidden, input_lengths)
 
     def forward(
         self,
@@ -669,20 +792,9 @@ class POSSMPhonemeModel(nn.Module):
                 encoder_hidden,
                 encoder_outputs.token_lengths,
             )
-        packed = nn.utils.rnn.pack_padded_sequence(
-            encoder_hidden,
-            encoder_outputs.token_lengths.cpu(),
-            batch_first=True,
-            enforce_sorted=False,
-        )
-        packed_hidden, _ = self.gru(packed)
-        gru_hidden, _ = nn.utils.rnn.pad_packed_sequence(
-            packed_hidden,
-            batch_first=True,
-            total_length=encoder_hidden.shape[1],
-        )
+        decoder_hidden = self._decode_sequence(encoder_hidden, encoder_outputs.token_lengths)
 
-        conv_input = gru_hidden.transpose(1, 2)
+        conv_input = decoder_hidden.transpose(1, 2)
         conv_input = F.pad(conv_input, (self.conv_kernel_size - 1, 0))
         conv_hidden = self.conv(conv_input)
         conv_hidden = self.conv_activation(conv_hidden)
@@ -695,7 +807,8 @@ class POSSMPhonemeModel(nn.Module):
             "encoder_hidden": encoder_outputs.hidden,
             "sequence_hidden": encoder_hidden,
             "encoder_lengths": encoder_outputs.token_lengths,
-            "gru_hidden": gru_hidden,
+            "decoder_hidden": decoder_hidden,
+            "gru_hidden": decoder_hidden,
             "conv_hidden": conv_hidden,
             "logits": logits,
             "token_lengths": output_lengths,

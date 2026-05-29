@@ -69,6 +69,13 @@ def base_config(args: argparse.Namespace) -> POSSMFinetuneConfig:
         gru_hidden_size=int(args.gru_hidden_size),
         gru_num_layers=int(args.gru_num_layers),
         gru_dropout=float(args.gru_dropout_default),
+        decoder_backbone_type=str(args.decoder_backbone_type),
+        s5_hidden_size=int(args.s5_hidden_size),
+        s5_state_size=int(args.s5_state_size),
+        s5_num_layers=int(args.s5_num_layers),
+        s5_dropout=float(args.s5_dropout),
+        s5_direction=str(args.s5_direction),
+        s5_ffn_multiplier=float(args.s5_ffn_multiplier),
         temporal_patch_kernel_size=int(args.temporal_patch_kernel_size),
         temporal_patch_stride=int(args.temporal_patch_stride),
         conv_dropout=float(args.conv_dropout),
@@ -154,6 +161,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gru-hidden-size", type=int, default=768)
     parser.add_argument("--gru-num-layers", type=int, default=5)
     parser.add_argument("--gru-dropout-default", type=float, default=0.2)
+    parser.add_argument("--decoder-backbone-type", choices=("gru", "s5"), default="gru")
+    parser.add_argument("--s5-hidden-size", type=int, default=768)
+    parser.add_argument("--s5-state-size", type=int, default=128)
+    parser.add_argument("--s5-num-layers", type=int, default=5)
+    parser.add_argument("--s5-dropout", type=float, default=0.2)
+    parser.add_argument("--s5-direction", choices=("causal", "bidirectional"), default="causal")
+    parser.add_argument("--s5-ffn-multiplier", type=float, default=2.0)
     parser.add_argument("--temporal-patch-kernel-size", type=int, default=14)
     parser.add_argument("--temporal-patch-stride", type=int, default=4)
     parser.add_argument("--conv-dropout", type=float, default=0.1)
@@ -339,6 +353,13 @@ def run_parent(args: argparse.Namespace) -> None:
             f"--gru-hidden-size={int(args.gru_hidden_size)}",
             f"--gru-num-layers={int(args.gru_num_layers)}",
             f"--gru-dropout-default={float(args.gru_dropout_default)}",
+            f"--decoder-backbone-type={str(args.decoder_backbone_type)}",
+            f"--s5-hidden-size={int(args.s5_hidden_size)}",
+            f"--s5-state-size={int(args.s5_state_size)}",
+            f"--s5-num-layers={int(args.s5_num_layers)}",
+            f"--s5-dropout={float(args.s5_dropout)}",
+            f"--s5-direction={str(args.s5_direction)}",
+            f"--s5-ffn-multiplier={float(args.s5_ffn_multiplier)}",
             f"--temporal-patch-kernel-size={int(args.temporal_patch_kernel_size)}",
             f"--temporal-patch-stride={int(args.temporal_patch_stride)}",
             f"--conv-dropout={float(args.conv_dropout)}",
