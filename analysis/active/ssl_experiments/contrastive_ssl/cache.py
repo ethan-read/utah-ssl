@@ -17,6 +17,7 @@ try:
         SegmentBatchSampler,
         build_segment_sampler,
         load_precomputed_session_feature_stats_into_cache_context,
+        resolve_precomputed_session_stats_path,
         prepare_cache_context as _prepare_cache_context,
     )
 except ModuleNotFoundError:  # pragma: no cover - repo-root unittest fallback
@@ -26,6 +27,7 @@ except ModuleNotFoundError:  # pragma: no cover - repo-root unittest fallback
         SegmentBatchSampler,
         build_segment_sampler,
         load_precomputed_session_feature_stats_into_cache_context,
+        resolve_precomputed_session_stats_path,
         prepare_cache_context as _prepare_cache_context,
     )
 
@@ -45,5 +47,6 @@ __all__ = [
     "SegmentBatchSampler",
     "build_segment_sampler",
     "load_precomputed_session_feature_stats_into_cache_context",
+    "resolve_precomputed_session_stats_path",
     "prepare_cache_context",
 ]

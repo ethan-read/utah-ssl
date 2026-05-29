@@ -23,6 +23,7 @@ from .cache import (
     CacheContext,
     build_segment_sampler,
     load_precomputed_session_feature_stats_into_cache_context,
+    resolve_precomputed_session_stats_path,
     prepare_cache_context,
 )
 from .probe import (
@@ -80,6 +81,7 @@ __all__ = [
     "build_segment_sampler",
     "list_ssl_checkpoints",
     "load_precomputed_session_feature_stats_into_cache_context",
+    "resolve_precomputed_session_stats_path",
     "plot_ssl_training_history",
     "prepare_cache_context",
     "recover_downstream_probe_state",

@@ -240,15 +240,55 @@ def _canonical_session_stats_dir(
     )
 
 
-def _canonical_session_stats_stem(
+def _normalize_dataset_names_for_stem(dataset_names: Sequence[str]) -> tuple[str, ...]:
+    normalized: list[str] = []
+    for item in dataset_names:
+        value = str(item).strip()
+        if not value:
+            continue
+        normalized.append(value.replace("/", "_"))
+    return tuple(sorted(dict.fromkeys(normalized)))
+
+
+def _canonical_session_stats_stem_from_included(
+    *,
+    dataset_names: Sequence[str],
+) -> str:
+    included = _normalize_dataset_names_for_stem(dataset_names)
+    if included:
+        joined = "_".join(included)
+        return f"ssl_pretrain_datasets_{joined}_v1"
+    return "ssl_pretrain_all_datasets_v1"
+
+
+def _legacy_canonical_session_stats_stem(
     *,
     excluded_datasets: Sequence[str],
 ) -> str:
-    excluded = tuple(sorted({str(item).strip() for item in excluded_datasets if str(item).strip()}))
+    excluded = tuple(
+        sorted({str(item).strip() for item in excluded_datasets if str(item).strip()})
+    )
     if excluded:
         joined = "_".join(item.replace("/", "_") for item in excluded)
         return f"ssl_pretrain_excluding_{joined}_v1"
     return "ssl_pretrain_all_datasets_v1"
+
+
+def _discover_included_dataset_names_for_stats(
+    *,
+    cache_root: str | Path,
+    excluded_datasets: Sequence[str],
+) -> tuple[str, ...]:
+    root = Path(cache_root)
+    if not root.exists():
+        return tuple()
+    excluded = {str(item).strip() for item in excluded_datasets if str(item).strip()}
+    discovered = [
+        path.name
+        for path in root.iterdir()
+        if path.is_dir() and (path / "metadata.json").exists() and path.name not in excluded
+    ]
+    return tuple(sorted(discovered))
 
 
 def resolve_precomputed_session_stats_path(
@@ -263,9 +303,26 @@ def resolve_precomputed_session_stats_path(
         feature_mode=feature_mode,
         boundary_key_mode=boundary_key_mode,
     )
-    return stats_dir / (
-        f"{_canonical_session_stats_stem(excluded_datasets=excluded_datasets)}.pt"
+    included_datasets = _discover_included_dataset_names_for_stats(
+        cache_root=cache_root,
+        excluded_datasets=excluded_datasets,
     )
+    preferred_path = stats_dir / (
+        f"{_canonical_session_stats_stem_from_included(dataset_names=included_datasets)}.pt"
+    )
+    if preferred_path.exists():
+        return preferred_path
+
+    legacy_path = stats_dir / (
+        f"{_legacy_canonical_session_stats_stem(excluded_datasets=excluded_datasets)}.pt"
+    )
+    if legacy_path.exists():
+        return legacy_path
+
+    discovered = sorted(stats_dir.glob("*.pt"))
+    if len(discovered) == 1:
+        return discovered[0]
+    return preferred_path
 
 
 def _load_artifact_payload_and_sidecar(
