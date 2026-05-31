@@ -19,6 +19,13 @@ def _apply_sequence_mask(x: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor
     return x * mask.to(x.dtype)
 
 
+def _validate_implementation(implementation: str) -> str:
+    resolved = str(implementation)
+    if resolved not in {"recurrent", "fft"}:
+        raise ValueError("S5 implementation must be one of {'recurrent', 'fft'}")
+    return resolved
+
+
 def reverse_padded_sequence(x: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
     """Reverse only the valid prefix of each sequence, leaving padding aligned."""
 
@@ -38,10 +45,11 @@ def reverse_padded_sequence(x: torch.Tensor, lengths: torch.Tensor) -> torch.Ten
 class DiagonalS5SSM(nn.Module):
     """Minimal diagonalized MIMO S5 layer with shared complex state."""
 
-    def __init__(self, d_model: int, d_state: int):
+    def __init__(self, d_model: int, d_state: int, *, implementation: str = "recurrent"):
         super().__init__()
         self.d_model = d_model
         self.d_state = d_state
+        self.implementation = _validate_implementation(implementation)
 
         real_init = torch.linspace(0.5, 1.5, d_state, dtype=torch.float32)
         imag_init = torch.linspace(0.0, math.pi, d_state, dtype=torch.float32)
@@ -72,7 +80,7 @@ class DiagonalS5SSM(nn.Module):
         bbar = ((abar - 1.0) / lam).unsqueeze(-1) * b
         return abar, bbar, c
 
-    def forward(self, x: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+    def forward_recurrent(self, x: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
         batch_size, seq_len, _ = x.shape
         abar, bbar, c = self._discretized_params()
 
@@ -98,6 +106,33 @@ class DiagonalS5SSM(nn.Module):
         y = torch.stack(outputs, dim=1)
         return _apply_sequence_mask(y, lengths)
 
+    def forward_fft(self, x: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+        _, seq_len, _ = x.shape
+        if seq_len <= 0:
+            return x.new_zeros((*x.shape[:-1], self.d_model))
+        abar, bbar, c = self._discretized_params()
+
+        input_terms = x.to(torch.complex64) @ bbar.transpose(0, 1)
+        input_terms = _apply_sequence_mask(input_terms, lengths)
+
+        powers = torch.arange(seq_len, device=x.device, dtype=torch.float32)
+        kernel = abar.unsqueeze(0).pow(powers.unsqueeze(1))
+        fft_len = 1 << (2 * seq_len - 1).bit_length()
+        input_fft = torch.fft.fft(input_terms, n=fft_len, dim=1)
+        kernel_fft = torch.fft.fft(kernel, n=fft_len, dim=0).unsqueeze(0)
+        states = torch.fft.ifft(input_fft * kernel_fft, n=fft_len, dim=1)[:, :seq_len, :]
+
+        response = states @ c.transpose(0, 1)
+        y = response.real + self.D(x)
+        return _apply_sequence_mask(y, lengths)
+
+    def forward(self, x: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+        if self.implementation == "recurrent":
+            return self.forward_recurrent(x, lengths)
+        if self.implementation == "fft":
+            return self.forward_fft(x, lengths)
+        raise RuntimeError(f"Unsupported S5 implementation: {self.implementation}")
+
 
 class S5Block(nn.Module):
     """Canonical pre-norm residual S5 block with a small FFN."""
@@ -109,11 +144,17 @@ class S5Block(nn.Module):
         *,
         dropout: float = 0.0,
         ffn_multiplier: float = 2.0,
+        implementation: str = "recurrent",
     ):
         super().__init__()
+        resolved_implementation = _validate_implementation(implementation)
         d_ff = max(d_model, int(ffn_multiplier * d_model))
         self.norm1 = nn.LayerNorm(d_model)
-        self.ssm = DiagonalS5SSM(d_model=d_model, d_state=d_state)
+        self.ssm = DiagonalS5SSM(
+            d_model=d_model,
+            d_state=d_state,
+            implementation=resolved_implementation,
+        )
         self.dropout1 = nn.Dropout(dropout)
 
         self.norm2 = nn.LayerNorm(d_model)
@@ -143,8 +184,10 @@ class S5SequenceBackbone(nn.Module):
         *,
         dropout: float = 0.0,
         ffn_multiplier: float = 2.0,
+        implementation: str = "recurrent",
     ):
         super().__init__()
+        self.implementation = _validate_implementation(implementation)
         self.blocks = nn.ModuleList(
             [
                 S5Block(
@@ -152,6 +195,7 @@ class S5SequenceBackbone(nn.Module):
                     d_state=d_state,
                     dropout=dropout,
                     ffn_multiplier=ffn_multiplier,
+                    implementation=self.implementation,
                 )
                 for _ in range(num_layers)
             ]
@@ -174,14 +218,17 @@ class BidirectionalS5SequenceBackbone(nn.Module):
         *,
         dropout: float = 0.0,
         ffn_multiplier: float = 2.0,
+        implementation: str = "recurrent",
     ):
         super().__init__()
+        self.implementation = _validate_implementation(implementation)
         self.forward_backbone = S5SequenceBackbone(
             d_model=d_model,
             d_state=d_state,
             num_layers=num_layers,
             dropout=dropout,
             ffn_multiplier=ffn_multiplier,
+            implementation=self.implementation,
         )
         self.backward_backbone = S5SequenceBackbone(
             d_model=d_model,
@@ -189,6 +236,7 @@ class BidirectionalS5SequenceBackbone(nn.Module):
             num_layers=num_layers,
             dropout=dropout,
             ffn_multiplier=ffn_multiplier,
+            implementation=self.implementation,
         )
         self.fusion = nn.Linear(2 * d_model, d_model)
 

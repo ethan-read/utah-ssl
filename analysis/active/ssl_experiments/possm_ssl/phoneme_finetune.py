@@ -77,6 +77,7 @@ class POSSMFinetuneConfig:
     s5_dropout: float = 0.2
     s5_direction: str = "causal"
     s5_ffn_multiplier: float = 2.0
+    s5_implementation: str = "recurrent"
     # Backward-compatible aliases for old notebooks/checkpoints that briefly used
     # Willett-style pre-GRU temporal patching names for the POSSM output conv.
     temporal_patch_kernel_size: int | None = None
@@ -157,6 +158,9 @@ class POSSMFinetuneConfig:
             raise ValueError("s5_dropout must be in [0, 1)")
         if self.s5_direction not in {"causal", "bidirectional"}:
             raise ValueError("s5_direction must be one of {'causal', 'bidirectional'}")
+        self.s5_implementation = str(self.s5_implementation)
+        if self.s5_implementation not in {"recurrent", "fft"}:
+            raise ValueError("s5_implementation must be one of {'recurrent', 'fft'}")
         if float(self.s5_ffn_multiplier) <= 0.0:
             raise ValueError("s5_ffn_multiplier must be positive")
         if int(self.conv_kernel_size) <= 0 or int(self.conv_stride) <= 0:
@@ -797,6 +801,14 @@ def recover_possm_stage2_summary(
         "config": config,
         "steps": int(payload.get("steps", 0) or 0),
         "metrics": metrics,
+        "decoder_backbone_type": config.get("decoder_backbone_type"),
+        "s5_hidden_size": config.get("s5_hidden_size"),
+        "s5_state_size": config.get("s5_state_size"),
+        "s5_num_layers": config.get("s5_num_layers"),
+        "s5_dropout": config.get("s5_dropout"),
+        "s5_direction": config.get("s5_direction"),
+        "s5_ffn_multiplier": config.get("s5_ffn_multiplier"),
+        "s5_implementation": config.get("s5_implementation"),
     }
 
 
@@ -999,6 +1011,7 @@ def run_possm_phoneme_finetuning(
         s5_dropout=float(effective_config.s5_dropout),
         s5_direction=str(effective_config.s5_direction),
         s5_ffn_multiplier=float(effective_config.s5_ffn_multiplier),
+        s5_implementation=str(effective_config.s5_implementation),
         conv_hidden_size=effective_config.conv_hidden_size,
         conv_kernel_size=int(effective_config.conv_kernel_size),
         conv_stride=int(effective_config.conv_stride),
@@ -1432,6 +1445,7 @@ def run_possm_phoneme_finetuning(
         "s5_dropout": float(effective_config.s5_dropout),
         "s5_direction": str(effective_config.s5_direction),
         "s5_ffn_multiplier": float(effective_config.s5_ffn_multiplier),
+        "s5_implementation": str(effective_config.s5_implementation),
         "train_split_name": str(problem.get("train_split_name", "competition_train")),
         "val_split_name": str(problem.get("val_split_name", "competition_test")),
         "train_session_ids": [str(session_id) for session_id in tuple(problem.get("train_session_ids", ()))],

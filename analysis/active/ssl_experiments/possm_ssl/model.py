@@ -338,11 +338,15 @@ class S5Stage2SequenceDecoder(nn.Module):
         dropout: float = 0.2,
         direction: str = "causal",
         ffn_multiplier: float = 2.0,
+        implementation: str = "recurrent",
     ) -> None:
         super().__init__()
         resolved_direction = str(direction)
+        resolved_implementation = str(implementation)
         if resolved_direction not in {"causal", "bidirectional"}:
             raise ValueError("S5 direction must be one of {'causal', 'bidirectional'}")
+        if resolved_implementation not in {"recurrent", "fft"}:
+            raise ValueError("S5 implementation must be one of {'recurrent', 'fft'}")
         if int(input_size) <= 0 or int(hidden_size) <= 0 or int(state_size) <= 0:
             raise ValueError("S5 input, hidden, and state sizes must be positive")
         if int(num_layers) <= 0:
@@ -359,6 +363,7 @@ class S5Stage2SequenceDecoder(nn.Module):
         self.dropout = float(dropout)
         self.direction = resolved_direction
         self.ffn_multiplier = float(ffn_multiplier)
+        self.implementation = resolved_implementation
         self.output_size = self.hidden_size
         self.input_projection = nn.Sequential(
             nn.LayerNorm(self.input_size),
@@ -376,6 +381,7 @@ class S5Stage2SequenceDecoder(nn.Module):
             num_layers=self.num_layers,
             dropout=self.dropout,
             ffn_multiplier=self.ffn_multiplier,
+            implementation=self.implementation,
         )
 
     def forward(self, hidden: torch.Tensor, input_lengths: torch.Tensor) -> torch.Tensor:
@@ -645,6 +651,7 @@ class POSSMPhonemeModel(nn.Module):
         s5_dropout: float = 0.2,
         s5_direction: str = "causal",
         s5_ffn_multiplier: float = 2.0,
+        s5_implementation: str = "recurrent",
         temporal_patch_kernel_size: int | None = None,
         temporal_patch_stride: int | None = None,
         conv_hidden_size: int | None = None,
@@ -669,6 +676,7 @@ class POSSMPhonemeModel(nn.Module):
         self.s5_dropout = float(s5_dropout)
         self.s5_direction = str(s5_direction)
         self.s5_ffn_multiplier = float(s5_ffn_multiplier)
+        self.s5_implementation = str(s5_implementation)
         self.session_adapter_enabled = bool(session_adapter_enabled)
         self.session_input_adapter = SessionInputAdapterBank(
             tuple(session_adapter_keys),
@@ -718,6 +726,7 @@ class POSSMPhonemeModel(nn.Module):
                 dropout=self.s5_dropout,
                 direction=self.s5_direction,
                 ffn_multiplier=self.s5_ffn_multiplier,
+                implementation=self.s5_implementation,
             )
             decoder_output_size = int(self.s5_sequence_decoder.output_size)
         self.decoder_output_size = int(decoder_output_size)
