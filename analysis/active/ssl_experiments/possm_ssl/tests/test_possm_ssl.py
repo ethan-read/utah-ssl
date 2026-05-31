@@ -1829,7 +1829,12 @@ class POSSMSSLTests(unittest.TestCase):
                 for line in Path(summary["progress_log_path"]).read_text().splitlines()
                 if line.strip()
             ]
+            train_record = next(record for record in progress_records if record.get("event") == "phoneme_train_report")
             val_record = next(record for record in progress_records if record.get("event") == "phoneme_val_report")
+            self.assertIn("sample_seconds", train_record)
+            self.assertIn("model_seconds", train_record)
+            self.assertGreaterEqual(float(train_record["sample_seconds"]), 0.0)
+            self.assertGreaterEqual(float(train_record["model_seconds"]), 0.0)
             self.assertIn("val_phoneme_error_rate", val_record)
             self.assertIn("blank_frame_rate", val_record)
 

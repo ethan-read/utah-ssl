@@ -1230,6 +1230,8 @@ def run_possm_phoneme_finetuning(
     accumulated_target_count = 0
     accumulated_loss_sum = 0.0
     accumulation_microbatches = 0
+    accumulated_sample_seconds = 0.0
+    accumulated_model_seconds = 0.0
     has_pending_gradients = False
 
     def flush_pending_gradients(*, force_report: bool = False) -> None:
@@ -1239,6 +1241,8 @@ def run_possm_phoneme_finetuning(
         nonlocal accumulated_target_count
         nonlocal accumulated_loss_sum
         nonlocal accumulation_microbatches
+        nonlocal accumulated_sample_seconds
+        nonlocal accumulated_model_seconds
         nonlocal has_pending_gradients
         if not has_pending_gradients:
             return
@@ -1263,6 +1267,8 @@ def run_possm_phoneme_finetuning(
                 microbatch_examples=int(accumulated_examples),
                 accumulation_microbatches=int(accumulation_microbatches),
                 optimizer_target_examples=int(effective_config.batch_size),
+                sample_seconds=round(accumulated_sample_seconds, 4),
+                model_seconds=round(accumulated_model_seconds, 4),
                 mode=str(effective_config.mode),
                 init_source=str(effective_config.init_source),
                 data_mode=effective_data_mode,
@@ -1274,6 +1280,8 @@ def run_possm_phoneme_finetuning(
         accumulated_target_count = 0
         accumulated_loss_sum = 0.0
         accumulation_microbatches = 0
+        accumulated_sample_seconds = 0.0
+        accumulated_model_seconds = 0.0
         has_pending_gradients = False
 
     while True:
@@ -1281,10 +1289,18 @@ def run_possm_phoneme_finetuning(
         if steps >= int(effective_config.num_steps):
             break
         made_progress = False
-        for batch in train_loader:
+        train_loader_iter = iter(train_loader)
+        while True:
+            sample_start = time.time()
+            try:
+                batch = next(train_loader_iter)
+            except StopIteration:
+                break
+            accumulated_sample_seconds += time.time() - sample_start
             elapsed = time.time() - start_time
             if steps >= int(effective_config.num_steps):
                 break
+            model_start = time.time()
             if train_encoder:
                 _set_train_mode(model, train_encoder=True)
             else:
@@ -1318,6 +1334,7 @@ def run_possm_phoneme_finetuning(
                 label_lengths,
                 blank_index=int(problem["vocab"]["blank_index"]),
             )
+            accumulated_model_seconds += time.time() - model_start
             if target_count <= 0:
                 continue
             loss = loss_sum / target_count

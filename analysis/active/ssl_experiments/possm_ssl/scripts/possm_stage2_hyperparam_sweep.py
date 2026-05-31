@@ -145,7 +145,13 @@ def install_stdout_progress_hook() -> None:
         elapsed = _fmt(payload.get("elapsed_seconds"), digits=1)
         if event == "phoneme_train_report":
             train_loss = _fmt(payload.get("train_ctc_bpphone"))
-            print(f"[stage2 train] step={step} train_ctc_bpphone={train_loss} elapsed_s={elapsed}", flush=True)
+            sample_s = _fmt(payload.get("sample_seconds"), digits=2)
+            model_s = _fmt(payload.get("model_seconds"), digits=2)
+            print(
+                f"[stage2 train] step={step} train_ctc_bpphone={train_loss} "
+                f"sample_s={sample_s} model_s={model_s} elapsed_s={elapsed}",
+                flush=True,
+            )
         elif event == "phoneme_resume":
             checkpoint_path = payload.get("resumed_from_checkpoint")
             print(

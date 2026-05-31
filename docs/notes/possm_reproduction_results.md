@@ -240,6 +240,42 @@ Interpretation:
 - the loss curves still appeared to have room to keep decreasing, so this run should be treated as promising but likely not fully converged
 - next comparison should keep the same config and extend training further (resume from latest checkpoint) to test whether PER continues improving beyond the current plateau region
 
+### 2026-05-28 Random-Init Stage-2 Baseline
+
+Stage-2 was rerun with the same overall `tx_only` area-6v setup, but with `init_source='random'` so the POSSM encoder and temporal backbone started from random weights instead of the Stage-1 reconstruction checkpoint.
+
+Observed result:
+
+- final validation PER: about `0.728`
+- best validation PER: about `0.707`
+- final validation CTC: about `4.03` bits/phoneme
+- blank frame rate: about `0.822`
+- prediction/reference token ratio: about `0.451`
+
+Interpretation:
+
+- this is substantially worse than the pretrained Stage-2 run above
+- the random-init model stayed heavily blank-dominant and under-emissive throughout training
+- the Stage-1 reconstruction pretraining appears to help POSSM Stage-2 optimization materially, even though it is very cheap compared with the several-hour CTC fine-tune
+- the most plausible benefit is better conditioning of the neural frontend and alignment problem, not task-level phoneme knowledge
+- this was a single run, so it should be treated as strong evidence rather than a final statistical conclusion
+
+### 2026-05-29 S5 Random-Init Stage-2 Baseline (No Pretraining)
+
+Latest `S5` stage-2 random-init run path from the training log:
+
+- `/content/drive/MyDrive/utah_ssl/outputs/ssl_experiments/possm_masked_reconstruction/phoneme_finetune/possm_stage2_finetune_full_tx_only_20260529T131819Z_randominit`
+
+Nearby stage-2 log evidence:
+
+- `pruned_step_checkpoint: /content/drive/MyDrive/utah_ssl/outputs/ssl_experiments/possm_masked_reconstruction/phoneme_finetune/possm_stage2_finetune_full_tx_only_20260529T131819Z_randominit/checkpoints/step_005000.pt`
+- `[stage2 train] step=7020 train_ctc_bpphone=3.959 elapsed_s=29829.5`
+
+Observed outcome for this baseline:
+
+- decoder backbone was `S5` with `init_source='random'` (no Stage-1 pretraining transfer)
+- the run did not meaningfully learn decoding by about step `8900`
+
 ## Current Interpretation
 
 The reconstruction-pretrained POSSM initialization appears to help CTC fine-tuning materially:
