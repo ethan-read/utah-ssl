@@ -76,7 +76,6 @@ def base_config(args: argparse.Namespace) -> POSSMFinetuneConfig:
         s5_dropout=float(args.s5_dropout),
         s5_direction=str(args.s5_direction),
         s5_ffn_multiplier=float(args.s5_ffn_multiplier),
-        s5_implementation=str(args.s5_implementation),
         temporal_patch_kernel_size=int(args.temporal_patch_kernel_size),
         temporal_patch_stride=int(args.temporal_patch_stride),
         conv_dropout=float(args.conv_dropout),
@@ -169,7 +168,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--s5-dropout", type=float, default=0.2)
     parser.add_argument("--s5-direction", choices=("causal", "bidirectional"), default="causal")
     parser.add_argument("--s5-ffn-multiplier", type=float, default=2.0)
-    parser.add_argument("--s5-implementation", choices=("recurrent", "fft"), default="recurrent")
     parser.add_argument("--temporal-patch-kernel-size", type=int, default=14)
     parser.add_argument("--temporal-patch-stride", type=int, default=4)
     parser.add_argument("--conv-dropout", type=float, default=0.1)
@@ -362,7 +360,6 @@ def run_parent(args: argparse.Namespace) -> None:
             f"--s5-dropout={float(args.s5_dropout)}",
             f"--s5-direction={str(args.s5_direction)}",
             f"--s5-ffn-multiplier={float(args.s5_ffn_multiplier)}",
-            f"--s5-implementation={str(args.s5_implementation)}",
             f"--temporal-patch-kernel-size={int(args.temporal_patch_kernel_size)}",
             f"--temporal-patch-stride={int(args.temporal_patch_stride)}",
             f"--conv-dropout={float(args.conv_dropout)}",

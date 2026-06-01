@@ -150,8 +150,6 @@ def display_possm_stage2_summary(summary: dict[str, Any] | None) -> dict[str, pd
                 or dict(summary.get("config", {})).get("decoder_backbone_type"),
                 "s5_direction": summary.get("s5_direction")
                 or dict(summary.get("config", {})).get("s5_direction"),
-                "s5_implementation": summary.get("s5_implementation")
-                or dict(summary.get("config", {})).get("s5_implementation"),
                 "steps": summary.get("steps"),
                 "val_ctc_bpphone": metrics.get("val_ctc_bpphone"),
                 "val_phoneme_error_rate": metrics.get("val_phoneme_error_rate"),
@@ -305,7 +303,6 @@ def run_possm_stage2_prediction_diagnostics(
         s5_dropout=float(config.s5_dropout),
         s5_direction=str(config.s5_direction),
         s5_ffn_multiplier=float(config.s5_ffn_multiplier),
-        s5_implementation=str(config.s5_implementation),
         conv_hidden_size=config.conv_hidden_size,
         conv_kernel_size=int(config.conv_kernel_size),
         conv_stride=int(config.conv_stride),

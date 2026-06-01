@@ -836,6 +836,10 @@ class POSSMSSLTests(unittest.TestCase):
         actual = causal_conv_output_lengths(lengths, stride=4)
         self.assertTrue(torch.equal(actual, expected))
 
+    def test_possm_finetune_config_has_no_s5_implementation_switch(self) -> None:
+        payload = asdict(POSSMFinetuneConfig())
+        self.assertNotIn("s5_implementation", payload)
+
     def test_session_input_adapter_bank_initializes_to_identity_feature_affine(self) -> None:
         adapter = SessionInputAdapterBank(("day.1", "day/2"), input_dim=3)
         reversed_adapter = SessionInputAdapterBank(("day/2", "day.1"), input_dim=3)
@@ -1053,129 +1057,78 @@ class POSSMSSLTests(unittest.TestCase):
             self.assertTrue(torch.equal(outputs["token_lengths"], torch.tensor([4, 4])))
             self.assertEqual(tuple(outputs["adapted_input"].shape), (2, 8, 5))
 
-    def test_diagonal_s5_fft_matches_recurrent_outputs_with_padding(self) -> None:
+    def test_diagonal_s5_outputs_are_masked(self) -> None:
         torch.manual_seed(0)
-        recurrent = DiagonalS5SSM(d_model=5, d_state=3, implementation="recurrent")
-        fft = DiagonalS5SSM(d_model=5, d_state=3, implementation="fft")
-        fft.load_state_dict(recurrent.state_dict())
-        recurrent.eval()
-        fft.eval()
+        ssm = DiagonalS5SSM(d_model=5, d_state=3)
+        ssm.eval()
 
         x = torch.randn(3, 7, 5)
         lengths = torch.tensor([7, 4, 2], dtype=torch.long)
         x[1, 4:] = 3.0
         x[2, 2:] = -2.0
 
-        recurrent_out = recurrent(x, lengths)
-        fft_out = fft(x, lengths)
+        output = ssm(x, lengths)
 
-        torch.testing.assert_close(fft_out, recurrent_out, atol=1e-4, rtol=1e-3)
-        self.assertTrue(torch.equal(fft_out[1, 4:], torch.zeros_like(fft_out[1, 4:])))
-        self.assertTrue(torch.equal(fft_out[2, 2:], torch.zeros_like(fft_out[2, 2:])))
+        self.assertEqual(tuple(output.shape), (3, 7, 5))
+        self.assertTrue(torch.equal(output[1, 4:], torch.zeros_like(output[1, 4:])))
+        self.assertTrue(torch.equal(output[2, 2:], torch.zeros_like(output[2, 2:])))
+        self.assertTrue(torch.isfinite(output).all())
 
-    def test_diagonal_s5_fft_matches_recurrent_gradients(self) -> None:
+    def test_diagonal_s5_ignores_padded_suffix_inputs(self) -> None:
         torch.manual_seed(1)
-        recurrent = DiagonalS5SSM(d_model=4, d_state=3, implementation="recurrent")
-        fft = DiagonalS5SSM(d_model=4, d_state=3, implementation="fft")
-        fft.load_state_dict(recurrent.state_dict())
-        recurrent.eval()
-        fft.eval()
+        ssm = DiagonalS5SSM(d_model=4, d_state=3)
+        ssm.eval()
 
-        x_base = torch.randn(2, 6, 4)
+        x = torch.randn(2, 6, 4)
         lengths = torch.tensor([6, 3], dtype=torch.long)
-        target = torch.randn(2, 6, 4)
+        changed_suffix = x.clone()
+        changed_suffix[1, 3:] = 100.0
 
-        recurrent_x = x_base.clone().requires_grad_(True)
-        fft_x = x_base.clone().requires_grad_(True)
-        recurrent_loss = (recurrent(recurrent_x, lengths) * target).sum()
-        fft_loss = (fft(fft_x, lengths) * target).sum()
-        recurrent_loss.backward()
-        fft_loss.backward()
+        base_output = ssm(x, lengths)
+        changed_output = ssm(changed_suffix, lengths)
 
-        torch.testing.assert_close(fft_x.grad, recurrent_x.grad, atol=5e-4, rtol=2e-3)
-        recurrent_params = dict(recurrent.named_parameters())
-        fft_params = dict(fft.named_parameters())
-        for name in (
-            "lambda_real_log",
-            "lambda_imag",
-            "log_dt",
-            "B_re",
-            "B_im",
-            "C_re",
-            "C_im",
-            "D.weight",
-        ):
-            self.assertIsNotNone(recurrent_params[name].grad)
-            self.assertIsNotNone(fft_params[name].grad)
-            torch.testing.assert_close(
-                fft_params[name].grad,
-                recurrent_params[name].grad,
-                atol=5e-4,
-                rtol=2e-3,
-            )
+        torch.testing.assert_close(changed_output[1, :3], base_output[1, :3], atol=1e-5, rtol=1e-4)
+        self.assertTrue(torch.equal(changed_output[1, 3:], torch.zeros_like(changed_output[1, 3:])))
 
-    def test_s5_sequence_backbone_fft_matches_recurrent(self) -> None:
-        for num_layers in (1, 2):
-            torch.manual_seed(10 + num_layers)
-            recurrent = S5SequenceBackbone(
-                d_model=5,
-                d_state=3,
-                num_layers=num_layers,
-                dropout=0.0,
-                ffn_multiplier=1.0,
-                implementation="recurrent",
-            )
-            fft = S5SequenceBackbone(
-                d_model=5,
-                d_state=3,
-                num_layers=num_layers,
-                dropout=0.0,
-                ffn_multiplier=1.0,
-                implementation="fft",
-            )
-            fft.load_state_dict(recurrent.state_dict())
-            recurrent.eval()
-            fft.eval()
+    def test_s5_sequence_backbone_outputs_are_masked(self) -> None:
+        torch.manual_seed(10)
+        backbone = S5SequenceBackbone(
+            d_model=5,
+            d_state=3,
+            num_layers=2,
+            dropout=0.0,
+            ffn_multiplier=1.0,
+        )
+        backbone.eval()
 
-            x = torch.randn(2, 6, 5)
-            lengths = torch.tensor([6, 4], dtype=torch.long)
-            x[1, 4:] = 7.0
-            recurrent_out = recurrent(x, lengths)
-            fft_out = fft(x, lengths)
+        x = torch.randn(2, 6, 5)
+        lengths = torch.tensor([6, 4], dtype=torch.long)
+        x[1, 4:] = 7.0
+        output = backbone(x, lengths)
 
-            torch.testing.assert_close(fft_out, recurrent_out, atol=1e-4, rtol=1e-3)
-            self.assertTrue(torch.equal(fft_out[1, 4:], torch.zeros_like(fft_out[1, 4:])))
+        self.assertEqual(tuple(output.shape), (2, 6, 5))
+        self.assertTrue(torch.equal(output[1, 4:], torch.zeros_like(output[1, 4:])))
+        self.assertTrue(torch.isfinite(output).all())
 
-    def test_bidirectional_s5_sequence_backbone_fft_matches_recurrent(self) -> None:
+    def test_bidirectional_s5_sequence_backbone_shapes_and_masks(self) -> None:
         torch.manual_seed(12)
-        recurrent = BidirectionalS5SequenceBackbone(
+        backbone = BidirectionalS5SequenceBackbone(
             d_model=4,
             d_state=3,
             num_layers=1,
             dropout=0.0,
             ffn_multiplier=1.0,
-            implementation="recurrent",
         )
-        fft = BidirectionalS5SequenceBackbone(
-            d_model=4,
-            d_state=3,
-            num_layers=1,
-            dropout=0.0,
-            ffn_multiplier=1.0,
-            implementation="fft",
-        )
-        fft.load_state_dict(recurrent.state_dict())
-        recurrent.eval()
-        fft.eval()
+        backbone.eval()
 
         x = torch.randn(2, 6, 4)
         lengths = torch.tensor([6, 3], dtype=torch.long)
         x[1, 3:] = -5.0
-        recurrent_out = recurrent(x, lengths)
-        fft_out = fft(x, lengths)
+        output = backbone(x, lengths)
 
-        torch.testing.assert_close(fft_out, recurrent_out, atol=1e-4, rtol=1e-3)
-        self.assertTrue(torch.equal(fft_out[1, 3:], torch.zeros_like(fft_out[1, 3:])))
+        self.assertEqual(tuple(output.shape), (2, 6, 4))
+        self.assertTrue(torch.equal(output[1, 3:], torch.zeros_like(output[1, 3:])))
+        self.assertTrue(torch.isfinite(output).all())
 
     def test_possm_phoneme_model_s5_decoder_shapes_and_lengths(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1191,7 +1144,6 @@ class POSSMSSLTests(unittest.TestCase):
                 s5_num_layers=2,
                 s5_dropout=0.0,
                 s5_direction="causal",
-                s5_implementation="fft",
                 conv_kernel_size=3,
                 conv_stride=2,
             )
@@ -1219,7 +1171,6 @@ class POSSMSSLTests(unittest.TestCase):
                 s5_num_layers=1,
                 s5_dropout=0.0,
                 s5_direction="bidirectional",
-                s5_implementation="fft",
                 conv_kernel_size=3,
                 conv_stride=2,
             )
@@ -1449,7 +1400,6 @@ class POSSMSSLTests(unittest.TestCase):
                     s5_num_layers=1,
                     s5_dropout=0.0,
                     s5_direction="causal",
-                    s5_implementation="fft",
                     conv_kernel_size=3,
                     conv_stride=1,
                 ),
@@ -1457,11 +1407,10 @@ class POSSMSSLTests(unittest.TestCase):
             )
             self.assertEqual(summary["decoder_backbone_type"], "s5")
             self.assertEqual(summary["s5_direction"], "causal")
-            self.assertEqual(summary["s5_implementation"], "fft")
             self.assertTrue(Path(summary["checkpoint_final_path"]).exists())
             payload = torch.load(summary["checkpoint_final_path"], map_location="cpu")
             self.assertEqual(str(payload["config"]["decoder_backbone_type"]), "s5")
-            self.assertEqual(str(payload["config"]["s5_implementation"]), "fft")
+            self.assertNotIn("s5_implementation", payload["config"])
             self.assertTrue(
                 any(key.startswith("s5_sequence_decoder.") for key in payload["model_state"].keys())
             )
