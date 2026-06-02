@@ -1,12 +1,20 @@
-"""Willett-style GRU phoneme decoder."""
+"""Willett-style supervised phoneme decoders."""
 
 from __future__ import annotations
 
 import hashlib
+import sys
 from dataclasses import dataclass
+from pathlib import Path
 
 import torch
 import torch.nn as nn
+
+S5_DIR = Path(__file__).resolve().parents[2] / "transfer_benchmark" / "ssl_autoresearch"
+if str(S5_DIR) not in sys.path:
+    sys.path.insert(0, str(S5_DIR))
+
+from s5 import BidirectionalS5SequenceBackbone, S5SequenceBackbone
 
 
 def patched_length(length: int, *, patch_size: int, patch_stride: int) -> int:
@@ -126,7 +134,7 @@ class WillettEncoderOutputs:
 
 
 class WillettPhonemeModel(nn.Module):
-    """Supervised GRU decoder inspired by the Stanford speech baseline."""
+    """Supervised decoder inspired by the Stanford speech baseline."""
 
     def __init__(
         self,
@@ -137,9 +145,16 @@ class WillettPhonemeModel(nn.Module):
         patch_stride: int = 4,
         input_projection_size: int = 256,
         input_projection_dropout: float = 0.2,
+        decoder_backbone_type: str = "gru",
         gru_hidden_size: int = 512,
         gru_num_layers: int = 5,
         gru_dropout: float = 0.4,
+        s5_hidden_size: int = 512,
+        s5_state_size: int = 128,
+        s5_num_layers: int = 5,
+        s5_dropout: float = 0.2,
+        s5_direction: str = "causal",
+        s5_ffn_multiplier: float = 2.0,
         session_adapter_keys: tuple[str, ...] = (),
         session_adapter_enabled: bool = True,
     ) -> None:
@@ -149,9 +164,18 @@ class WillettPhonemeModel(nn.Module):
         self.patch_size = int(patch_size)
         self.patch_stride = int(patch_stride)
         self.input_projection_size = int(input_projection_size)
+        self.decoder_backbone_type = str(decoder_backbone_type)
         self.gru_hidden_size = int(gru_hidden_size)
         self.gru_num_layers = int(gru_num_layers)
+        self.s5_hidden_size = int(s5_hidden_size)
+        self.s5_state_size = int(s5_state_size)
+        self.s5_num_layers = int(s5_num_layers)
+        self.s5_direction = str(s5_direction)
         self.session_adapter_enabled = bool(session_adapter_enabled)
+        if self.decoder_backbone_type not in {"gru", "s5"}:
+            raise ValueError("decoder_backbone_type must be one of {'gru', 's5'}")
+        if self.s5_direction not in {"causal", "bidirectional"}:
+            raise ValueError("s5_direction must be one of {'causal', 'bidirectional'}")
         self.session_input_adapter = SessionInputAdapterBank(
             tuple(session_adapter_keys),
             input_dim=self.input_dim,
@@ -160,18 +184,37 @@ class WillettPhonemeModel(nn.Module):
         )
         self.adapter_output_dim = self.input_projection_size
         patch_dim = self.adapter_output_dim * self.patch_size
-        effective_gru_dropout = float(gru_dropout) if self.gru_num_layers > 1 else 0.0
-        self.gru = nn.GRU(
-            input_size=patch_dim,
-            hidden_size=self.gru_hidden_size,
-            num_layers=self.gru_num_layers,
-            dropout=effective_gru_dropout,
-            batch_first=True,
-            bidirectional=False,
-        )
-        self.initial_state = nn.Parameter(torch.empty((1, self.gru_hidden_size)))
-        nn.init.xavier_uniform_(self.initial_state)
-        self.classifier = nn.Linear(self.gru_hidden_size, self.vocab_size)
+        if self.decoder_backbone_type == "gru":
+            effective_gru_dropout = float(gru_dropout) if self.gru_num_layers > 1 else 0.0
+            self.gru = nn.GRU(
+                input_size=patch_dim,
+                hidden_size=self.gru_hidden_size,
+                num_layers=self.gru_num_layers,
+                dropout=effective_gru_dropout,
+                batch_first=True,
+                bidirectional=False,
+            )
+            self.initial_state = nn.Parameter(torch.empty((1, self.gru_hidden_size)))
+            nn.init.xavier_uniform_(self.initial_state)
+            self.decoder_output_size = self.gru_hidden_size
+        else:
+            self.s5_input_norm = nn.LayerNorm(patch_dim)
+            self.s5_input_projection = nn.Linear(patch_dim, self.s5_hidden_size)
+            self.s5_hidden_norm = nn.LayerNorm(self.s5_hidden_size)
+            s5_backbone_cls = (
+                S5SequenceBackbone
+                if self.s5_direction == "causal"
+                else BidirectionalS5SequenceBackbone
+            )
+            self.s5 = s5_backbone_cls(
+                d_model=self.s5_hidden_size,
+                d_state=self.s5_state_size,
+                num_layers=self.s5_num_layers,
+                dropout=float(s5_dropout),
+                ffn_multiplier=float(s5_ffn_multiplier),
+            )
+            self.decoder_output_size = self.s5_hidden_size
+        self.classifier = nn.Linear(self.decoder_output_size, self.vocab_size)
 
     def _initial_hidden_state(
         self,
@@ -241,29 +284,37 @@ class WillettPhonemeModel(nn.Module):
             session_adapter_enabled=self.session_adapter_enabled,
         )
         patched_inputs, token_lengths = self._patch_batch(adapted_input, input_lengths)
-        packed = nn.utils.rnn.pack_padded_sequence(
-            patched_inputs,
-            token_lengths.cpu(),
-            batch_first=True,
-            enforce_sorted=False,
-        )
-        initial_hidden = self._initial_hidden_state(
-            batch_size=int(x.shape[0]),
-            device=patched_inputs.device,
-            dtype=patched_inputs.dtype,
-        )
-        packed_hidden, _ = self.gru(packed, initial_hidden)
-        hidden, _ = nn.utils.rnn.pad_packed_sequence(
-            packed_hidden,
-            batch_first=True,
-            total_length=patched_inputs.shape[1],
-        )
+        if self.decoder_backbone_type == "gru":
+            packed = nn.utils.rnn.pack_padded_sequence(
+                patched_inputs,
+                token_lengths.cpu(),
+                batch_first=True,
+                enforce_sorted=False,
+            )
+            initial_hidden = self._initial_hidden_state(
+                batch_size=int(x.shape[0]),
+                device=patched_inputs.device,
+                dtype=patched_inputs.dtype,
+            )
+            packed_hidden, _ = self.gru(packed, initial_hidden)
+            hidden, _ = nn.utils.rnn.pad_packed_sequence(
+                packed_hidden,
+                batch_first=True,
+                total_length=patched_inputs.shape[1],
+            )
+            projected_inputs = patched_inputs
+        else:
+            projected_inputs = self.s5_hidden_norm(
+                self.s5_input_projection(self.s5_input_norm(patched_inputs))
+            )
+            hidden = self.s5(projected_inputs, token_lengths)
         logits = self.classifier(hidden)
         return {
             "adapted_input": adapted_input,
             "patched_inputs": patched_inputs,
-            "projected_inputs": patched_inputs,
+            "projected_inputs": projected_inputs,
             "hidden": hidden,
+            "decoder_hidden": hidden,
             "token_lengths": token_lengths,
             "logits": logits,
         }

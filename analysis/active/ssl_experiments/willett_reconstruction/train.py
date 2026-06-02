@@ -68,9 +68,16 @@ class WillettReconstructionConfig:
     progress_every_steps: int = 25
     input_projection_size: int = 256
     input_projection_dropout: float = 0.2
+    decoder_backbone_type: str = "gru"
     gru_hidden_size: int = 512
     gru_num_layers: int = 5
     gru_dropout: float = 0.4
+    s5_hidden_size: int = 512
+    s5_state_size: int = 128
+    s5_num_layers: int = 5
+    s5_dropout: float = 0.2
+    s5_direction: str = "causal"
+    s5_ffn_multiplier: float = 2.0
     patch_size: int = 14
     patch_stride: int = 4
     session_adapter_enabled: bool = True
@@ -103,8 +110,16 @@ class WillettReconstructionConfig:
             raise ValueError("patch_size and patch_stride must be positive")
         if int(self.input_projection_size) <= 0:
             raise ValueError("input_projection_size must be positive")
+        if self.decoder_backbone_type not in {"gru", "s5"}:
+            raise ValueError("decoder_backbone_type must be one of {'gru', 's5'}")
         if int(self.gru_hidden_size) <= 0 or int(self.gru_num_layers) <= 0:
             raise ValueError("GRU sizes must be positive")
+        if int(self.s5_hidden_size) <= 0 or int(self.s5_state_size) <= 0 or int(self.s5_num_layers) <= 0:
+            raise ValueError("S5 sizes must be positive")
+        if self.s5_direction not in {"causal", "bidirectional"}:
+            raise ValueError("s5_direction must be one of {'causal', 'bidirectional'}")
+        if float(self.s5_ffn_multiplier) <= 0.0:
+            raise ValueError("s5_ffn_multiplier must be positive")
 
 
 def _timestamp_utc() -> str:
@@ -361,9 +376,16 @@ def run_willett_reconstruction(config: WillettReconstructionConfig) -> dict[str,
         patch_stride=int(config.patch_stride),
         input_projection_size=int(config.input_projection_size),
         input_projection_dropout=float(config.input_projection_dropout),
+        decoder_backbone_type=str(config.decoder_backbone_type),
         gru_hidden_size=int(config.gru_hidden_size),
         gru_num_layers=int(config.gru_num_layers),
         gru_dropout=float(config.gru_dropout),
+        s5_hidden_size=int(config.s5_hidden_size),
+        s5_state_size=int(config.s5_state_size),
+        s5_num_layers=int(config.s5_num_layers),
+        s5_dropout=float(config.s5_dropout),
+        s5_direction=str(config.s5_direction),
+        s5_ffn_multiplier=float(config.s5_ffn_multiplier),
         session_adapter_keys=session_adapter_keys,
         session_adapter_enabled=bool(config.session_adapter_enabled),
     ).to(device)
@@ -619,9 +641,16 @@ def _parse_args() -> WillettReconstructionConfig:
     parser.add_argument("--progress-every-steps", type=int, default=25)
     parser.add_argument("--input-projection-size", type=int, default=256)
     parser.add_argument("--input-projection-dropout", type=float, default=0.2)
+    parser.add_argument("--decoder-backbone-type", choices=("gru", "s5"), default="gru")
     parser.add_argument("--gru-hidden-size", type=int, default=512)
     parser.add_argument("--gru-num-layers", type=int, default=5)
     parser.add_argument("--gru-dropout", type=float, default=0.4)
+    parser.add_argument("--s5-hidden-size", type=int, default=512)
+    parser.add_argument("--s5-state-size", type=int, default=128)
+    parser.add_argument("--s5-num-layers", type=int, default=5)
+    parser.add_argument("--s5-dropout", type=float, default=0.2)
+    parser.add_argument("--s5-direction", choices=("causal", "bidirectional"), default="causal")
+    parser.add_argument("--s5-ffn-multiplier", type=float, default=2.0)
     parser.add_argument("--patch-size", type=int, default=14)
     parser.add_argument("--patch-stride", type=int, default=4)
     parser.add_argument("--input-smoothing-sigma-bins", type=float, default=2.0)
@@ -655,9 +684,16 @@ def _parse_args() -> WillettReconstructionConfig:
         progress_every_steps=int(args.progress_every_steps),
         input_projection_size=int(args.input_projection_size),
         input_projection_dropout=float(args.input_projection_dropout),
+        decoder_backbone_type=str(args.decoder_backbone_type),
         gru_hidden_size=int(args.gru_hidden_size),
         gru_num_layers=int(args.gru_num_layers),
         gru_dropout=float(args.gru_dropout),
+        s5_hidden_size=int(args.s5_hidden_size),
+        s5_state_size=int(args.s5_state_size),
+        s5_num_layers=int(args.s5_num_layers),
+        s5_dropout=float(args.s5_dropout),
+        s5_direction=str(args.s5_direction),
+        s5_ffn_multiplier=float(args.s5_ffn_multiplier),
         patch_size=int(args.patch_size),
         patch_stride=int(args.patch_stride),
         session_adapter_enabled=not bool(args.disable_session_adapter),
