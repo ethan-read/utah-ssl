@@ -14,6 +14,7 @@ S5_DIR = Path(__file__).resolve().parents[2] / "transfer_benchmark" / "ssl_autor
 if str(S5_DIR) not in sys.path:
     sys.path.insert(0, str(S5_DIR))
 
+from s4d import BidirectionalS4DSequenceBackbone, S4DSequenceBackbone
 from s5 import BidirectionalS5SequenceBackbone, S5SequenceBackbone
 
 
@@ -155,6 +156,12 @@ class WillettPhonemeModel(nn.Module):
         s5_dropout: float = 0.2,
         s5_direction: str = "causal",
         s5_ffn_multiplier: float = 2.0,
+        s4d_hidden_size: int = 512,
+        s4d_state_size: int = 128,
+        s4d_num_layers: int = 5,
+        s4d_dropout: float = 0.2,
+        s4d_direction: str = "causal",
+        s4d_ffn_multiplier: float = 2.0,
         session_adapter_keys: tuple[str, ...] = (),
         session_adapter_enabled: bool = True,
     ) -> None:
@@ -171,11 +178,17 @@ class WillettPhonemeModel(nn.Module):
         self.s5_state_size = int(s5_state_size)
         self.s5_num_layers = int(s5_num_layers)
         self.s5_direction = str(s5_direction)
+        self.s4d_hidden_size = int(s4d_hidden_size)
+        self.s4d_state_size = int(s4d_state_size)
+        self.s4d_num_layers = int(s4d_num_layers)
+        self.s4d_direction = str(s4d_direction)
         self.session_adapter_enabled = bool(session_adapter_enabled)
-        if self.decoder_backbone_type not in {"gru", "s5"}:
-            raise ValueError("decoder_backbone_type must be one of {'gru', 's5'}")
+        if self.decoder_backbone_type not in {"gru", "s5", "s4d"}:
+            raise ValueError("decoder_backbone_type must be one of {'gru', 's5', 's4d'}")
         if self.s5_direction not in {"causal", "bidirectional"}:
             raise ValueError("s5_direction must be one of {'causal', 'bidirectional'}")
+        if self.s4d_direction not in {"causal", "bidirectional"}:
+            raise ValueError("s4d_direction must be one of {'causal', 'bidirectional'}")
         self.session_input_adapter = SessionInputAdapterBank(
             tuple(session_adapter_keys),
             input_dim=self.input_dim,
@@ -197,7 +210,7 @@ class WillettPhonemeModel(nn.Module):
             self.initial_state = nn.Parameter(torch.empty((1, self.gru_hidden_size)))
             nn.init.xavier_uniform_(self.initial_state)
             self.decoder_output_size = self.gru_hidden_size
-        else:
+        elif self.decoder_backbone_type == "s5":
             self.s5_input_norm = nn.LayerNorm(patch_dim)
             self.s5_input_projection = nn.Linear(patch_dim, self.s5_hidden_size)
             self.s5_hidden_norm = nn.LayerNorm(self.s5_hidden_size)
@@ -214,6 +227,23 @@ class WillettPhonemeModel(nn.Module):
                 ffn_multiplier=float(s5_ffn_multiplier),
             )
             self.decoder_output_size = self.s5_hidden_size
+        else:
+            self.s4d_input_norm = nn.LayerNorm(patch_dim)
+            self.s4d_input_projection = nn.Linear(patch_dim, self.s4d_hidden_size)
+            self.s4d_hidden_norm = nn.LayerNorm(self.s4d_hidden_size)
+            s4d_backbone_cls = (
+                S4DSequenceBackbone
+                if self.s4d_direction == "causal"
+                else BidirectionalS4DSequenceBackbone
+            )
+            self.s4d = s4d_backbone_cls(
+                d_model=self.s4d_hidden_size,
+                d_state=self.s4d_state_size,
+                num_layers=self.s4d_num_layers,
+                dropout=float(s4d_dropout),
+                ffn_multiplier=float(s4d_ffn_multiplier),
+            )
+            self.decoder_output_size = self.s4d_hidden_size
         self.classifier = nn.Linear(self.decoder_output_size, self.vocab_size)
 
     def _initial_hidden_state(
@@ -303,11 +333,16 @@ class WillettPhonemeModel(nn.Module):
                 total_length=patched_inputs.shape[1],
             )
             projected_inputs = patched_inputs
-        else:
+        elif self.decoder_backbone_type == "s5":
             projected_inputs = self.s5_hidden_norm(
                 self.s5_input_projection(self.s5_input_norm(patched_inputs))
             )
             hidden = self.s5(projected_inputs, token_lengths)
+        else:
+            projected_inputs = self.s4d_hidden_norm(
+                self.s4d_input_projection(self.s4d_input_norm(patched_inputs))
+            )
+            hidden = self.s4d(projected_inputs, token_lengths)
         logits = self.classifier(hidden)
         return {
             "adapted_input": adapted_input,

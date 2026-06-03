@@ -267,6 +267,43 @@ class WillettReconstructionTest(unittest.TestCase):
         self.assertEqual(int(outputs["logits"].shape[-1]), 4)
         self.assertFalse(any(name.startswith("gru.") for name, _ in model.named_parameters()))
 
+    def test_s4d_model_forward_shapes_and_lengths(self) -> None:
+        model = WillettPhonemeModel(
+            input_dim=3,
+            vocab_size=4,
+            patch_size=3,
+            patch_stride=2,
+            input_projection_size=5,
+            decoder_backbone_type="s4d",
+            s4d_hidden_size=8,
+            s4d_state_size=4,
+            s4d_num_layers=1,
+            s4d_dropout=0.0,
+            s4d_ffn_multiplier=1.0,
+            session_adapter_keys=("t12.2022.08.10",),
+            session_adapter_enabled=True,
+        )
+        x = torch.randn(2, 5, 3)
+        lengths = torch.tensor([5, 2], dtype=torch.long)
+        outputs = model(
+            x,
+            lengths,
+            session_ids=["t12.2022.08.10", "t12.2022.08.10"],
+        )
+        self.assertEqual(
+            outputs["token_lengths"].tolist(),
+            [
+                patched_length(5, patch_size=3, patch_stride=2),
+                patched_length(2, patch_size=3, patch_stride=2),
+            ],
+        )
+        self.assertEqual(int(outputs["patched_inputs"].shape[-1]), 15)
+        self.assertEqual(int(outputs["projected_inputs"].shape[-1]), 8)
+        self.assertEqual(int(outputs["hidden"].shape[-1]), 8)
+        self.assertEqual(int(outputs["logits"].shape[-1]), 4)
+        self.assertTrue(torch.isfinite(outputs["logits"]).all())
+        self.assertFalse(any(name.startswith("gru.") for name, _ in model.named_parameters()))
+
     def test_short_training_run_writes_outputs_and_can_resume(self) -> None:
         cache_root = Path(self._tmp_dir())
         _write_tiny_competition_probe_cache(cache_root)
@@ -389,6 +426,63 @@ class WillettReconstructionTest(unittest.TestCase):
         self.assertTrue((run_dir / "checkpoint_best.pt").exists())
         self.assertTrue((run_dir / "checkpoint_final.pt").exists())
         self.assertEqual(summary["config"]["decoder_backbone_type"], "s5")
+        checkpoint_payload = torch.load(run_dir / "checkpoint_final.pt", map_location="cpu", weights_only=False)
+        self.assertFalse(any(name.startswith("gru.") for name in checkpoint_payload["model_state"]))
+
+    def test_short_s4d_training_run_writes_outputs(self) -> None:
+        cache_root = Path(self._tmp_dir())
+        _write_tiny_competition_probe_cache(cache_root)
+        output_root = Path(self._tmp_dir())
+        stats_path = resolve_canonical_split_stats_path(
+            cache_root=cache_root,
+            dataset="brain2text24",
+            train_split_name="competition_train",
+            feature_mode="tx_only",
+            preferred_path=None,
+        )
+        _write_valid_split_stats_artifact(
+            cache_root=cache_root,
+            stats_path=stats_path,
+            dataset="brain2text24",
+            feature_mode="tx_only",
+            boundary_key_mode="session",
+            train_split_name="competition_train",
+            val_split_name="competition_test",
+            dim=3,
+        )
+        config = WillettReconstructionConfig(
+            cache_root=cache_root,
+            output_root=output_root,
+            run_name="tiny_s4d_run",
+            max_steps=1,
+            batch_size=2,
+            learning_rate=1e-3,
+            min_learning_rate=1e-4,
+            warmup_steps=0,
+            adam_epsilon=1e-1,
+            val_every_steps=1,
+            checkpoint_every_steps=1,
+            progress_every_steps=1,
+            input_smoothing_sigma_bins=0.0,
+            white_noise_sd=0.0,
+            constant_offset_sd=0.0,
+            patch_size=2,
+            patch_stride=1,
+            input_projection_size=8,
+            decoder_backbone_type="s4d",
+            s4d_hidden_size=16,
+            s4d_state_size=4,
+            s4d_num_layers=1,
+            s4d_dropout=0.0,
+            s4d_ffn_multiplier=1.0,
+        )
+        summary = run_willett_reconstruction(config)
+        run_dir = output_root / "tiny_s4d_run"
+        self.assertTrue((run_dir / "progress.jsonl").exists())
+        self.assertTrue((run_dir / "summary.json").exists())
+        self.assertTrue((run_dir / "checkpoint_best.pt").exists())
+        self.assertTrue((run_dir / "checkpoint_final.pt").exists())
+        self.assertEqual(summary["config"]["decoder_backbone_type"], "s4d")
         checkpoint_payload = torch.load(run_dir / "checkpoint_final.pt", map_location="cpu", weights_only=False)
         self.assertFalse(any(name.startswith("gru.") for name in checkpoint_payload["model_state"]))
 

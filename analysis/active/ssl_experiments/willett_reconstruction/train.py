@@ -78,6 +78,12 @@ class WillettReconstructionConfig:
     s5_dropout: float = 0.2
     s5_direction: str = "causal"
     s5_ffn_multiplier: float = 2.0
+    s4d_hidden_size: int = 512
+    s4d_state_size: int = 128
+    s4d_num_layers: int = 5
+    s4d_dropout: float = 0.2
+    s4d_direction: str = "causal"
+    s4d_ffn_multiplier: float = 2.0
     patch_size: int = 14
     patch_stride: int = 4
     session_adapter_enabled: bool = True
@@ -110,8 +116,8 @@ class WillettReconstructionConfig:
             raise ValueError("patch_size and patch_stride must be positive")
         if int(self.input_projection_size) <= 0:
             raise ValueError("input_projection_size must be positive")
-        if self.decoder_backbone_type not in {"gru", "s5"}:
-            raise ValueError("decoder_backbone_type must be one of {'gru', 's5'}")
+        if self.decoder_backbone_type not in {"gru", "s5", "s4d"}:
+            raise ValueError("decoder_backbone_type must be one of {'gru', 's5', 's4d'}")
         if int(self.gru_hidden_size) <= 0 or int(self.gru_num_layers) <= 0:
             raise ValueError("GRU sizes must be positive")
         if int(self.s5_hidden_size) <= 0 or int(self.s5_state_size) <= 0 or int(self.s5_num_layers) <= 0:
@@ -120,6 +126,12 @@ class WillettReconstructionConfig:
             raise ValueError("s5_direction must be one of {'causal', 'bidirectional'}")
         if float(self.s5_ffn_multiplier) <= 0.0:
             raise ValueError("s5_ffn_multiplier must be positive")
+        if int(self.s4d_hidden_size) <= 0 or int(self.s4d_state_size) <= 0 or int(self.s4d_num_layers) <= 0:
+            raise ValueError("S4D sizes must be positive")
+        if self.s4d_direction not in {"causal", "bidirectional"}:
+            raise ValueError("s4d_direction must be one of {'causal', 'bidirectional'}")
+        if float(self.s4d_ffn_multiplier) <= 0.0:
+            raise ValueError("s4d_ffn_multiplier must be positive")
 
 
 def _timestamp_utc() -> str:
@@ -386,6 +398,12 @@ def run_willett_reconstruction(config: WillettReconstructionConfig) -> dict[str,
         s5_dropout=float(config.s5_dropout),
         s5_direction=str(config.s5_direction),
         s5_ffn_multiplier=float(config.s5_ffn_multiplier),
+        s4d_hidden_size=int(config.s4d_hidden_size),
+        s4d_state_size=int(config.s4d_state_size),
+        s4d_num_layers=int(config.s4d_num_layers),
+        s4d_dropout=float(config.s4d_dropout),
+        s4d_direction=str(config.s4d_direction),
+        s4d_ffn_multiplier=float(config.s4d_ffn_multiplier),
         session_adapter_keys=session_adapter_keys,
         session_adapter_enabled=bool(config.session_adapter_enabled),
     ).to(device)
@@ -641,7 +659,7 @@ def _parse_args() -> WillettReconstructionConfig:
     parser.add_argument("--progress-every-steps", type=int, default=25)
     parser.add_argument("--input-projection-size", type=int, default=256)
     parser.add_argument("--input-projection-dropout", type=float, default=0.2)
-    parser.add_argument("--decoder-backbone-type", choices=("gru", "s5"), default="gru")
+    parser.add_argument("--decoder-backbone-type", choices=("gru", "s5", "s4d"), default="gru")
     parser.add_argument("--gru-hidden-size", type=int, default=512)
     parser.add_argument("--gru-num-layers", type=int, default=5)
     parser.add_argument("--gru-dropout", type=float, default=0.4)
@@ -651,6 +669,12 @@ def _parse_args() -> WillettReconstructionConfig:
     parser.add_argument("--s5-dropout", type=float, default=0.2)
     parser.add_argument("--s5-direction", choices=("causal", "bidirectional"), default="causal")
     parser.add_argument("--s5-ffn-multiplier", type=float, default=2.0)
+    parser.add_argument("--s4d-hidden-size", type=int, default=512)
+    parser.add_argument("--s4d-state-size", type=int, default=128)
+    parser.add_argument("--s4d-num-layers", type=int, default=5)
+    parser.add_argument("--s4d-dropout", type=float, default=0.2)
+    parser.add_argument("--s4d-direction", choices=("causal", "bidirectional"), default="causal")
+    parser.add_argument("--s4d-ffn-multiplier", type=float, default=2.0)
     parser.add_argument("--patch-size", type=int, default=14)
     parser.add_argument("--patch-stride", type=int, default=4)
     parser.add_argument("--input-smoothing-sigma-bins", type=float, default=2.0)
@@ -694,6 +718,12 @@ def _parse_args() -> WillettReconstructionConfig:
         s5_dropout=float(args.s5_dropout),
         s5_direction=str(args.s5_direction),
         s5_ffn_multiplier=float(args.s5_ffn_multiplier),
+        s4d_hidden_size=int(args.s4d_hidden_size),
+        s4d_state_size=int(args.s4d_state_size),
+        s4d_num_layers=int(args.s4d_num_layers),
+        s4d_dropout=float(args.s4d_dropout),
+        s4d_direction=str(args.s4d_direction),
+        s4d_ffn_multiplier=float(args.s4d_ffn_multiplier),
         patch_size=int(args.patch_size),
         patch_stride=int(args.patch_stride),
         session_adapter_enabled=not bool(args.disable_session_adapter),
