@@ -276,6 +276,35 @@ Observed outcome for this baseline:
 - decoder backbone was `S5` with `init_source='random'` (no Stage-1 pretraining transfer)
 - the run did not meaningfully learn decoding by about step `8900`
 
+### 2026-06-02 Supervised Willett-Style S5 Baseline
+
+A separate supervised baseline was run in `analysis/active/ssl_experiments/s8_willett_s5_reconstruction.ipynb`.
+This keeps the Willett-style supervised CTC pipeline and swaps only the recurrent sequence backbone from GRU to causal `S5`:
+
+- raw `cache_v1`
+- train-split global stats
+- online Gaussian smoothing
+- Willett-style session input adapter
+- temporal patching before the sequence model (`patch_size=14`, `patch_stride=4`)
+- causal `S5`, hidden size `512`, state size `128`, `5` layers, dropout `0.2`
+- optimizer preset: `s5_safe`
+- run: `willett_s5_tx_only_causal_20260602T211412Z`
+
+Observed outcome:
+
+- final validation PER: `0.337`
+- best observed validation PER: `0.336` near step `11200`
+- final validation CTC: `2.197` bits/phoneme
+- prediction/reference token ratio: `0.922`
+- blank frame rate: `0.383`
+
+Interpretation:
+
+- `S5` can learn Brain2Text24 CTC decoding well in the supervised Willett-style setup
+- the poor POSSM Stage-2 `S5` results are therefore unlikely to mean that `S5` is intrinsically unable to decode this dataset
+- the more likely issue is the POSSM-to-S5 temporal interface or fine-tuning recipe: POSSM Stage-2 feeds one encoded `20 ms` frame at a time into `S5`, while the supervised Willett-style baseline gives `S5` local temporal patches before the sequence model
+- the next targeted diagnostic is to keep the POSSM encoder/pretraining path but add Willett-style temporal patching over POSSM encoder outputs before the Stage-2 `S5` decoder
+
 ## Current Interpretation
 
 The reconstruction-pretrained POSSM initialization appears to help CTC fine-tuning materially:
@@ -312,4 +341,8 @@ Stage 2 has therefore been moved toward the cleaner Willett-style option: load t
   - reducing the post-GRU conv stride was not automatically helpful
   - future stride changes should be treated as controlled ablations, not assumed improvements
   - compare PER together with prediction / target length, deletion rate, and insertion rate
+- POSSM/S5 temporal interface:
+  - supervised Willett-style `S5` can decode strongly when given temporal patches before the sequence model
+  - test POSSM Stage-2 `S5` with temporal patching over POSSM encoder outputs before the `S5` decoder
+  - if this improves materially, the main issue is likely the framewise POSSM-to-S5 interface rather than S5 capacity or dataset incompatibility
 - rerun pretrained and random-init baselines under the same stage-2 settings whenever changing major decoder hyperparameters

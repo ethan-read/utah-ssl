@@ -33,7 +33,9 @@ from possm_ssl.model import (
     POSSMReconstructionModel,
     SessionInputAdapterBank,
     causal_conv_output_lengths,
+    patch_temporal_sequence,
     register_temporal_backbone,
+    temporal_patch_output_lengths,
 )
 from possm_ssl.phoneme_finetune import (
     POSSMFinetuneConfig,
@@ -1157,6 +1159,55 @@ class POSSMSSLTests(unittest.TestCase):
             self.assertEqual(tuple(outputs["logits"].shape), (2, 4, 3))
             self.assertTrue(torch.equal(outputs["token_lengths"], torch.tensor([4, 3])))
 
+    def test_temporal_patch_output_lengths_match_willett_rule(self) -> None:
+        lengths = torch.tensor([0, 1, 3, 4, 5, 8, 9], dtype=torch.long)
+        actual = temporal_patch_output_lengths(lengths, patch_size=4, patch_stride=2)
+        expected = torch.tensor([0, 1, 1, 1, 1, 3, 3], dtype=torch.long)
+        self.assertTrue(torch.equal(actual, expected))
+
+    def test_patch_temporal_sequence_pads_short_final_windows(self) -> None:
+        hidden = torch.arange(1 * 5 * 2, dtype=torch.float32).reshape(1, 5, 2)
+        patched, token_lengths = patch_temporal_sequence(
+            hidden,
+            torch.tensor([3], dtype=torch.long),
+            patch_size=4,
+            patch_stride=2,
+        )
+        self.assertTrue(torch.equal(token_lengths, torch.tensor([1])))
+        self.assertEqual(tuple(patched.shape), (1, 1, 8))
+        expected = torch.cat([hidden[0, :3], torch.zeros(1, 2)], dim=0).reshape(-1)
+        self.assertTrue(torch.equal(patched[0, 0], expected))
+
+    def test_possm_phoneme_model_pre_decoder_patch_s5_shapes_and_lengths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_encoder = recover_possm_stage1_encoder(
+                checkpoint_path=_make_stage1_checkpoint(Path(tmpdir)),
+            )[0]
+            model = POSSMPhonemeModel(
+                base_encoder=base_encoder,
+                vocab_size=3,
+                decoder_backbone_type="s5",
+                s5_hidden_size=8,
+                s5_state_size=4,
+                s5_num_layers=1,
+                s5_dropout=0.0,
+                s5_direction="causal",
+                emission_mode="pre_decoder_patch",
+                pre_decoder_patch_size=3,
+                pre_decoder_patch_stride=2,
+            )
+            x = torch.randn(2, 8, 5)
+            lengths = torch.tensor([8, 5], dtype=torch.long)
+            outputs = model(x, lengths, session_ids=["a", "b"])
+            self.assertEqual(int(model.s5_sequence_decoder.input_size), base_encoder.hidden_size * 3)
+            self.assertEqual(tuple(outputs["sequence_hidden"].shape), (2, 8, base_encoder.hidden_size))
+            self.assertEqual(tuple(outputs["decoder_input"].shape), (2, 3, base_encoder.hidden_size * 3))
+            self.assertTrue(torch.equal(outputs["decoder_input_lengths"], torch.tensor([3, 2])))
+            self.assertEqual(tuple(outputs["decoder_hidden"].shape), (2, 3, 8))
+            self.assertEqual(tuple(outputs["conv_hidden"].shape), (2, 3, 8))
+            self.assertEqual(tuple(outputs["logits"].shape), (2, 3, 3))
+            self.assertTrue(torch.equal(outputs["token_lengths"], torch.tensor([3, 2])))
+
     def test_possm_phoneme_model_bidirectional_s5_decoder_shapes(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             base_encoder = recover_possm_stage1_encoder(
@@ -1296,6 +1347,35 @@ class POSSMSSLTests(unittest.TestCase):
             }
             decoder_param_ids = {id(param) for param in model.sequence_decoder.parameters()}
             self.assertTrue(decoder_param_ids)
+            self.assertTrue(decoder_param_ids.issubset(module_param_ids))
+
+    def test_stage2_decoder_train_modules_include_pre_patch_classifier(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_encoder = recover_possm_stage1_encoder(
+                checkpoint_path=_make_stage1_checkpoint(Path(tmpdir)),
+            )[0]
+            model = POSSMPhonemeModel(
+                base_encoder=base_encoder,
+                vocab_size=3,
+                decoder_backbone_type="s5",
+                s5_hidden_size=8,
+                s5_state_size=4,
+                s5_num_layers=1,
+                s5_dropout=0.0,
+                emission_mode="pre_decoder_patch",
+                pre_decoder_patch_size=3,
+                pre_decoder_patch_stride=2,
+                session_adapter_enabled=True,
+            )
+            modules = _stage2_decoder_train_modules(model, session_adapter_enabled=True)
+            module_param_ids = {
+                id(param)
+                for module in modules
+                for param in module.parameters()
+            }
+            classifier_param_ids = {id(param) for param in model.classifier.parameters()}
+            decoder_param_ids = {id(param) for param in model.sequence_decoder.parameters()}
+            self.assertTrue(classifier_param_ids.issubset(module_param_ids))
             self.assertTrue(decoder_param_ids.issubset(module_param_ids))
 
     def test_run_possm_phoneme_finetuning_writes_checkpoints(self) -> None:

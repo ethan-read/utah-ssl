@@ -77,6 +77,9 @@ class POSSMFinetuneConfig:
     s5_dropout: float = 0.2
     s5_direction: str = "causal"
     s5_ffn_multiplier: float = 2.0
+    emission_mode: str = "post_decoder_conv"
+    pre_decoder_patch_size: int = 14
+    pre_decoder_patch_stride: int = 4
     # Backward-compatible aliases for old notebooks/checkpoints that briefly used
     # Willett-style pre-GRU temporal patching names for the POSSM output conv.
     temporal_patch_kernel_size: int | None = None
@@ -147,6 +150,10 @@ class POSSMFinetuneConfig:
             raise ValueError("input augmentation standard deviations must be non-negative")
         if self.decoder_backbone_type not in {"gru", "s5"}:
             raise ValueError("decoder_backbone_type must be one of {'gru', 's5'}")
+        if self.emission_mode not in {"post_decoder_conv", "pre_decoder_patch"}:
+            raise ValueError("emission_mode must be one of {'post_decoder_conv', 'pre_decoder_patch'}")
+        if int(self.pre_decoder_patch_size) <= 0 or int(self.pre_decoder_patch_stride) <= 0:
+            raise ValueError("pre-decoder patch size and stride must be positive")
         if int(self.gru_hidden_size) <= 0 or int(self.gru_num_layers) <= 0:
             raise ValueError("GRU sizes must be positive")
         if not (0.0 <= float(self.gru_dropout) < 1.0):
@@ -804,6 +811,9 @@ def recover_possm_stage2_summary(
         "s5_dropout": config.get("s5_dropout"),
         "s5_direction": config.get("s5_direction"),
         "s5_ffn_multiplier": config.get("s5_ffn_multiplier"),
+        "emission_mode": config.get("emission_mode", "post_decoder_conv"),
+        "pre_decoder_patch_size": config.get("pre_decoder_patch_size"),
+        "pre_decoder_patch_stride": config.get("pre_decoder_patch_stride"),
     }
 
 
@@ -1006,6 +1016,9 @@ def run_possm_phoneme_finetuning(
         s5_dropout=float(effective_config.s5_dropout),
         s5_direction=str(effective_config.s5_direction),
         s5_ffn_multiplier=float(effective_config.s5_ffn_multiplier),
+        emission_mode=str(effective_config.emission_mode),
+        pre_decoder_patch_size=int(effective_config.pre_decoder_patch_size),
+        pre_decoder_patch_stride=int(effective_config.pre_decoder_patch_stride),
         conv_hidden_size=effective_config.conv_hidden_size,
         conv_kernel_size=int(effective_config.conv_kernel_size),
         conv_stride=int(effective_config.conv_stride),
@@ -1433,6 +1446,9 @@ def run_possm_phoneme_finetuning(
         "session_adapter_enabled": bool(effective_config.session_adapter_enabled),
         "session_adapter_keys": list(session_adapter_keys),
         "decoder_backbone_type": str(effective_config.decoder_backbone_type),
+        "emission_mode": str(effective_config.emission_mode),
+        "pre_decoder_patch_size": int(effective_config.pre_decoder_patch_size),
+        "pre_decoder_patch_stride": int(effective_config.pre_decoder_patch_stride),
         "s5_hidden_size": int(effective_config.s5_hidden_size),
         "s5_state_size": int(effective_config.s5_state_size),
         "s5_num_layers": int(effective_config.s5_num_layers),

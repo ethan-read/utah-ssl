@@ -551,6 +551,61 @@ def causal_conv_output_lengths(lengths: torch.Tensor, stride: int) -> torch.Tens
     return torch.where(positive, output, torch.zeros_like(output))
 
 
+def temporal_patch_output_lengths(
+    lengths: torch.Tensor,
+    *,
+    patch_size: int,
+    patch_stride: int,
+) -> torch.Tensor:
+    patch_size = int(patch_size)
+    patch_stride = int(patch_stride)
+    if patch_size <= 0 or patch_stride <= 0:
+        raise ValueError("patch_size and patch_stride must be positive")
+    lengths = lengths.to(dtype=torch.long)
+    positive = lengths > 0
+    longer_than_patch = lengths > patch_size
+    patched = 1 + torch.div(lengths - patch_size, patch_stride, rounding_mode="floor")
+    one = torch.ones_like(lengths)
+    return torch.where(positive, torch.where(longer_than_patch, patched, one), torch.zeros_like(lengths))
+
+
+def patch_temporal_sequence(
+    hidden: torch.Tensor,
+    input_lengths: torch.Tensor,
+    *,
+    patch_size: int,
+    patch_stride: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if hidden.ndim != 3:
+        raise ValueError(f"Expected hidden to have shape [B, T, H], got {tuple(hidden.shape)}")
+    patch_size = int(patch_size)
+    patch_stride = int(patch_stride)
+    token_lengths = temporal_patch_output_lengths(
+        input_lengths,
+        patch_size=patch_size,
+        patch_stride=patch_stride,
+    )
+    max_tokens = int(token_lengths.max().item()) if int(token_lengths.numel()) else 0
+    patch_dim = int(hidden.shape[-1]) * patch_size
+    patched = hidden.new_zeros((int(hidden.shape[0]), max_tokens, patch_dim))
+    for batch_idx, length_tensor in enumerate(input_lengths.tolist()):
+        length = int(length_tensor)
+        total_patches = int(token_lengths[batch_idx].item())
+        if total_patches <= 0:
+            continue
+        valid = hidden[batch_idx, :length]
+        patches: list[torch.Tensor] = []
+        for patch_idx in range(total_patches):
+            start = patch_idx * patch_stride
+            patch = valid[start : start + patch_size]
+            if int(patch.shape[0]) < patch_size:
+                pad = valid.new_zeros((patch_size - int(patch.shape[0]), int(hidden.shape[-1])))
+                patch = torch.cat([patch, pad], dim=0)
+            patches.append(patch.reshape(-1))
+        patched[batch_idx, :total_patches] = torch.stack(patches, dim=0)
+    return patched, token_lengths
+
+
 class SessionFeatureAffine(nn.Module):
     """Per-session per-feature affine initialized as an exact identity map."""
 
@@ -645,6 +700,9 @@ class POSSMPhonemeModel(nn.Module):
         s5_dropout: float = 0.2,
         s5_direction: str = "causal",
         s5_ffn_multiplier: float = 2.0,
+        emission_mode: str = "post_decoder_conv",
+        pre_decoder_patch_size: int = 14,
+        pre_decoder_patch_stride: int = 4,
         temporal_patch_kernel_size: int | None = None,
         temporal_patch_stride: int | None = None,
         conv_hidden_size: int | None = None,
@@ -663,6 +721,13 @@ class POSSMPhonemeModel(nn.Module):
         self.decoder_backbone_type = str(decoder_backbone_type)
         if self.decoder_backbone_type not in {"gru", "s5"}:
             raise ValueError("decoder_backbone_type must be one of {'gru', 's5'}")
+        self.emission_mode = str(emission_mode)
+        if self.emission_mode not in {"post_decoder_conv", "pre_decoder_patch"}:
+            raise ValueError("emission_mode must be one of {'post_decoder_conv', 'pre_decoder_patch'}")
+        self.pre_decoder_patch_size = int(pre_decoder_patch_size)
+        self.pre_decoder_patch_stride = int(pre_decoder_patch_stride)
+        if self.pre_decoder_patch_size <= 0 or self.pre_decoder_patch_stride <= 0:
+            raise ValueError("pre-decoder patch size and stride must be positive")
         self.s5_hidden_size = int(s5_hidden_size)
         self.s5_state_size = int(s5_state_size)
         self.s5_num_layers = int(s5_num_layers)
@@ -694,8 +759,11 @@ class POSSMPhonemeModel(nn.Module):
             else int(base_encoder.hidden_size)
         )
         self.sequence_input_size = int(encoder_output_size)
+        decoder_input_size = self.sequence_input_size
+        if self.emission_mode == "pre_decoder_patch":
+            decoder_input_size = self.sequence_input_size * self.pre_decoder_patch_size
         if self.decoder_backbone_type == "gru":
-            self.gru_input_size = self.sequence_input_size
+            self.gru_input_size = decoder_input_size
             effective_gru_dropout = float(gru_dropout) if int(gru_num_layers) > 1 else 0.0
             self.gru = nn.GRU(
                 input_size=self.gru_input_size,
@@ -708,10 +776,10 @@ class POSSMPhonemeModel(nn.Module):
             decoder_output_size = self.gru_hidden_size
             self.s5_sequence_decoder: S5Stage2SequenceDecoder | None = None
         else:
-            self.gru_input_size = self.sequence_input_size
+            self.gru_input_size = decoder_input_size
             self.gru = None
             self.s5_sequence_decoder = S5Stage2SequenceDecoder(
-                input_size=self.sequence_input_size,
+                input_size=decoder_input_size,
                 hidden_size=self.s5_hidden_size,
                 state_size=self.s5_state_size,
                 num_layers=self.s5_num_layers,
@@ -724,15 +792,23 @@ class POSSMPhonemeModel(nn.Module):
         self.conv_hidden_size = (
             int(conv_hidden_size) if conv_hidden_size is not None else self.decoder_output_size
         )
-        self.conv = nn.Conv1d(
-            in_channels=self.decoder_output_size,
-            out_channels=self.conv_hidden_size,
-            kernel_size=self.conv_kernel_size,
-            stride=self.conv_stride,
-        )
-        self.conv_activation = nn.GELU()
-        self.conv_dropout = nn.Dropout(self.conv_dropout_rate)
-        self.classifier = nn.Linear(self.conv_hidden_size, self.vocab_size)
+        if self.emission_mode == "post_decoder_conv":
+            self.conv = nn.Conv1d(
+                in_channels=self.decoder_output_size,
+                out_channels=self.conv_hidden_size,
+                kernel_size=self.conv_kernel_size,
+                stride=self.conv_stride,
+            )
+            self.conv_activation = nn.GELU()
+            self.conv_dropout = nn.Dropout(self.conv_dropout_rate)
+            classifier_input_size = self.conv_hidden_size
+        else:
+            self.conv = nn.Identity()
+            self.conv_activation = nn.Identity()
+            self.conv_dropout = nn.Identity()
+            self.conv_hidden_size = self.decoder_output_size
+            classifier_input_size = self.decoder_output_size
+        self.classifier = nn.Linear(classifier_input_size, self.vocab_size)
 
     @property
     def input_dim(self) -> int:
@@ -792,20 +868,36 @@ class POSSMPhonemeModel(nn.Module):
                 encoder_hidden,
                 encoder_outputs.token_lengths,
             )
-        decoder_hidden = self._decode_sequence(encoder_hidden, encoder_outputs.token_lengths)
+        decoder_input = encoder_hidden
+        decoder_input_lengths = encoder_outputs.token_lengths
+        if self.emission_mode == "pre_decoder_patch":
+            decoder_input, decoder_input_lengths = patch_temporal_sequence(
+                encoder_hidden,
+                encoder_outputs.token_lengths,
+                patch_size=self.pre_decoder_patch_size,
+                patch_stride=self.pre_decoder_patch_stride,
+            )
+        decoder_hidden = self._decode_sequence(decoder_input, decoder_input_lengths)
 
-        conv_input = decoder_hidden.transpose(1, 2)
-        conv_input = F.pad(conv_input, (self.conv_kernel_size - 1, 0))
-        conv_hidden = self.conv(conv_input)
-        conv_hidden = self.conv_activation(conv_hidden)
-        conv_hidden = self.conv_dropout(conv_hidden)
-        conv_hidden = conv_hidden.transpose(1, 2)
-        output_lengths = causal_conv_output_lengths(encoder_outputs.token_lengths, self.conv_stride)
-        logits = self.classifier(conv_hidden)
+        if self.emission_mode == "post_decoder_conv":
+            conv_input = decoder_hidden.transpose(1, 2)
+            conv_input = F.pad(conv_input, (self.conv_kernel_size - 1, 0))
+            conv_hidden = self.conv(conv_input)
+            conv_hidden = self.conv_activation(conv_hidden)
+            conv_hidden = self.conv_dropout(conv_hidden)
+            conv_hidden = conv_hidden.transpose(1, 2)
+            output_lengths = causal_conv_output_lengths(decoder_input_lengths, self.conv_stride)
+            logits = self.classifier(conv_hidden)
+        else:
+            conv_hidden = decoder_hidden
+            output_lengths = decoder_input_lengths
+            logits = self.classifier(decoder_hidden)
         return {
             "adapted_input": adapted_input,
             "encoder_hidden": encoder_outputs.hidden,
             "sequence_hidden": encoder_hidden,
+            "decoder_input": decoder_input,
+            "decoder_input_lengths": decoder_input_lengths,
             "encoder_lengths": encoder_outputs.token_lengths,
             "decoder_hidden": decoder_hidden,
             "gru_hidden": decoder_hidden,

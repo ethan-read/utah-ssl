@@ -2,6 +2,9 @@
 
 Subset repository for the Utah-array SSL / transfer benchmark work.
 
+For the current interpretation of experiment results, start with
+[`docs/notes/experiment_synthesis.md`](docs/notes/experiment_synthesis.md).
+
 ## Included
 
 - `analysis/active/transfer_benchmark/ssl_autoresearch`
@@ -10,6 +13,8 @@ Subset repository for the Utah-array SSL / transfer benchmark work.
   - held-out-session phoneme probe benchmark
 - `analysis/active/transfer_benchmark/ssl_autoresearch_local`
   - small local smoke-test harness
+- `docs/notes/experiment_synthesis.md`
+  - current canonical synthesis of experiment results and active conclusions
 - `docs/notes/ssl_architecture_choices.md`
   - current architecture decision log
 - `analysis/active/ssl_experiments/possm_ssl`
