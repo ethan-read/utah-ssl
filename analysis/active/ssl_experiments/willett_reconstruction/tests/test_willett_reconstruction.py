@@ -44,6 +44,7 @@ def _write_tiny_competition_probe_cache(cache_root: Path) -> None:
         ("train-0", "competition_train", "t12.2022.08.10", np.array([[1, 2, 3], [2, 3, 4], [3, 4, 5], [4, 5, 6]], dtype=np.float32), [1, 2]),
         ("train-1", "competition_train", "t12.2022.08.10", np.array([[6, 5, 4], [5, 4, 3], [4, 3, 2], [3, 2, 1]], dtype=np.float32), [2, 1]),
         ("train-2", "competition_train", "t12.2022.08.11", np.array([[1, 1, 2], [2, 2, 3], [3, 3, 4], [4, 4, 5]], dtype=np.float32), [1, 1]),
+        ("train-3", "competition_train", "t12.2022.08.11", np.array([[5, 4, 3], [4, 3, 2], [3, 2, 1], [2, 1, 0]], dtype=np.float32), [2, 2]),
         ("test-0", "competition_test", "t12.2022.08.10", np.array([[1, 0, 1], [2, 0, 2], [3, 0, 3], [4, 0, 4]], dtype=np.float32), [1, 2]),
         ("test-1", "competition_test", "t12.2022.08.11", np.array([[0, 1, 1], [0, 2, 2], [0, 3, 3], [0, 4, 4]], dtype=np.float32), [2, 2]),
     ]
@@ -108,8 +109,30 @@ class WillettReconstructionTest(unittest.TestCase):
         )
         self.assertEqual(problem["train_split_name"], "competition_train")
         self.assertEqual(problem["val_split_name"], "competition_test")
-        self.assertEqual(len(problem["train_rows"]), 3)
+        self.assertEqual(len(problem["train_rows"]), 4)
         self.assertEqual(len(problem["val_rows"]), 2)
+
+    def test_build_problem_can_use_competition_train_kfold(self) -> None:
+        cache_root = Path(self._tmp_dir())
+        _write_tiny_competition_probe_cache(cache_root)
+        problem = build_willett_problem(
+            cache_root=cache_root,
+            dataset="brain2text24",
+            feature_mode="tx_only",
+            boundary_key_mode="session",
+            split_policy="competition_train_kfold",
+            cv_num_folds=2,
+            cv_fold_index=1,
+        )
+        self.assertEqual(problem["split_policy"], "competition_train_kfold")
+        self.assertEqual(problem["train_split_name"], "competition_train_cv2_fold1_train")
+        self.assertEqual(problem["val_split_name"], "competition_train_cv2_fold1_val")
+        self.assertEqual(len(problem["train_rows"]), 2)
+        self.assertEqual(len(problem["val_rows"]), 2)
+        self.assertTrue(all(row.source_split == "competition_train" for row in problem["train_rows"]))
+        self.assertTrue(all(row.source_split == "competition_train" for row in problem["val_rows"]))
+        self.assertEqual(set(problem["train_session_ids"]), {"t12.2022.08.10", "t12.2022.08.11"})
+        self.assertEqual(set(problem["val_session_ids"]), {"t12.2022.08.10", "t12.2022.08.11"})
 
     def test_adapter_keys_follow_boundary_key_mode(self) -> None:
         cache_root = Path(self._tmp_dir())
@@ -143,7 +166,7 @@ class WillettReconstructionTest(unittest.TestCase):
         )
         self.assertEqual(sorted(grouped), ["brain2text24:t12.2022.08.10", "brain2text24:t12.2022.08.11"])
         self.assertEqual(len(grouped["brain2text24:t12.2022.08.10"]), 2)
-        self.assertEqual(len(grouped["brain2text24:t12.2022.08.11"]), 1)
+        self.assertEqual(len(grouped["brain2text24:t12.2022.08.11"]), 2)
 
     def test_prepare_inputs_preserves_shape(self) -> None:
         x = torch.arange(24, dtype=torch.float32).view(2, 4, 3)
@@ -428,6 +451,46 @@ class WillettReconstructionTest(unittest.TestCase):
         self.assertEqual(summary["config"]["decoder_backbone_type"], "s5")
         checkpoint_payload = torch.load(run_dir / "checkpoint_final.pt", map_location="cpu", weights_only=False)
         self.assertFalse(any(name.startswith("gru.") for name in checkpoint_payload["model_state"]))
+
+    def test_short_cv_training_run_computes_fold_stats(self) -> None:
+        cache_root = Path(self._tmp_dir())
+        _write_tiny_competition_probe_cache(cache_root)
+        output_root = Path(self._tmp_dir())
+        config = WillettReconstructionConfig(
+            cache_root=cache_root,
+            output_root=output_root,
+            run_name="tiny_cv_run",
+            split_policy="competition_train_kfold",
+            cv_num_folds=2,
+            cv_fold_index=0,
+            max_steps=1,
+            batch_size=2,
+            learning_rate=1e-3,
+            min_learning_rate=1e-4,
+            warmup_steps=0,
+            adam_epsilon=1e-1,
+            val_every_steps=1,
+            checkpoint_every_steps=1,
+            progress_every_steps=1,
+            input_smoothing_sigma_bins=0.0,
+            white_noise_sd=0.0,
+            constant_offset_sd=0.0,
+            patch_size=2,
+            patch_stride=1,
+            input_projection_size=8,
+            gru_hidden_size=16,
+            gru_num_layers=1,
+            gru_dropout=0.0,
+        )
+        summary = run_willett_reconstruction(config)
+        run_dir = output_root / "tiny_cv_run"
+        self.assertTrue((run_dir / "summary.json").exists())
+        self.assertEqual(summary["split_policy"], "competition_train_kfold")
+        self.assertEqual(summary["cv_num_folds"], 2)
+        self.assertEqual(summary["cv_fold_index"], 0)
+        self.assertEqual(summary["precomputed_split_stats_path"], None)
+        self.assertEqual(summary["train_examples"], 2)
+        self.assertEqual(summary["val_examples"], 2)
 
     def test_short_s4d_training_run_writes_outputs(self) -> None:
         cache_root = Path(self._tmp_dir())

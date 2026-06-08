@@ -17,15 +17,24 @@ if str(S5_DIR) not in sys.path:
 from s4d import BidirectionalS4DSequenceBackbone, S4DSequenceBackbone
 from s5 import BidirectionalS5SequenceBackbone, S5SequenceBackbone
 
+try:
+    from ssl_core.patching import patch_batch as _core_patch_batch
+    from ssl_core.patching import patched_length as _core_patched_length
+except ModuleNotFoundError:  # pragma: no cover - repo-root unittest fallback
+    from analysis.active.ssl_experiments.ssl_core.patching import patch_batch as _core_patch_batch
+    from analysis.active.ssl_experiments.ssl_core.patching import (
+        patched_length as _core_patched_length,
+    )
+
 
 def patched_length(length: int, *, patch_size: int, patch_stride: int) -> int:
     """Return the number of pre-GRU temporal patches for one example."""
-    resolved_length = int(length)
-    if resolved_length <= 0:
-        return 0
-    if resolved_length <= int(patch_size):
-        return 1
-    return 1 + ((resolved_length - int(patch_size)) // int(patch_stride))
+    return _core_patched_length(
+        int(length),
+        patch_size=int(patch_size),
+        patch_stride=int(patch_stride),
+        policy="floor",
+    )
 
 
 class SessionInputNetwork(nn.Module):
@@ -264,42 +273,18 @@ class WillettPhonemeModel(nn.Module):
         hidden[0] = self.initial_state.to(device=device, dtype=dtype).expand(int(batch_size), -1)
         return hidden
 
-    def _patch_one(self, sample: torch.Tensor, length: int) -> torch.Tensor:
-        valid = sample[:length]
-        total_patches = patched_length(
-            length,
-            patch_size=self.patch_size,
-            patch_stride=self.patch_stride,
-        )
-        if total_patches <= 0:
-            return sample.new_zeros((0, self.adapter_output_dim * self.patch_size))
-        patches: list[torch.Tensor] = []
-        for patch_idx in range(total_patches):
-            start = patch_idx * self.patch_stride
-            patch = valid[start : start + self.patch_size]
-            if int(patch.shape[0]) < self.patch_size:
-                pad = valid.new_zeros((self.patch_size - int(patch.shape[0]), self.adapter_output_dim))
-                patch = torch.cat([patch, pad], dim=0)
-            patches.append(patch.reshape(-1))
-        return torch.stack(patches, dim=0)
-
     def _patch_batch(
         self,
         x: torch.Tensor,
         input_lengths: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        token_sequences: list[torch.Tensor] = []
-        token_lengths: list[int] = []
-        for sample, length_tensor in zip(x, input_lengths):
-            tokens = self._patch_one(sample, int(length_tensor.item()))
-            token_sequences.append(tokens)
-            token_lengths.append(int(tokens.shape[0]))
-        max_tokens = max(token_lengths, default=0)
-        patched = x.new_zeros((int(x.shape[0]), max_tokens, self.adapter_output_dim * self.patch_size))
-        for batch_idx, tokens in enumerate(token_sequences):
-            if int(tokens.shape[0]) > 0:
-                patched[batch_idx, : int(tokens.shape[0])] = tokens
-        return patched, torch.as_tensor(token_lengths, device=input_lengths.device, dtype=torch.long)
+        return _core_patch_batch(
+            x,
+            input_lengths,
+            patch_size=self.patch_size,
+            patch_stride=self.patch_stride,
+            policy="floor",
+        )
 
     def forward(
         self,

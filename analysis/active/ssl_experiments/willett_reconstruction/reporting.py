@@ -13,9 +13,9 @@ import torch
 from torch.utils.data import DataLoader
 
 try:
-    from masked_ssl.probe import compute_ctc_loss_sum
+    from ssl_core.ctc import compute_ctc_loss_sum
 except ModuleNotFoundError:  # pragma: no cover - repo-root unittest fallback
-    from analysis.active.ssl_experiments.masked_ssl.probe import compute_ctc_loss_sum
+    from analysis.active.ssl_experiments.ssl_core.ctc import compute_ctc_loss_sum
 
 from .data import WillettInputTransformConfig, prepare_willett_inputs
 

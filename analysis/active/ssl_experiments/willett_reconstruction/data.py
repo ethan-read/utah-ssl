@@ -10,27 +10,31 @@ import numpy as np
 import torch
 
 try:
-    from masked_ssl.cache import (
+    from ssl_core.cache import (
         resolve_boundary_key,
     )
-    from masked_ssl.probe import (
+    from ssl_core.ctc import (
         CanonicalSequenceDataset,
         LengthAwareBatchSampler,
         build_competition_split_problem,
         canonical_rows_padded_time_percentile,
         collate_sequence_batch,
+    )
+    from ssl_core.stats import (
         compute_feature_stats,
     )
 except ModuleNotFoundError:  # pragma: no cover - repo-root unittest fallback
-    from analysis.active.ssl_experiments.masked_ssl.cache import (
+    from analysis.active.ssl_experiments.ssl_core.cache import (
         resolve_boundary_key,
     )
-    from analysis.active.ssl_experiments.masked_ssl.probe import (
+    from analysis.active.ssl_experiments.ssl_core.ctc import (
         CanonicalSequenceDataset,
         LengthAwareBatchSampler,
         build_competition_split_problem,
         canonical_rows_padded_time_percentile,
         collate_sequence_batch,
+    )
+    from analysis.active.ssl_experiments.ssl_core.stats import (
         compute_feature_stats,
     )
 
@@ -206,13 +210,91 @@ def build_willett_problem(
     dataset: str,
     feature_mode: str,
     boundary_key_mode: str,
+    split_policy: str = "competition_train_test",
+    cv_num_folds: int = 5,
+    cv_fold_index: int = 0,
 ) -> dict[str, Any]:
-    return build_competition_split_problem(
+    problem = build_competition_split_problem(
         cache_root=Path(cache_root),
         dataset=str(dataset),
         feature_mode=str(feature_mode),
         boundary_key_mode=str(boundary_key_mode),
     )
+    if str(split_policy) == "competition_train_test":
+        return problem
+    if str(split_policy) != "competition_train_kfold":
+        raise ValueError("split_policy must be one of {'competition_train_test', 'competition_train_kfold'}")
+
+    num_folds = int(cv_num_folds)
+    fold_index = int(cv_fold_index)
+    if num_folds < 2:
+        raise ValueError("cv_num_folds must be at least 2")
+    if fold_index < 0 or fold_index >= num_folds:
+        raise ValueError("cv_fold_index must satisfy 0 <= cv_fold_index < cv_num_folds")
+
+    rows_by_session: dict[str, list[Any]] = {}
+    for row in problem["train_rows"]:
+        rows_by_session.setdefault(str(row.session_id), []).append(row)
+
+    train_candidates: list[Any] = []
+    val_candidates: list[Any] = []
+    for session_id in sorted(rows_by_session):
+        session_rows = sorted(
+            rows_by_session[session_id],
+            key=lambda row: (
+                int(getattr(row, "block_num", -1) or -1),
+                str(getattr(row, "example_id", "")),
+                int(getattr(row, "example_index", -1)),
+            ),
+        )
+        if len(session_rows) < num_folds:
+            raise ValueError(
+                f"Session {session_id!r} has only {len(session_rows)} train rows, "
+                f"which is fewer than cv_num_folds={num_folds}."
+            )
+        for row_index, row in enumerate(session_rows):
+            if row_index % num_folds == fold_index:
+                val_candidates.append(row)
+            else:
+                train_candidates.append(row)
+
+    train_rows, train_examples_by_session, train_session_ids = _group_willett_rows_by_session(train_candidates)
+    val_rows, val_examples_by_session, val_session_ids = _group_willett_rows_by_session(val_candidates)
+    if not train_rows or not val_rows:
+        raise ValueError(
+            "Cross-validation split produced an empty train or validation set. "
+            f"cv_num_folds={num_folds}, cv_fold_index={fold_index}"
+        )
+
+    updated = dict(problem)
+    updated.update(
+        {
+            "split_policy": "competition_train_kfold",
+            "train_split_name": f"competition_train_cv{num_folds}_fold{fold_index}_train",
+            "val_split_name": f"competition_train_cv{num_folds}_fold{fold_index}_val",
+            "cv_num_folds": num_folds,
+            "cv_fold_index": fold_index,
+            "train_rows": train_rows,
+            "val_rows": val_rows,
+            "train_examples_by_session": train_examples_by_session,
+            "val_examples_by_session": val_examples_by_session,
+            "train_session_ids": train_session_ids,
+            "val_session_ids": val_session_ids,
+        }
+    )
+    return updated
+
+
+def _group_willett_rows_by_session(
+    rows: list[Any],
+) -> tuple[tuple[Any, ...], dict[str, int], tuple[str, ...]]:
+    grouped: dict[str, list[Any]] = {}
+    for row in rows:
+        grouped.setdefault(str(row.session_id), []).append(row)
+    session_ids = tuple(sorted(grouped))
+    flattened = tuple(row for session_id in session_ids for row in grouped[session_id])
+    counts = {session_id: len(grouped[session_id]) for session_id in session_ids}
+    return flattened, counts, session_ids
 
 
 def compute_willett_normalization_stats(

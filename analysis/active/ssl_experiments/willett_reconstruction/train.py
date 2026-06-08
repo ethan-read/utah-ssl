@@ -17,13 +17,13 @@ import torch
 from torch.utils.data import DataLoader
 
 try:
-    from masked_ssl.probe import CanonicalSequenceDataset, compute_ctc_loss_sum
+    from ssl_core.ctc import CanonicalSequenceDataset, compute_ctc_loss_sum
     from recompute_split_feature_stats import (
         load_precomputed_split_feature_stats,
         resolve_precomputed_split_stats_path,
     )
 except ModuleNotFoundError:  # pragma: no cover - repo-root unittest fallback
-    from analysis.active.ssl_experiments.masked_ssl.probe import (
+    from analysis.active.ssl_experiments.ssl_core.ctc import (
         CanonicalSequenceDataset,
         compute_ctc_loss_sum,
     )
@@ -53,6 +53,9 @@ class WillettReconstructionConfig:
     dataset: str = "brain2text24"
     feature_mode: str = "tx_only"
     boundary_key_mode: str = "session"
+    split_policy: str = "competition_train_test"
+    cv_num_folds: int = 5
+    cv_fold_index: int = 0
     normalization_mode: str = "global"
     batch_size: int = 64
     max_steps: int = 120000
@@ -104,6 +107,12 @@ class WillettReconstructionConfig:
             raise ValueError("feature_mode must be one of {'tx_only', 'tx_sbp'}")
         if self.boundary_key_mode not in {"session", "subject_if_available"}:
             raise ValueError("boundary_key_mode must be one of {'session', 'subject_if_available'}")
+        if self.split_policy not in {"competition_train_test", "competition_train_kfold"}:
+            raise ValueError("split_policy must be one of {'competition_train_test', 'competition_train_kfold'}")
+        if int(self.cv_num_folds) < 2:
+            raise ValueError("cv_num_folds must be at least 2")
+        if int(self.cv_fold_index) < 0 or int(self.cv_fold_index) >= int(self.cv_num_folds):
+            raise ValueError("cv_fold_index must satisfy 0 <= cv_fold_index < cv_num_folds")
         if self.normalization_mode not in {"block", "global", "per_session", "none"}:
             raise ValueError("normalization_mode must be one of {'block', 'global', 'per_session', 'none'}")
         if int(self.batch_size) <= 0 or int(self.max_steps) <= 0:
@@ -272,6 +281,9 @@ def run_willett_reconstruction(config: WillettReconstructionConfig) -> dict[str,
         dataset=str(config.dataset),
         feature_mode=str(config.feature_mode),
         boundary_key_mode=str(config.boundary_key_mode),
+        split_policy=str(config.split_policy),
+        cv_num_folds=int(config.cv_num_folds),
+        cv_fold_index=int(config.cv_fold_index),
     )
     run_dir = _resolve_run_dir(config)
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -285,7 +297,10 @@ def run_willett_reconstruction(config: WillettReconstructionConfig) -> dict[str,
     sample_dim = int(problem["train_rows"][0].n_tx_features if config.feature_mode == "tx_only" else problem["train_rows"][0].n_tx_features + problem["train_rows"][0].n_sbp_features)
     loaded_stats_path = None
     stats_metadata = None
-    if str(config.normalization_mode) == "global":
+    if str(config.normalization_mode) == "global" and (
+        str(config.split_policy) == "competition_train_test"
+        or config.precomputed_split_stats_path is not None
+    ):
         resolved_stats_path = resolve_precomputed_split_stats_path(
             cache_root=Path(config.cache_root),
             dataset=str(config.dataset),
@@ -315,6 +330,11 @@ def run_willett_reconstruction(config: WillettReconstructionConfig) -> dict[str,
             mode=str(config.normalization_mode),
             feature_mode=str(problem["feature_mode"]),
         )
+        if str(config.normalization_mode) == "global":
+            print(
+                "computed Willett global split stats from current train rows: "
+                f"split_policy={problem['split_policy']} train_split={problem['train_split_name']}"
+            )
     val_stats = train_stats
     missing_val_examples = normalization_stats_missing_rows(val_stats, problem["val_rows"])
     if missing_val_examples:
@@ -605,6 +625,9 @@ def run_willett_reconstruction(config: WillettReconstructionConfig) -> dict[str,
         "dataset": str(problem["dataset"]),
         "feature_mode": str(problem["feature_mode"]),
         "boundary_key_mode": str(problem["boundary_key_mode"]),
+        "split_policy": str(problem["split_policy"]),
+        "cv_num_folds": problem.get("cv_num_folds"),
+        "cv_fold_index": problem.get("cv_fold_index"),
         "normalization_mode": str(config.normalization_mode),
         "train_examples": int(len(problem["train_rows"])),
         "val_examples": int(len(problem["val_rows"])),
@@ -644,6 +667,13 @@ def _parse_args() -> WillettReconstructionConfig:
     parser.add_argument("--dataset", type=str, default="brain2text24")
     parser.add_argument("--feature-mode", choices=("tx_only", "tx_sbp"), default="tx_only")
     parser.add_argument("--boundary-key-mode", choices=("session", "subject_if_available"), default="session")
+    parser.add_argument(
+        "--split-policy",
+        choices=("competition_train_test", "competition_train_kfold"),
+        default="competition_train_test",
+    )
+    parser.add_argument("--cv-num-folds", type=int, default=5)
+    parser.add_argument("--cv-fold-index", type=int, default=0)
     parser.add_argument("--normalization-mode", choices=("block", "global", "per_session", "none"), default="global")
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--max-steps", type=int, default=120000)
@@ -693,6 +723,9 @@ def _parse_args() -> WillettReconstructionConfig:
         dataset=str(args.dataset),
         feature_mode=str(args.feature_mode),
         boundary_key_mode=str(args.boundary_key_mode),
+        split_policy=str(args.split_policy),
+        cv_num_folds=int(args.cv_num_folds),
+        cv_fold_index=int(args.cv_fold_index),
         normalization_mode=str(args.normalization_mode),
         batch_size=int(args.batch_size),
         max_steps=int(args.max_steps),
