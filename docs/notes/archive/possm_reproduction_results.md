@@ -305,6 +305,50 @@ Interpretation:
 - the more likely issue is the POSSM-to-S5 temporal interface or fine-tuning recipe: POSSM Stage-2 feeds one encoded `20 ms` frame at a time into `S5`, while the supervised Willett-style baseline gives `S5` local temporal patches before the sequence model
 - the next targeted diagnostic is to keep the POSSM encoder/pretraining path but add Willett-style temporal patching over POSSM encoder outputs before the Stage-2 `S5` decoder
 
+### 2026-06-07 POSSM Stage-2 S5 With Pre-Decoder Patching
+
+A follow-up diagnostic tested the above hypothesis by replacing the post-decoder
+conv emission head with Willett-style `14/4` temporal patching over POSSM encoder
+outputs before a causal Stage-2 `S5` decoder.
+
+Observed outcome:
+
+- validation PER improved early but plateaued around `0.56`
+- validation CTC bottomed around `5k-6k` steps and then rose while train CTC kept falling
+- this was worse than the earlier post-decoder-conv POSSM result around `PER=0.467`
+
+Interpretation: this weakens the idea that POSSM Stage-2 mainly needed
+Willett-style pre-decoder patching. The old dense-20 ms decoder plus post-decoder
+conv head appears to generalize better for this POSSM representation.
+
+### 2026-06-10 RunPod Supervised Willett-Style S5 `tx_sbp`
+
+A longer supervised S5 run was launched on RunPod using the area-6v
+`tx_sbp` feature set and the same Willett-style CTC recipe family:
+
+- run: `willett_s5_tx_sbp_seed7_60k`
+- cache: raw `cache_v1`
+- feature mode: area-6v `tx_sbp` (`128` TX + `128` SBP)
+- split: `competition_train -> competition_test`
+- normalization: train-split global stats
+- smoothing: Willett-style online Gaussian smoothing
+- sequence backbone: causal `S5`
+- steps: `60000`
+
+Observed outcome:
+
+- best observed validation PER: `0.2559` at step `56000`
+- final validation PER: `0.2574`
+- final validation CTC: `2.8886` bits/phoneme
+- elapsed wall time: about `11.6` hours
+
+Interpretation:
+
+- this is the strongest supervised decoder result currently recorded in these notes
+- it materially improves on the earlier supervised `tx_only` S5 baseline (`PER=0.336`)
+- it strengthens the case that plain supervised `S5` is already a very strong decoder when given Willett-style temporal patching and the area-6v `tx_sbp` input
+- it also widens the gap that current SSL / POSSM paths still need to close
+
 ## Current Interpretation
 
 The reconstruction-pretrained POSSM initialization appears to help CTC fine-tuning materially:

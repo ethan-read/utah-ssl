@@ -27,7 +27,8 @@ and S4D backbones:
 | Backbone | Current best visible result | Interpretation |
 |---|---:|---|
 | GRU | latest visible S7 progress log: `PER=0.37485` at step `9400` | Useful reproduction baseline, but the notebook contains mixed historical outputs and the recipe still has known discrepancies. |
-| S5 | best observed `PER=0.33637`, final `PER=0.33732` at `12000` steps | Strongest supervised result in these notes; S5 is not the limiting factor when paired with temporal patching. |
+| S5 (`tx_only`) | best observed `PER=0.33637`, final `PER=0.33732` at `12000` steps | Strong local supervised baseline; already showed that S5 trains well in the Willett-style setup. |
+| S5 (`tx_sbp`) | best observed `PER=0.25591` at step `56000`, final `PER=0.25736` at `60000` steps | Current strongest supervised result in these notes; area-6v `tx_sbp` plus longer training materially improves on the earlier `tx_only` S5 baseline. |
 | S4D | initial 12k run best `PER=0.37526`; 8k sweep baseline best `PER=0.39058` | Trains and decodes, but looks slightly weaker than S5 on the runs so far. |
 
 Important caveat: these are still mostly single-seed comparisons. The S4D
@@ -43,10 +44,29 @@ hyperparameter sweep was small and did not improve on the default S4D recipe:
 Current interpretation:
 
 - `S5` is the strongest supervised SSM result so far.
+- the new area-6v `tx_sbp` RunPod result is the best supervised decoder outcome in the current corpus
+- relative to the earlier `tx_only` S5 baseline, the best observed PER improved by about `0.0805` absolute (`0.3364 -> 0.2559`)
 - `S4D` is viable but not yet competitive with `S5` under the tested settings.
 - The GRU reproduction is still useful as the recipe anchor, but it should be
   interpreted together with [`willett_reconstruction_replication.md`](willett_reconstruction_replication.md)
   because that note tracks remaining recipe discrepancies.
+
+Simple ledger for the new RunPod result:
+
+- run: `willett_s5_tx_sbp_seed7_60k`
+- feature mode: area-6v `tx_sbp` (`128` TX + `128` SBP)
+- split: `competition_train -> competition_test`
+- steps: `60000`
+- best observed validation PER: `0.25591` at step `56000`
+- final validation PER: `0.25736`
+- final validation CTC: `2.88862` bits/phoneme
+- elapsed wall time: about `11.6` hours
+
+Comparison against the earlier supervised ladder:
+
+- versus the prior supervised `tx_only` S5 run, the new `tx_sbp` run is much better on PER (`0.2559` vs `0.3364`)
+- versus the visible GRU reproduction point (`PER=0.3749`) and current S4D runs (`PER=0.375-0.391`), the new `tx_sbp` S5 result is substantially stronger
+- versus the best archived POSSM stage-2 result (`PER` around `0.467`), the supervised `tx_sbp` S5 run remains far ahead
 
 ## Claim 2: POSSM Pretraining Helps, But Does Not Yet Close The Gap
 
