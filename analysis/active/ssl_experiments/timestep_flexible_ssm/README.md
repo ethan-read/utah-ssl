@@ -12,3 +12,8 @@ The first intended comparison is a model trained at `20 ms` and evaluated at:
 
 - `20 ms`
 - `40 ms`
+
+Experiment-specific artifacts live alongside the package:
+
+- notebook: `s10_timestep_flexible_ssm.ipynb`
+- running log: `tests_and_results.md`

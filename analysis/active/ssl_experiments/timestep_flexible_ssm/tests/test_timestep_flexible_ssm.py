@@ -15,7 +15,20 @@ from analysis.active.ssl_experiments.timestep_flexible_ssm.data import (
     rebin_features,
     resolve_patch_bins,
 )
+from analysis.active.ssl_experiments.timestep_flexible_ssm.experiment_utils import (
+    carry_forward_missing_frames,
+    interpolate_missing_frames,
+    irregular_observation_view,
+)
+from analysis.active.ssl_experiments.timestep_flexible_ssm.future_infonce import (
+    FutureInfoNCEConfig,
+    run_future_infonce,
+)
 from analysis.active.ssl_experiments.timestep_flexible_ssm.model import TimestepFlexibleS5Model
+from analysis.active.ssl_experiments.timestep_flexible_ssm.supervised_experiments import (
+    SupervisedExperimentConfig,
+    run_mixed_bin_gru,
+)
 from analysis.active.ssl_experiments.timestep_flexible_ssm.train import (
     TimestepFlexibleSSMConfig,
     run_timestep_flexible_reconstruction,
@@ -178,6 +191,31 @@ class TimestepFlexibleSSMTest(unittest.TestCase):
         )
         self.assertEqual([row.n_time_bins for row in sampler.rows], [2, 4])
 
+    def test_missing_bin_helpers(self) -> None:
+        x = np.asarray(
+            [
+                [1.0, 10.0],
+                [3.0, 14.0],
+                [5.0, 18.0],
+                [7.0, 22.0],
+            ],
+            dtype=np.float32,
+        )
+        keep = np.asarray([True, False, False, True], dtype=bool)
+        interpolated = interpolate_missing_frames(x, keep)
+        carried = carry_forward_missing_frames(x, keep)
+        self.assertTrue(np.allclose(interpolated[:, 0], np.asarray([1.0, 3.0, 5.0, 7.0], dtype=np.float32)))
+        self.assertTrue(np.allclose(carried[:, 0], np.asarray([1.0, 1.0, 1.0, 7.0], dtype=np.float32)))
+        irregular_x, deltas_ms, keep_mask = irregular_observation_view(
+            x,
+            example_id="demo",
+            seed=7,
+            drop_probability=0.25,
+        )
+        self.assertGreaterEqual(int(irregular_x.shape[0]), 1)
+        self.assertEqual(int(irregular_x.shape[0]), int(deltas_ms.shape[0]))
+        self.assertEqual(int(keep_mask.shape[0]), int(x.shape[0]))
+
     def test_rebinned_dataset_and_short_training_run(self) -> None:
         cache_root = Path(self._tmp_dir())
         _write_tiny_competition_probe_cache(cache_root)
@@ -225,6 +263,68 @@ class TimestepFlexibleSSMTest(unittest.TestCase):
         self.assertIn("val_40ms_ctc_bpphone", summary["metrics"])
         self.assertEqual(summary["train_bin_size_ms"], 20)
         self.assertEqual(summary["eval_bin_sizes_ms"], [20, 40])
+
+    def test_mixed_gru_smoke_run(self) -> None:
+        cache_root = Path(self._tmp_dir())
+        _write_tiny_competition_probe_cache(cache_root)
+        output_root = Path(self._tmp_dir())
+        config = SupervisedExperimentConfig(
+            cache_root=cache_root,
+            output_root=output_root,
+            run_name="tiny_mixed_gru",
+            normalization_mode="global",
+            max_steps=1,
+            batch_size=2,
+            learning_rate=1e-3,
+            min_learning_rate=1e-4,
+            warmup_steps=0,
+            val_every_steps=1,
+            progress_every_steps=1,
+            input_smoothing_sigma_ms=0.0,
+            white_noise_sd=0.0,
+            constant_offset_sd=0.0,
+            patch_size_ms=40,
+            patch_stride_ms=40,
+            input_projection_size=8,
+            gru_hidden_size=16,
+            gru_num_layers=1,
+            gru_dropout=0.0,
+        )
+        summary = run_mixed_bin_gru(config)
+        self.assertIn("val_20ms_ctc_bpphone", summary["metrics"])
+        self.assertIn("val_40ms_ctc_bpphone", summary["metrics"])
+
+    def test_future_infonce_smoke_run(self) -> None:
+        cache_root = Path(self._tmp_dir())
+        _write_tiny_competition_probe_cache(cache_root)
+        output_root = Path(self._tmp_dir())
+        config = FutureInfoNCEConfig(
+            cache_root=cache_root,
+            output_root=output_root,
+            run_name="tiny_future_infonce",
+            model_family="s5",
+            max_steps=1,
+            batch_size=2,
+            warmup_steps=0,
+            val_every_steps=1,
+            progress_every_steps=1,
+            input_smoothing_sigma_ms=0.0,
+            white_noise_sd=0.0,
+            constant_offset_sd=0.0,
+            patch_size_ms=40,
+            patch_stride_ms=40,
+            input_projection_size=8,
+            s5_hidden_size=16,
+            s5_state_size=4,
+            s5_num_layers=1,
+            s5_dropout=0.0,
+            s5_ffn_multiplier=1.0,
+            horizons_ms=(20, 40),
+            projection_dim=8,
+        )
+        summary = run_future_infonce(config)
+        self.assertIn("h20_infonce_loss", summary["metrics"])
+        self.assertIn("h40_infonce_loss", summary["metrics"])
 
 
 if __name__ == "__main__":
