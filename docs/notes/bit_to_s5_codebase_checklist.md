@@ -12,7 +12,7 @@ The main question is:
 
 I also checked:
 
-- [`analysis/active/ssl_experiments/s5_maskedreconstruction.ipynb`](/Users/home/thesis/utah-ssl/analysis/active/ssl_experiments/s5_maskedreconstruction.ipynb)
+- [`analysis/active/ssl_experiments/archive/notebooks/s5_maskedreconstruction.ipynb`](/Users/home/thesis/utah-ssl/analysis/active/ssl_experiments/archive/notebooks/s5_maskedreconstruction.ipynb)
 
 That notebook is important because it shows how the current masked-reconstruction path is actually being used in practice.
 

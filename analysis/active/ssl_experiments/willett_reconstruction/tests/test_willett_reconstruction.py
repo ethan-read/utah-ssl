@@ -15,9 +15,12 @@ from analysis.active.ssl_experiments.stats_artifact_test_utils import (
     write_valid_split_stats_artifact as _write_valid_split_stats_artifact,
 )
 from analysis.active.ssl_experiments.willett_reconstruction.data import (
+    ConcatenatedPredictedTxSequenceDataset,
+    FuturePredictionExportAccessor,
     WillettInputTransformConfig,
     adapter_keys_from_rows,
     build_willett_problem,
+    compute_predicted_tx_normalization_stats,
     compute_willett_normalization_stats,
     group_rows_by_adapter_key,
     normalization_stats_missing_rows,
@@ -93,6 +96,86 @@ def _write_tiny_competition_probe_cache(cache_root: Path) -> None:
         },
     }
     (dataset_dir / "metadata.json").write_text(json.dumps(metadata))
+
+
+def _write_tiny_future_prediction_export(export_root: Path) -> None:
+    export_root.mkdir(parents=True, exist_ok=True)
+    rows = []
+    shard_dir = export_root / "predictions" / "brain2text24" / "brain2text24" / "shards"
+    shard_dir.mkdir(parents=True, exist_ok=True)
+    shard_path = shard_dir / "toy_shard.future_pred.pt"
+    shard_rows = []
+    examples = [
+        ("train-0", "competition_train", "t12.2022.08.10", 0),
+        ("train-1", "competition_train", "t12.2022.08.10", 1),
+        ("train-2", "competition_train", "t12.2022.08.11", 2),
+        ("train-3", "competition_train", "t12.2022.08.11", 3),
+        ("test-0", "competition_test", "t12.2022.08.10", 4),
+        ("test-1", "competition_test", "t12.2022.08.11", 5),
+    ]
+    for idx, (example_id, split_name, session_id, example_index) in enumerate(examples):
+        forecast = torch.full((2, 1, 3), float(idx + 1), dtype=torch.float32)
+        shard_rows.append(
+            {
+                "dataset": "brain2text24",
+                "session_id": session_id,
+                "subject_id": "t12",
+                "boundary_key": f"brain2text24:{session_id}",
+                "shard_relpath": "brain2text24/shards/toy_shard",
+                "example_index": example_index,
+                "n_time_bins_raw": 4,
+                "n_time_bins_agg": 2,
+                "future_bins": 1,
+                "forecast_raw": forecast,
+                "target_raw": forecast.clone(),
+                "forecast_norm": forecast.clone(),
+                "target_norm": forecast.clone(),
+                "valid_mask": torch.ones((2, 1), dtype=torch.bool),
+            }
+        )
+        rows.append(
+            {
+                "dataset": "brain2text24",
+                "session_id": session_id,
+                "subject_id": "t12",
+                "boundary_key": f"brain2text24:{session_id}",
+                "shard_relpath": "brain2text24/shards/toy_shard",
+                "example_index": example_index,
+                "n_time_bins_raw": 4,
+                "n_time_bins_agg": 2,
+            }
+        )
+    torch.save(
+        {
+            "checkpoint_path": "/tmp/checkpoint_best.pt",
+            "checkpoint_step": 10,
+            "dataset": "brain2text24",
+            "shard_relpath": "brain2text24/shards/toy_shard",
+            "rows": shard_rows,
+        },
+        shard_path,
+    )
+    (export_root / "manifest.json").write_text(
+        json.dumps(
+            {
+                "export_kind": "future_prediction_bins",
+                "checkpoint_path": "/tmp/checkpoint_best.pt",
+                "checkpoint_step": 10,
+                "checkpoint_kind": "best",
+                "run_name": "toy_export",
+                "datasets": ["brain2text24"],
+                "segment_bins": 24,
+                "temporal_bin_stride": 2,
+                "future_bins": 1,
+                "feature_mode": "tx_sbp",
+                "tx_dim": 3,
+                "sbp_dim": 0,
+                "example_count": len(rows),
+                "shard_export_count": 1,
+                "rows": rows,
+            }
+        )
+    )
 
 class WillettReconstructionTest(unittest.TestCase):
     def _tmp_dir(self) -> str:
@@ -185,6 +268,43 @@ class WillettReconstructionTest(unittest.TestCase):
         )
         self.assertEqual(tuple(transformed.shape), (2, 4, 3))
         self.assertTrue(torch.allclose(transformed[1, 3], torch.zeros_like(transformed[1, 3])))
+
+    def test_concatenated_predicted_tx_dataset_duplicates_and_concatenates(self) -> None:
+        cache_root = Path(self._tmp_dir())
+        export_root = Path(self._tmp_dir())
+        _write_tiny_competition_probe_cache(cache_root)
+        _write_tiny_future_prediction_export(export_root)
+        problem = build_willett_problem(
+            cache_root=cache_root,
+            dataset="brain2text24",
+            feature_mode="tx_only",
+            boundary_key_mode="session",
+        )
+        raw_stats = compute_willett_normalization_stats(
+            problem["train_rows"],
+            cache_root=cache_root,
+            feature_mode="tx_only",
+            mode="none",
+        )
+        accessor = FuturePredictionExportAccessor(export_root)
+        predicted_stats = compute_predicted_tx_normalization_stats(
+            problem["train_rows"],
+            export_accessor=accessor,
+            mode="none",
+        )
+        dataset = ConcatenatedPredictedTxSequenceDataset(
+            problem["train_rows"],
+            cache_root=cache_root,
+            raw_stats=raw_stats,
+            predicted_stats=predicted_stats,
+            export_accessor=accessor,
+            boundary_key_mode="session",
+            dataset="brain2text24",
+        )
+        item = dataset[0]
+        self.assertEqual(tuple(item["x"].shape), (4, 6))
+        self.assertTrue(torch.allclose(item["x"][:2, 3:], torch.ones((2, 3), dtype=torch.float32)))
+        self.assertTrue(torch.allclose(item["x"][2:, 3:], torch.ones((2, 3), dtype=torch.float32)))
 
     def test_train_derived_block_stats_do_not_cover_val_blocks(self) -> None:
         cache_root = Path(self._tmp_dir())
@@ -394,6 +514,58 @@ class WillettReconstructionTest(unittest.TestCase):
         )
         self.assertGreaterEqual(int(resumed_summary["steps"]), 3)
         self.assertGreaterEqual(int(resumed_summary["best_step"]), 1)
+
+    def test_short_training_run_with_predicted_tx_concat_writes_outputs(self) -> None:
+        cache_root = Path(self._tmp_dir())
+        export_root = Path(self._tmp_dir())
+        _write_tiny_competition_probe_cache(cache_root)
+        _write_tiny_future_prediction_export(export_root)
+        output_root = Path(self._tmp_dir())
+        stats_path = resolve_canonical_split_stats_path(
+            cache_root=cache_root,
+            dataset="brain2text24",
+            train_split_name="competition_train",
+            feature_mode="tx_only",
+            preferred_path=None,
+        )
+        _write_valid_split_stats_artifact(
+            cache_root=cache_root,
+            stats_path=stats_path,
+            dataset="brain2text24",
+            feature_mode="tx_only",
+            boundary_key_mode="session",
+            train_split_name="competition_train",
+            val_split_name="competition_test",
+            dim=3,
+        )
+        config = WillettReconstructionConfig(
+            cache_root=cache_root,
+            output_root=output_root,
+            run_name="tiny_predicted_concat_run",
+            max_steps=1,
+            batch_size=2,
+            learning_rate=1e-3,
+            min_learning_rate=1e-4,
+            warmup_steps=0,
+            adam_epsilon=1e-1,
+            val_every_steps=1,
+            checkpoint_every_steps=1,
+            progress_every_steps=1,
+            input_smoothing_sigma_bins=0.0,
+            white_noise_sd=0.0,
+            constant_offset_sd=0.0,
+            patch_size=2,
+            patch_stride=1,
+            input_projection_size=8,
+            gru_hidden_size=16,
+            gru_num_layers=1,
+            gru_dropout=0.0,
+            input_feature_source="raw_plus_predicted_tx",
+            predicted_export_root=export_root,
+        )
+        summary = run_willett_reconstruction(config)
+        self.assertEqual(summary["input_feature_source"], "raw_plus_predicted_tx")
+        self.assertTrue((output_root / "tiny_predicted_concat_run" / "checkpoint_final.pt").exists())
 
     def test_short_s5_training_run_writes_outputs(self) -> None:
         cache_root = Path(self._tmp_dir())

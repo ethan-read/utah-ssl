@@ -18,6 +18,11 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from bit_cache_contract import (
+    BIT_CANONICAL_FEATURE_POLICY,
+    canonical_stage1_stats_stem,
+)
+
 try:
     import psutil
 except ImportError:  # pragma: no cover - optional dependency
@@ -33,7 +38,7 @@ RUNTIME_SMOOTHING_MIGRATION_MESSAGE = (
 # Fixed stride for session-stat computation to match the normalized cache artifacts.
 SESSION_STATS_BIN_STRIDE = 2
 AREA6V_FEATURE_DIM = 128
-FEATURE_POLICY = "area6v_v1"
+FEATURE_POLICY = BIT_CANONICAL_FEATURE_POLICY
 
 
 @dataclass
@@ -65,10 +70,18 @@ class CacheAccessConfig:
             raise ValueError("segment_bins must be positive")
         if self.examples_per_shard <= 0:
             raise ValueError("examples_per_shard must be positive")
-        if self.tx_dim <= 0 or self.sbp_dim <= 0:
-            raise ValueError("tx_dim and sbp_dim must be positive")
         if self.feature_mode not in {"tx_only", "tx_sbp"}:
             raise ValueError("feature_mode must be one of {'tx_only', 'tx_sbp'}")
+        if int(self.tx_dim) <= 0:
+            raise ValueError("tx_dim must be positive")
+        if self.feature_mode == "tx_only":
+            if self.sbp_dim is None:
+                self.sbp_dim = 0
+            if int(self.sbp_dim) < 0:
+                raise ValueError("sbp_dim must be non-negative when feature_mode='tx_only'")
+        else:
+            if self.sbp_dim is None or int(self.sbp_dim) <= 0:
+                raise ValueError("sbp_dim must be positive when feature_mode='tx_sbp'")
         if self.boundary_key_mode not in {"session", "subject_if_available"}:
             raise ValueError(
                 "boundary_key_mode must be one of {'session', 'subject_if_available'}"
@@ -307,9 +320,14 @@ def resolve_precomputed_session_stats_path(
         cache_root=cache_root,
         excluded_datasets=excluded_datasets,
     )
-    preferred_path = stats_dir / (
-        f"{_canonical_session_stats_stem_from_included(dataset_names=included_datasets)}.pt"
+    preferred_stem = canonical_stage1_stats_stem(
+        included_datasets=included_datasets,
+        excluded_datasets=excluded_datasets,
+        fallback_stem=_canonical_session_stats_stem_from_included(
+            dataset_names=included_datasets
+        ),
     )
+    preferred_path = stats_dir / f"{preferred_stem}.pt"
     if preferred_path.exists():
         return preferred_path
 
@@ -668,7 +686,11 @@ class ShardStore:
     def _load_array(self, path: Path) -> np.ndarray | None:
         if not path.exists():
             return None
-        return np.load(path, mmap_mode="r", allow_pickle=False)
+        # Use eager in-memory loads here rather than memmaps. ShardStore already
+        # enforces a RAM budget, and keeping many memmapped arrays alive at once
+        # can exhaust per-process file-descriptor limits during full-corpus
+        # stats recomputation on laptops.
+        return np.load(path, allow_pickle=False)
 
     def _load_shard(self, shard_relpath: str) -> dict[str, np.ndarray | None | int]:
         shard_path = self.cache_root / shard_relpath

@@ -1,8 +1,8 @@
 """Compatibility shim for contrastive SSL cache access.
 
-This module now delegates to ``masked_ssl.cache`` so contrastive S5 notebooks
-use the same area-6v feature policy, cache validation, and segment sampler
-behavior as POSSM/Willett workflows.
+This module now delegates to ``ssl_core.cache`` so contrastive S5 notebooks use
+the same area-6v feature policy, cache validation, and segment sampler behavior
+as POSSM/Willett workflows.
 """
 
 from __future__ import annotations
@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Sequence
 
 try:
-    from masked_ssl.cache import (
+    from ssl_core.cache import (
         CacheAccessConfig,
         CacheContext,
         SegmentBatchSampler,
@@ -21,7 +21,7 @@ try:
         prepare_cache_context as _prepare_cache_context,
     )
 except ModuleNotFoundError:  # pragma: no cover - repo-root unittest fallback
-    from analysis.active.ssl_experiments.masked_ssl.cache import (
+    from analysis.active.ssl_experiments.ssl_core.cache import (
         CacheAccessConfig,
         CacheContext,
         SegmentBatchSampler,
@@ -37,7 +37,7 @@ def prepare_cache_context(
     cache_candidates: Sequence[Path],
     config: CacheAccessConfig,
 ) -> CacheContext:
-    """Build a cache context using the shared masked_ssl cache backend."""
+    """Build a cache context using the shared ssl_core cache backend."""
     return _prepare_cache_context(cache_candidates=cache_candidates, config=config)
 
 

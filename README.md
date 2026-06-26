@@ -17,9 +17,12 @@ For the current interpretation of experiment results, start with
   - current canonical synthesis of experiment results and active conclusions
 - `docs/notes/ssl_architecture_choices.md`
   - current architecture decision log
+- `analysis/active/ssl_experiments/ssl_core`
+  - shared cache, normalization-stat, CTC, temporal patching, and reporting helpers
+- `analysis/active/ssl_experiments/ssm_ssl`
+  - active generic `S5`/`Mamba` SSL experiments with downstream CTC controls
 - `analysis/active/ssl_experiments/possm_ssl`
-  - active POSSM reconstruction and phoneme fine-tuning helpers
-  - POSSM sweep/launcher scripts live in `possm_ssl/scripts`
+  - POSSM reconstruction and phoneme fine-tuning reference implementation
 - `docs/paper_notes/`
   - paper architecture notes that informed the benchmark design
 
@@ -34,7 +37,7 @@ For the current interpretation of experiment results, start with
 
 The full scaffold expects data and outputs to live outside the repo and be routed through environment variables.
 
-For the active SSL/POSSM notebooks, reusable Drive artifacts are organized under:
+For active SSL experiment notebooks and scripts, reusable Drive artifacts are organized under:
 
 - `/content/drive/MyDrive/utah_ssl/data/`
   - cache roots such as `cache_v1` and `cache_v1_smoothed_sigma2p0`

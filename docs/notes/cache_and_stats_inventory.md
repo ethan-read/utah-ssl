@@ -3,6 +3,9 @@
 This note records the cache roots and normalization-stat artifacts that are
 still relevant for current Utah SSL notebook work.
 
+For the fuller Drive-backed dataset-by-dataset cache contract, see
+`docs/notes/canonical_drive_cache_spec.md`.
+
 ## Area-6v-Only Feature Policy
 
 Active Brain2Text24 cache roots should now be hard-migrated to area 6v only.
@@ -46,7 +49,7 @@ resumed.
 ## Pre-Smoothed Cache
 
 ### Local
-- path: `/Users/home/thesis/utah-ssl/data/cache_v1_smoothed_sigma2p0`
+- path: `/Users/home/thesis/data/cache_v1_smoothed_sigma2p0`
 - status: valid local pre-smoothed cache root for `brain2text24`
 - expected use:
   - select this cache root directly
@@ -70,14 +73,22 @@ legacy and may be absent in a fresh Drive organization.
 
 ### Canonical Drive Layout
 
-Stage-1 SSL/POSSM sampling uses session-level stats keyed by
-`dataset:session_id`:
+Stage-1 BIT-style masked reconstruction sampling should follow the paper's
+pretraining choice:
+
+- feature mode: `tx_only`
+- use `SBP` later for downstream speech decoding when available
+- keep `20 ms` bins and session-level z-scoring
+- default stage-1 dataset set may include `brain2text24` and the auxiliary Utah
+  datasets, while excluding `brain2text25`, but the important paper-faithful
+  point is that pretraining itself is `TX`-only because some datasets lack
+  `SBP`
 
 - Drive root:
   - `/content/drive/MyDrive/utah_ssl/data/stats/session_feature_stats/`
-- current POSSM Stage-1 target path:
-  - `/content/drive/MyDrive/utah_ssl/data/stats/session_feature_stats/smoothed_sigma2p0/tx_only/session/ssl_pretrain_excluding_brain2text25_v1.pt`
-  - `/content/drive/MyDrive/utah_ssl/data/stats/session_feature_stats/smoothed_sigma2p0/tx_only/session/ssl_pretrain_excluding_brain2text25_v1.json`
+- current canonical Stage-1 target path:
+  - `/content/drive/MyDrive/utah_ssl/data/stats/session_feature_stats/smoothed_sigma2p0/tx_only/session/ssl_pretrain_including_brain2text24_excluding_brain2text25_v1.pt`
+  - `/content/drive/MyDrive/utah_ssl/data/stats/session_feature_stats/smoothed_sigma2p0/tx_only/session/ssl_pretrain_including_brain2text24_excluding_brain2text25_v1.json`
 
 Stage-2 phoneme fine-tuning uses train-split global stats computed on the
 released Willett `competition_train` rows and then applied to both train and

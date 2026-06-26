@@ -10,6 +10,12 @@ from typing import Any, Sequence
 
 import torch
 
+from bit_cache_contract import (
+    BIT_STAGE1_DEFAULT_EXCLUDED_DATASETS,
+    BIT_STAGE1_FEATURE_MODE,
+    BIT_STAGE1_SBP_DIM,
+    BIT_STAGE1_TX_DIM,
+)
 from masked_ssl.cache import (
     FEATURE_POLICY,
     CacheAccessConfig,
@@ -19,9 +25,9 @@ from masked_ssl.cache import (
 )
 
 
-DEFAULT_TX_DIM = 128
-DEFAULT_SBP_DIM = 128
-DEFAULT_EXCLUDED_DATASETS = ("brain2text25",)
+DEFAULT_TX_DIM = BIT_STAGE1_TX_DIM
+DEFAULT_SBP_DIM = BIT_STAGE1_SBP_DIM
+DEFAULT_EXCLUDED_DATASETS = BIT_STAGE1_DEFAULT_EXCLUDED_DATASETS
 
 
 def _timestamp_utc() -> str:
@@ -55,7 +61,7 @@ def recompute_session_feature_stats(
     *,
     cache_root: str | Path,
     output_path: str | Path,
-    feature_mode: str = "tx_sbp",
+    feature_mode: str = BIT_STAGE1_FEATURE_MODE,
     boundary_key_mode: str = "session",
     datasets: Sequence[str] | None = None,
     tx_dim: int = DEFAULT_TX_DIM,
@@ -170,7 +176,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--feature-mode",
         choices=("tx_only", "tx_sbp"),
-        default="tx_sbp",
+        default=BIT_STAGE1_FEATURE_MODE,
         help="Feature layout to match when computing stats.",
     )
     parser.add_argument(

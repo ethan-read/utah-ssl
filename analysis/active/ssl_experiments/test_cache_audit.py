@@ -105,6 +105,7 @@ def _write_stats(
     session_ids: list[str],
     dim: int,
     sigma: float | None = None,
+    feature_mode: str | None = None,
     per_session_dims: dict[str, int] | None = None,
 ) -> None:
     payload = {
@@ -118,6 +119,7 @@ def _write_stats(
         "metadata": {
             "gaussian_smoothing_sigma_bins": sigma,
             "session_stats_bin_stride": 2,
+            "feature_mode": feature_mode,
         },
     }
     torch.save(payload, path)
@@ -168,20 +170,49 @@ class CacheAuditTests(unittest.TestCase):
             raw_root = tmp / "cache"
             _write_dataset(raw_root, "brain2text24", lengths_by_session={"t00.2025.01.01": [120], "t00.2025.01.02": [160]})
             stats_path = tmp / "stats.pt"
-            _write_stats(stats_path, session_ids=["t00.2025.01.01", "t00.2025.01.02"], dim=128)
+            _write_stats(
+                stats_path,
+                session_ids=["t00.2025.01.01", "t00.2025.01.02"],
+                dim=128,
+                feature_mode="tx_only",
+            )
             report = run_audit(cache_roots=[raw_root], stats_paths=[stats_path], dataset="brain2text24", segment_bins=80)
             stats = report["stats_audits"][0]
             self.assertTrue(stats["compatible_feature_modes"]["tx_only"])
             self.assertFalse(stats["compatible_feature_modes"]["tx_sbp"])
             self.assertIn("tx_only_only_not_tx_sbp", stats["findings"])
 
-    def test_256_dim_stats_are_tx_sbp_only_after_area6v_migration(self) -> None:
+    def test_256_dim_stats_can_be_tx_only_for_bit_stage1(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
             raw_root = tmp / "cache"
             _write_dataset(raw_root, "brain2text24", lengths_by_session={"t00.2025.01.01": [120], "t00.2025.01.02": [160]})
             stats_path = tmp / "stats.pt"
-            _write_stats(stats_path, session_ids=["t00.2025.01.01", "t00.2025.01.02"], dim=256, sigma=2.0)
+            _write_stats(
+                stats_path,
+                session_ids=["t00.2025.01.01", "t00.2025.01.02"],
+                dim=256,
+                sigma=2.0,
+                feature_mode="tx_only",
+            )
+            report = run_audit(cache_roots=[raw_root], stats_paths=[stats_path], dataset="brain2text24", segment_bins=80)
+            stats = report["stats_audits"][0]
+            self.assertTrue(stats["compatible_feature_modes"]["tx_only"])
+            self.assertFalse(stats["compatible_feature_modes"]["tx_sbp"])
+
+    def test_256_dim_stats_can_be_tx_sbp_when_metadata_says_so(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            raw_root = tmp / "cache"
+            _write_dataset(raw_root, "brain2text24", lengths_by_session={"t00.2025.01.01": [120], "t00.2025.01.02": [160]})
+            stats_path = tmp / "stats.pt"
+            _write_stats(
+                stats_path,
+                session_ids=["t00.2025.01.01", "t00.2025.01.02"],
+                dim=256,
+                sigma=2.0,
+                feature_mode="tx_sbp",
+            )
             report = run_audit(cache_roots=[raw_root], stats_paths=[stats_path], dataset="brain2text24", segment_bins=80)
             stats = report["stats_audits"][0]
             self.assertFalse(stats["compatible_feature_modes"]["tx_only"])

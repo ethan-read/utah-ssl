@@ -12,6 +12,19 @@ import torch.nn as nn
 import torch.nn.functional as F
 from s5 import BidirectionalS5SequenceBackbone, S5SequenceBackbone
 
+try:
+    from ssl_core.patching import causal_conv_lengths as _core_causal_conv_lengths
+    from ssl_core.patching import patch_batch as _core_patch_batch
+    from ssl_core.patching import patched_lengths as _core_patched_lengths
+except ModuleNotFoundError:  # pragma: no cover - repo-root unittest fallback
+    from analysis.active.ssl_experiments.ssl_core.patching import (
+        causal_conv_lengths as _core_causal_conv_lengths,
+    )
+    from analysis.active.ssl_experiments.ssl_core.patching import patch_batch as _core_patch_batch
+    from analysis.active.ssl_experiments.ssl_core.patching import (
+        patched_lengths as _core_patched_lengths,
+    )
+
 
 @dataclass(frozen=True)
 class EncoderOutputs:
@@ -541,14 +554,7 @@ class POSSMReconstructionModel(nn.Module):
 
 
 def causal_conv_output_lengths(lengths: torch.Tensor, stride: int) -> torch.Tensor:
-    stride = int(stride)
-    if stride <= 0:
-        raise ValueError("stride must be positive")
-    lengths = lengths.to(dtype=torch.long)
-    positive = lengths > 0
-    safe = torch.clamp(lengths - 1, min=0)
-    output = torch.div(safe, stride, rounding_mode="floor") + 1
-    return torch.where(positive, output, torch.zeros_like(output))
+    return _core_causal_conv_lengths(lengths, stride=int(stride))
 
 
 def temporal_patch_output_lengths(
@@ -557,16 +563,12 @@ def temporal_patch_output_lengths(
     patch_size: int,
     patch_stride: int,
 ) -> torch.Tensor:
-    patch_size = int(patch_size)
-    patch_stride = int(patch_stride)
-    if patch_size <= 0 or patch_stride <= 0:
-        raise ValueError("patch_size and patch_stride must be positive")
-    lengths = lengths.to(dtype=torch.long)
-    positive = lengths > 0
-    longer_than_patch = lengths > patch_size
-    patched = 1 + torch.div(lengths - patch_size, patch_stride, rounding_mode="floor")
-    one = torch.ones_like(lengths)
-    return torch.where(positive, torch.where(longer_than_patch, patched, one), torch.zeros_like(lengths))
+    return _core_patched_lengths(
+        lengths,
+        patch_size=int(patch_size),
+        patch_stride=int(patch_stride),
+        policy="floor",
+    )
 
 
 def patch_temporal_sequence(
@@ -576,34 +578,13 @@ def patch_temporal_sequence(
     patch_size: int,
     patch_stride: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if hidden.ndim != 3:
-        raise ValueError(f"Expected hidden to have shape [B, T, H], got {tuple(hidden.shape)}")
-    patch_size = int(patch_size)
-    patch_stride = int(patch_stride)
-    token_lengths = temporal_patch_output_lengths(
+    return _core_patch_batch(
+        hidden,
         input_lengths,
-        patch_size=patch_size,
-        patch_stride=patch_stride,
+        patch_size=int(patch_size),
+        patch_stride=int(patch_stride),
+        policy="floor",
     )
-    max_tokens = int(token_lengths.max().item()) if int(token_lengths.numel()) else 0
-    patch_dim = int(hidden.shape[-1]) * patch_size
-    patched = hidden.new_zeros((int(hidden.shape[0]), max_tokens, patch_dim))
-    for batch_idx, length_tensor in enumerate(input_lengths.tolist()):
-        length = int(length_tensor)
-        total_patches = int(token_lengths[batch_idx].item())
-        if total_patches <= 0:
-            continue
-        valid = hidden[batch_idx, :length]
-        patches: list[torch.Tensor] = []
-        for patch_idx in range(total_patches):
-            start = patch_idx * patch_stride
-            patch = valid[start : start + patch_size]
-            if int(patch.shape[0]) < patch_size:
-                pad = valid.new_zeros((patch_size - int(patch.shape[0]), int(hidden.shape[-1])))
-                patch = torch.cat([patch, pad], dim=0)
-            patches.append(patch.reshape(-1))
-        patched[batch_idx, :total_patches] = torch.stack(patches, dim=0)
-    return patched, token_lengths
 
 
 class SessionFeatureAffine(nn.Module):

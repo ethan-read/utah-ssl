@@ -5,7 +5,7 @@
 Track the status of the local Willett-style supervised phoneme-decoding
 baseline in `analysis/active/ssl_experiments/willett_reconstruction`, with a
 focus on convergence behavior and remaining discrepancies from the Stanford
-`speechBCI` reference code in `external/speechBCI`.
+`speechBCI` reference code.
 
 ## Current Local Baseline
 
@@ -32,10 +32,10 @@ focus on convergence behavior and remaining discrepancies from the Stanford
 
 Stanford training still differs in a potentially important way.
 
-The reference code samples one dataset/day at a time during training and routes
-that batch through the corresponding day-specific normalization/input path:
-
-- `external/speechBCI/NeuralDecoder/neuralDecoder/neuralSequenceDecoder.py:454`
+The Stanford reference code samples one dataset/day at a time during training
+and routes that batch through the corresponding day-specific normalization/input
+path. In the published `speechBCI` repository, this is in
+`NeuralDecoder/neuralDecoder/neuralSequenceDecoder.py`.
 
 The current local baseline instead uses one global length-aware sampler over
 all utterances:

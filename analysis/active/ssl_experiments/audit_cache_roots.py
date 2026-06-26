@@ -517,12 +517,28 @@ def audit_cache_root(spec: RootAuditInput) -> dict[str, Any]:
     return root_report
 
 
-def _classify_stats_feature_modes(unique_dims: Iterable[int]) -> dict[str, bool]:
+def _classify_stats_feature_modes(
+    unique_dims: Iterable[int],
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, bool]:
     dims = sorted({int(dim) for dim in unique_dims if int(dim) > 0})
-    smallest_dim = min(dims) if dims else 0
+    if not dims:
+        return {"tx_only": False, "tx_sbp": False}
+    feature_mode = None if not isinstance(metadata, dict) else metadata.get("feature_mode")
+    if feature_mode == "tx_only":
+        return {"tx_only": True, "tx_sbp": False}
+    if feature_mode == "tx_sbp":
+        return {"tx_only": False, "tx_sbp": True}
+    if len(dims) == 1:
+        only_dim = int(dims[0])
+        return {
+            "tx_only": bool(only_dim in {128, 256}),
+            "tx_sbp": bool(only_dim in {256, 512}),
+        }
+    smallest_dim = min(dims)
     return {
-        "tx_only": bool(smallest_dim == 128),
-        "tx_sbp": bool(smallest_dim == 256),
+        "tx_only": bool(smallest_dim in {128, 256}),
+        "tx_sbp": False,
     }
 
 
@@ -574,7 +590,10 @@ def audit_stats_artifact(spec: StatsAuditInput, dataset_names: Sequence[str]) ->
     report["session_count"] = int(len(raw_stats))
     report["unique_mean_dims"] = sorted(set(mean_dims))
     report["unique_std_dims"] = sorted(set(std_dims))
-    report["compatible_feature_modes"] = _classify_stats_feature_modes(set(mean_dims) | set(std_dims))
+    report["compatible_feature_modes"] = _classify_stats_feature_modes(
+        set(mean_dims) | set(std_dims),
+        report["metadata"],
+    )
     report["dataset_session_counts"] = {name: int(dataset_session_counts.get(name, 0)) for name in dataset_names}
     report["dataset_session_keys"] = {
         name: sorted(dataset_session_keys.get(name, set()))

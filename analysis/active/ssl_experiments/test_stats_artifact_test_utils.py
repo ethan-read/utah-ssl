@@ -11,6 +11,7 @@ from analysis.active.ssl_experiments.masked_ssl.cache import (
     CacheAccessConfig,
     resolve_precomputed_session_stats_path,
 )
+from analysis.active.ssl_experiments.ssm_ssl.config import GenericSSMSSLConfig
 from analysis.active.ssl_experiments.recompute_split_feature_stats import (
     load_precomputed_split_feature_stats,
     resolve_precomputed_split_stats_path,
@@ -121,6 +122,24 @@ class StatsArtifactTestUtilsTests(unittest.TestCase):
     def test_cache_config_deduplicates_excluded_datasets_for_canonical_paths(self) -> None:
         config = CacheAccessConfig(excluded_datasets=("zeta", "brain2text25", "zeta", ""))
         self.assertEqual(config.excluded_datasets, ("brain2text25", "zeta"))
+
+    def test_cache_config_allows_zero_sbp_dim_for_tx_only(self) -> None:
+        config = CacheAccessConfig(feature_mode="tx_only", tx_dim=256, sbp_dim=0)
+        self.assertEqual(config.sbp_dim, 0)
+        self.assertEqual(config.full_dim, 256)
+
+    def test_cache_config_requires_positive_sbp_dim_for_tx_sbp(self) -> None:
+        with self.assertRaisesRegex(ValueError, "sbp_dim must be positive"):
+            CacheAccessConfig(feature_mode="tx_sbp", tx_dim=256, sbp_dim=0)
+
+    def test_generic_ssl_config_allows_zero_sbp_dim_for_tx_only(self) -> None:
+        config = GenericSSMSSLConfig(feature_mode="tx_only", tx_dim=256, sbp_dim=0)
+        self.assertEqual(config.sbp_dim, 0)
+        self.assertEqual(config.input_dim, 256)
+
+    def test_generic_ssl_config_requires_positive_sbp_dim_for_tx_sbp(self) -> None:
+        with self.assertRaisesRegex(ValueError, "sbp_dim must be positive"):
+            GenericSSMSSLConfig(feature_mode="tx_sbp", tx_dim=256, sbp_dim=0)
 
 
 if __name__ == "__main__":

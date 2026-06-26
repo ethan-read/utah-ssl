@@ -3,13 +3,9 @@
 This orchestration script is intentionally conservative:
 
 - it discovers datasets from an existing canonical cache root
-- it prefers a sibling fused cache root when available to avoid excessive shards
+- it harmonizes the canonical raw cache to the BIT stage-1 contract
 - it builds a sigma-smoothed sibling cache for the selected datasets
-- it recomputes session-level tx-only z-scoring stats over the prepared cache
-
-The current masked-SSL stack expects one shared configured input width. To avoid
-silently truncating wider datasets, this script sizes the recommended `tx_dim`
-and `sbp_dim` to the maximum widths observed across the selected datasets.
+- it recomputes canonical session-level tx-only z-scoring stats over the prepared cache
 """
 
 from __future__ import annotations
@@ -20,7 +16,17 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Sequence
 
+from bit_cache_contract import (
+    BIT_STAGE1_BOUNDARY_KEY_MODE,
+    BIT_STAGE1_DEFAULT_EXCLUDED_DATASETS,
+    BIT_STAGE1_FEATURE_MODE,
+    BIT_STAGE1_SBP_DIM,
+    BIT_STAGE1_SIGMA_BINS,
+    BIT_STAGE1_TX_DIM,
+    canonical_stage1_stats_stem,
+)
 from build_smoothed_cache import build_smoothed_cache
+from harmonize_bit_cache import harmonize_bit_cache
 from masked_ssl.cache import (
     _canonical_session_stats_dir,
     _canonical_session_stats_stem_from_included,
@@ -28,9 +34,10 @@ from masked_ssl.cache import (
 from recompute_session_feature_stats import recompute_session_feature_stats
 
 
-DEFAULT_SIGMA_BINS = 2.0
-DEFAULT_BOUNDARY_KEY_MODE = "session"
-DEFAULT_FEATURE_MODE = "tx_only"
+DEFAULT_SIGMA_BINS = BIT_STAGE1_SIGMA_BINS
+DEFAULT_BOUNDARY_KEY_MODE = BIT_STAGE1_BOUNDARY_KEY_MODE
+DEFAULT_FEATURE_MODE = BIT_STAGE1_FEATURE_MODE
+DEFAULT_EXCLUDED_DATASETS = BIT_STAGE1_DEFAULT_EXCLUDED_DATASETS
 
 
 @dataclass(frozen=True)
@@ -206,16 +213,11 @@ def _recommended_output_root(src_root: Path, *, sigma_bins: float) -> Path:
     return src_root.with_name(f"{src_root.name}_smoothed_sigma{sigma_label}")
 
 
-def _max_feature_widths(entries: Sequence[DatasetInventoryEntry]) -> tuple[int, int]:
-    max_tx = max(int(entry.n_tx_features) for entry in entries)
-    max_sbp = max(int(entry.n_sbp_features) for entry in entries)
-    return max_tx, max_sbp
-
-
 def _recommended_stats_output_path(
     *,
     cache_root: Path,
     dataset_names: Sequence[str],
+    excluded_datasets: Sequence[str],
     feature_mode: str,
     boundary_key_mode: str,
 ) -> Path:
@@ -224,7 +226,13 @@ def _recommended_stats_output_path(
         feature_mode=feature_mode,
         boundary_key_mode=boundary_key_mode,
     )
-    stem = _canonical_session_stats_stem_from_included(dataset_names=tuple(dataset_names))
+    stem = canonical_stage1_stats_stem(
+        included_datasets=tuple(dataset_names),
+        excluded_datasets=tuple(excluded_datasets),
+        fallback_stem=_canonical_session_stats_stem_from_included(
+            dataset_names=tuple(dataset_names)
+        ),
+    )
     return stats_dir / f"{stem}.pt"
 
 
@@ -243,7 +251,8 @@ def prepare_bit_cache(
     prefer_fused: bool = True,
     overwrite: bool = False,
     dry_run: bool = False,
-    recompute_tx_only_stats: bool = True,
+    recompute_session_stats: bool = True,
+    harmonize_canonical_raw_cache: bool = True,
     segment_bins: int = 80,
     examples_per_shard: int = 8,
     seed: int = 7,
@@ -253,7 +262,17 @@ def prepare_bit_cache(
         raise FileNotFoundError(f"Cache root does not exist: {cache_root}")
 
     requested_datasets = _normalize_name_list(dataset_names)
-    excluded = _normalize_name_list(excluded_datasets)
+    excluded = (
+        _normalize_name_list(DEFAULT_EXCLUDED_DATASETS)
+        if excluded_datasets is None
+        else _normalize_name_list(excluded_datasets)
+    )
+    harmonization_summary: dict[str, Any] | None = None
+    if harmonize_canonical_raw_cache:
+        harmonization_summary = harmonize_bit_cache(
+            cache_root=cache_root,
+            dry_run=bool(dry_run),
+        )
     selected_source_root, source_reason = _resolve_source_root(
         cache_root=cache_root,
         requested_datasets=requested_datasets,
@@ -267,8 +286,6 @@ def prepare_bit_cache(
         require_tx=True,
     )
     selected_dataset_names = [entry.dataset for entry in selected_entries]
-    max_tx, max_sbp = _max_feature_widths(selected_entries)
-
     output_root = (
         Path(output_root)
         if output_root is not None
@@ -277,6 +294,7 @@ def prepare_bit_cache(
     stats_output_path = _recommended_stats_output_path(
         cache_root=output_root,
         dataset_names=selected_dataset_names,
+        excluded_datasets=excluded,
         feature_mode=DEFAULT_FEATURE_MODE,
         boundary_key_mode=DEFAULT_BOUNDARY_KEY_MODE,
     )
@@ -291,19 +309,19 @@ def prepare_bit_cache(
     )
 
     stats_summary: dict[str, Any] | None = None
-    if recompute_tx_only_stats and not dry_run:
+    if recompute_session_stats and not dry_run:
         stats_summary = recompute_session_feature_stats(
             cache_root=output_root,
             output_path=stats_output_path,
             feature_mode=DEFAULT_FEATURE_MODE,
             boundary_key_mode=DEFAULT_BOUNDARY_KEY_MODE,
             datasets=tuple(selected_dataset_names),
-            tx_dim=int(max_tx),
-            sbp_dim=int(max_sbp),
+            tx_dim=int(BIT_STAGE1_TX_DIM),
+            sbp_dim=int(BIT_STAGE1_SBP_DIM),
             segment_bins=int(segment_bins),
             seed=int(seed),
             examples_per_shard=int(examples_per_shard),
-            excluded_datasets=(),
+            excluded_datasets=tuple(excluded),
             overwrite=bool(overwrite),
         )
 
@@ -318,14 +336,17 @@ def prepare_bit_cache(
             "overwrite": bool(overwrite),
             "dry_run": bool(dry_run),
             "dataset_names": selected_dataset_names,
+            "excluded_dataset_names": list(excluded),
             "dataset_count": len(selected_dataset_names),
             "recommended_ssl_feature_mode": DEFAULT_FEATURE_MODE,
             "recommended_boundary_key_mode": DEFAULT_BOUNDARY_KEY_MODE,
-            "recommended_tx_dim": int(max_tx),
-            "recommended_sbp_dim": int(max_sbp),
+            "recommended_tx_dim": int(BIT_STAGE1_TX_DIM),
+            "recommended_sbp_dim": int(BIT_STAGE1_SBP_DIM),
+            "recommended_sbp_dim_note": "Only relevant for downstream tx_sbp speech fine-tuning; BIT stage-1 defaults to tx_only.",
             "recommended_stats_output_path": str(stats_output_path),
             "datasets": [asdict(entry) for entry in selected_entries],
         },
+        "harmonization_summary": harmonization_summary,
         "smoothing_summary": smoothing_summary,
         "stats_summary": (
             None
@@ -387,11 +408,16 @@ def _parse_args() -> argparse.Namespace:
         action="store_false",
         help="Use the provided cache root directly even if a fused sibling exists.",
     )
-    parser.set_defaults(prefer_fused=True)
+    parser.set_defaults(prefer_fused=False)
     parser.add_argument(
-        "--skip-tx-only-stats",
+        "--skip-session-stats",
         action="store_true",
-        help="Build the smoothed cache but skip recomputing tx-only session stats.",
+        help="Build the smoothed cache but skip recomputing canonical tx-only session stats.",
+    )
+    parser.add_argument(
+        "--skip-canonical-harmonization",
+        action="store_true",
+        help="Do not rewrite the raw canonical cache before building the smoothed root.",
     )
     parser.add_argument("--segment-bins", type=int, default=80)
     parser.add_argument("--examples-per-shard", type=int, default=8)
@@ -412,7 +438,8 @@ def main() -> None:
         prefer_fused=bool(args.prefer_fused),
         overwrite=bool(args.overwrite),
         dry_run=bool(args.dry_run),
-        recompute_tx_only_stats=not bool(args.skip_tx_only_stats),
+        recompute_session_stats=not bool(args.skip_session_stats),
+        harmonize_canonical_raw_cache=not bool(args.skip_canonical_harmonization),
         segment_bins=int(args.segment_bins),
         examples_per_shard=int(args.examples_per_shard),
         seed=int(args.seed),

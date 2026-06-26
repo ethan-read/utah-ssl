@@ -29,6 +29,7 @@ scratch/
 *.swp
 
 # Local tooling and scratch
+.venv/
 .codex_tmp/
 .mplconfig/
 analysis/active/.mplconfig/

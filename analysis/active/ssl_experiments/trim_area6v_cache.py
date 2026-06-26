@@ -21,7 +21,7 @@ import numpy as np
 AREA6V_FEATURES = 128
 FULL_RELEASE_FEATURES = 256
 SOURCE_NOTE = (
-    "external/speechBCI/AnalysisExamples/makeTFRecordsFromSession.py states "
+    "Stanford speechBCI AnalysisExamples/makeTFRecordsFromSession.py states "
     "'first 128 columns = area 6v only' for tx1 and spikePow."
 )
 

@@ -1,40 +1,367 @@
 \chapter{Mamba}
 \label{ch:mamba}
 
-\section*{Purpose}
-\addcontentsline{toc}{section}{Purpose}
+\section{Why Mamba Was Needed}
 
-This chapter explains Mamba as a selective state space model: still linear-time and
-recurrent in spirit, but no longer a fixed linear time-invariant convolution.
+S4 and S5 showed that structured state space models can supply long memory with linear
+time scaling and fixed-size recurrent state. But they also inherit a major restriction:
+their temporal core is linear time invariant. The same kernel is applied regardless of
+the input content.
 
-\section*{Assumed Background}
-\addcontentsline{toc}{section}{Assumed Background}
+That is a real limitation. In many sequence tasks, the model should not treat every token
+or time step the same way. Some inputs should be remembered strongly; others should be
+ignored. Some events should reset memory; others should be carried forward. Attention does
+this through content-dependent weights. Plain LTI SSMs do not.
 
-The reader understands SSMs, convolutional training for time-invariant systems, and the
-transformer idea of content-dependent routing through attention.
+Mamba addresses this gap by making the state space model \emph{selective}
+\citep{gu2023mamba}. Its key idea is:
+\[
+  \text{the recurrence parameters depend on the current input.}
+\]
+This gives the model a form of content-based routing while keeping a linear-time scan-like
+computation.
 
-\section*{Key Concepts To Define}
-\addcontentsline{toc}{section}{Key Concepts To Define}
+\section{From Fixed Dynamics To Selective Dynamics}
+
+Recall the standard discrete SSM:
+\[
+  \vx_t = \bar{\mA}\vx_{t-1} + \bar{\mB}\vu_t,
+  \qquad
+  \vy_t = \mC\vx_t + \mD\vu_t.
+\]
+In S4 and S5, the matrices are fixed across time. The same $\bar{\mA}$, $\bar{\mB}$,
+and $\mC$ are used for every $t$.
+
+Mamba instead uses input-dependent parameters. A simplified conceptual form is
+\begin{equation}
+  \vx_t = \bar{\mA}_t \vx_{t-1} + \bar{\mB}_t \vu_t,
+  \qquad
+  \vy_t = \mC_t \vx_t.
+  \label{eq:mamba-selective-ssm}
+\end{equation}
+The matrices at time $t$ are functions of the current input or a projection of it. In the
+original Mamba formulation, the continuous-time state matrix itself stays structured, but
+the discretization step size and input/output maps are input-dependent. The effect is still
+that the discrete-time recurrence changes from one step to the next.
+
+This is the meaning of \emph{selection}. The model selects how to write to memory, how
+fast to update, and how to read out, based on the current input.
+
+\section{Why Fixed Convolution Breaks}
+
+For an LTI SSM, we can unroll the recurrence into a single kernel:
+\[
+  \mK_i = \mC\bar{\mA}^i\bar{\mB}.
+\]
+That works only because the parameters are fixed across time.
+
+In Mamba, if the recurrence changes with $t$, then the effect of an old input on the
+current output depends on the whole chain of intermediate updates:
+\[
+  \vy_t
+  \text{ depends on }
+  \bar{\mA}_t \bar{\mA}_{t-1}\cdots \bar{\mA}_{s+1}
+  \bar{\mB}_s \vu_s.
+\]
+There is no single fixed kernel depending only on lag $(t-s)$. The system is no longer
+time invariant. So ordinary convolution mode disappears.
+
+This is the key tradeoff:
+
+\[
+\begin{array}{lll}
+\text{S4/S5} &:& \text{fixed kernel, strong convolution view, no content-based selection}, \\
+\text{Mamba} &:& \text{input-dependent recurrence, no fixed kernel, selective memory}.
+\end{array}
+\]
+
+Mamba gives up one kind of algebraic convenience in exchange for a more flexible temporal
+mechanism.
+
+\section{What Is Being Selected?}
+
+The original Mamba paper introduces selective state spaces by making certain SSM
+components input-dependent, especially:
 
 \begin{itemize}
-  \item Selection as input-dependent SSM parameters.
-  \item Why fixed LTI convolution cannot implement content-based routing.
-  \item Input-dependent $\mB$, $\mC$, and step size $\Delta$.
-  \item Why selectivity breaks ordinary convolution mode.
-  \item Hardware-aware parallel scan.
-  \item The Mamba block: projection, local convolution, selective scan, gating, and output projection.
-  \item Differences between attention, S4/S5, and Mamba for long sequences.
+  \item the step size $\Delta_t$;
+  \item the input matrix or input vector $\mB_t$;
+  \item the output readout $\mC_t$.
 \end{itemize}
 
-\section*{Primary Sources}
-\addcontentsline{toc}{section}{Primary Sources}
+The conceptual effect of each is different.
 
-The main source is \citet{gu2023mamba}. The optional follow-up is Mamba-2 and structured
-state space duality \citep{dao2024mamba2}, which can be introduced after the original
-Mamba chapter is solid.
+\paragraph{Selective step size.}
+If $\Delta_t$ changes with the input, then the effective decay or timescale of memory can
+change at each step. A large step may cause fast update or forgetting. A small step may
+preserve state longer.
 
-\section*{Prepares You For}
-\addcontentsline{toc}{section}{Prepares You For}
+\paragraph{Selective input write-in.}
+If $\mB_t$ changes with the input, the model can decide what kind of information enters the
+state and which modes it excites.
+
+\paragraph{Selective readout.}
+If $\mC_t$ changes with the input, the model can decide which state components matter for
+the current output.
+
+Together, these give the model something LTI SSMs lack:
+\[
+  \text{input-dependent control over memory flow.}
+\]
+
+\section{A Useful Intuition}
+
+Think of S5 as a bank of fixed memory modes. Once the mode spectrum is learned, every time
+step is processed through the same memory mechanism. The input changes the state values,
+but not the update rule itself.
+
+Mamba instead says: the update rule can change at each step. Some inputs can tell the
+model to write aggressively, some to preserve state, some to expose certain modes in the
+output, and some to suppress them.
+
+This is not the same as attention, but it serves a related purpose. Attention performs
+content-based routing through explicit pairwise interactions. Mamba performs a different
+kind of content-based routing through input-conditioned state updates.
+
+\section{The Selective Scan}
+
+At first glance, input-dependent recurrence seems to destroy the efficiency story. If the
+matrices change at every step, are we back to a purely sequential RNN?
+
+Mamba's answer is no. Even though there is no fixed convolution kernel, the recurrence
+still has an associative structure that can be exploited with a scan algorithm. This is
+often called the \emph{selective scan}.
+
+The recurrence at each time step defines an affine map:
+\[
+  F_t(\vx)=\bar{\mA}_t\vx+\vb_t,
+  \qquad
+  \vb_t=\bar{\mB}_t\vu_t.
+\]
+As in Chapter~\ref{ch:s5}, affine-map composition is associative:
+\[
+  (\mA_2,\vb_2)\circ(\mA_1,\vb_1)
+  =
+  (\mA_2\mA_1,\mA_2\vb_1+\vb_2).
+\]
+This means prefix compositions can still be parallelized. The resulting implementation is
+not the same as FFT convolution, but it still scales linearly in sequence length and can
+be hardware-efficient.
+
+\section{Hardware-Aware Design}
+
+The Mamba paper is not only about mathematical recurrence. It is also about GPU-friendly
+implementation. The selective scan is designed so that the recurrence can be evaluated in
+a memory-efficient, fused way rather than through slow generic loops.
+
+This is part of why Mamba matters in practice. A model can have attractive theory and
+still lose on real hardware if its kernels are badly matched to accelerator execution.
+Mamba's engineering contribution is substantial:
+
+\[
+  \text{make selective recurrent computation fast enough to compete in practice.}
+\]
+
+For learning purposes, the important idea is that algorithm design and model design are
+tightly coupled here. Mamba is not ``just S5 with input dependence.'' It is a specific
+input-dependent SSM together with a computation strategy that preserves throughput.
+
+\section{The Mamba Block}
+
+A Mamba block wraps the selective SSM inside a neural-network block. A simplified view is:
+\[
+  \vz
+  \rightarrow
+  \text{input projection}
+  \rightarrow
+  \text{split into branches}
+  \rightarrow
+  \text{local convolution}
+  \rightarrow
+  \text{selective SSM scan}
+  \rightarrow
+  \text{gating}
+  \rightarrow
+  \text{output projection}
+  \rightarrow
+  \text{residual addition}.
+\]
+
+The exact block contains several learned projections. One branch prepares features for the
+selective SSM. Another branch provides a multiplicative gate. There is also a short local
+convolution before the selective scan.
+
+This local convolution matters. It gives Mamba a small amount of explicit local mixing in
+addition to the recurrent state mechanism. The block is therefore not purely ``SSM only.''
+It combines:
+
+\begin{itemize}
+  \item local short-range convolution;
+  \item long-range selective recurrence;
+  \item channel projections and gating.
+\end{itemize}
+
+\section{Why The Local Convolution Is There}
+
+The selective SSM is good at long-range memory, but local pattern extraction is also
+important in sequence data. A short convolution near the input can cheaply capture local
+edges, short motifs, or small-scale temporal structure before the state mechanism handles
+longer-range effects.
+
+This is a common pattern in sequence architectures. Even transformers often include
+positional or local mixing components. Mamba makes this explicit inside the block.
+
+For neural data, this local component is plausible. Utah-array sequences often contain
+short-timescale temporal structure that may be easier to capture with local filters before
+or alongside longer dynamical memory.
+
+\section{Gating And Feature Control}
+
+The multiplicative gate in a Mamba block plays a role analogous to gating mechanisms in
+other architectures: it lets the block modulate how much of the temporally mixed signal is
+passed forward.
+
+At a high level:
+\[
+  \text{output} \approx \text{gate} \odot \text{selective-SSM-output}.
+\]
+This is not the full formula, but it captures the intent. The gate helps control feature
+flow and increases expressive power without abandoning the efficient recurrent structure.
+
+\section{Mamba Versus Attention}
+
+The cleanest comparison is functional rather than ideological.
+
+\paragraph{Attention.}
+Attention gives direct pairwise access from one position to another. The weight from $t$ to
+$s$ is content-dependent and can vary arbitrarily across pairs. This is very flexible, but
+causal self-attention over long sequences is memory-intensive.
+
+\paragraph{Mamba.}
+Mamba does not create arbitrary pairwise interactions. It processes the sequence through a
+state. The current input influences how the state is updated and read. This is less
+flexible than arbitrary attention, but much cheaper in long-sequence scaling and naturally
+online.
+
+So Mamba is best thought of as:
+\[
+  \text{more selective than S4/S5, less pairwise explicit than attention.}
+\]
+
+\section{Mamba Versus S4 And S5}
+
+Relative to S4 and S5, Mamba changes the computational center of gravity.
+
+\[
+\begin{array}{lll}
+\text{S4} &:& \text{structured LTI SSM, convolution-heavy viewpoint}, \\
+\text{S5} &:& \text{diagonal LTI SSM, scan-friendly recurrence viewpoint}, \\
+\text{Mamba} &:& \text{selective SSM, input-dependent scan viewpoint}.
+\end{array}
+\]
+
+S4 and S5 are easiest to analyze as kernels or fixed modes. Mamba is easier to analyze as
+a learned, gated, input-conditioned recurrent system. Once selectivity is introduced, the
+static kernel picture is no longer the right primary mental model.
+
+\section{Why Mamba Can Handle Content Better}
+
+Consider a simple language-style example. If the current token signals the start of a new
+entity, the model might want to preserve certain information for a long time. If the token
+signals a boundary or reset, it might want to forget. Attention can do this through
+content-based weights. Mamba can do it by changing the recurrence parameters.
+
+For time series, the analogue is:
+
+\begin{itemize}
+  \item some inputs indicate meaningful events worth remembering;
+  \item some inputs indicate nuisance fluctuations worth down-weighting;
+  \item some inputs suggest the model should read out one timescale more strongly than
+  another.
+\end{itemize}
+
+This is the practical meaning of selectivity. The model is not just integrating signal
+with a fixed filter. It is deciding how to process the signal based on its content.
+
+\section{Limitations Of Mamba}
+
+Mamba is powerful, but it also brings tradeoffs.
+
+\paragraph{Harder theory than LTI SSMs.}
+With fixed kernels, it is easy to inspect modes, impulse responses, and transfer functions.
+With input-dependent dynamics, analysis is less clean.
+
+\paragraph{Less direct interpretability.}
+A fixed diagonal SSM can be described as a bank of modes. A selective SSM changes its
+behavior from one step to the next, which is harder to summarize.
+
+\paragraph{Still not full attention.}
+Mamba introduces selectivity, but it does not explicitly compute arbitrary pairwise
+token-token interactions. There are tasks where full attention may still be a better fit.
+
+\paragraph{Objective dependence remains.}
+As with S5, a strong backbone does not rescue a badly chosen SSL objective. The model may
+still learn shortcuts if the pretraining task allows them.
+
+\section{Where Mamba Fits In The Story}
+
+Mamba is best understood as the next step after S4 and S5:
+
+\begin{enumerate}
+  \item RNNs gave recurrent state but poor parallelism.
+  \item CNNs gave parallel filters but fixed local kernels.
+  \item S4 and S5 gave long-range structured recurrent filters with efficient training.
+  \item Mamba added content-dependent selectivity while preserving linear-time scan-style
+  computation.
+\end{enumerate}
+
+That is why Mamba became so influential. It offered a plausible answer to the criticism
+that LTI SSMs are too rigid, while keeping the efficient state-space deployment story.
+
+\section{A Brief Note On Mamba-2}
+
+The follow-up work often called Mamba-2 or structured state space duality
+\citep{dao2024mamba2} pushes the theory further. It strengthens the connection between
+SSMs and attention-like sequence modeling and refines the computational picture.
+
+For a first pass, however, the original Mamba paper is enough. The main conceptual gain is
+already there:
+\[
+  \text{state-space sequence modeling can be selective, not just fixed and linear time invariant.}
+\]
+
+\section{What To Remember}
+
+\begin{itemize}
+  \item Mamba is a selective state space model.
+  \item It introduces input-dependent recurrence parameters, especially in step size and
+  input/output mappings.
+  \item Because the dynamics depend on the input, there is no single fixed convolution
+  kernel.
+  \item Mamba therefore relies on selective scan rather than ordinary convolution mode.
+  \item The Mamba block combines local convolution, selective recurrence, gating, and
+  channel projection.
+  \item Mamba sits between LTI SSMs and attention: more content-aware than S4/S5, less
+  explicitly pairwise than self-attention.
+  \item Its practical importance is as much about efficient implementation as about model
+  equations.
+\end{itemize}
+
+\section{Exercises}
+
+\begin{enumerate}
+  \item Explain why input-dependent $\bar{\mA}_t$ destroys the existence of a fixed kernel
+  depending only on lag.
+  \item Compare the kind of content dependence used by attention with the kind used by
+  Mamba.
+  \item Why is associative scan still possible even when the recurrence changes with time?
+  \item In your own words, what modeling role is played by the local convolution inside a
+  Mamba block?
+  \item Why might Mamba be especially appealing for long sequences that still need
+  content-sensitive memory updates?
+\end{enumerate}
+
+\section{Prepares You For}
 
 The final comparison chapter places Mamba alongside CNNs, RNNs, transformers, S4, and S5,
 with special attention to Utah array self-supervised learning.

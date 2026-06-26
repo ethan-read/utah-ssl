@@ -359,7 +359,13 @@ class CanonicalShardAccessor:
             self._shards[key] = cached
         return cached
 
-    def load_features(self, row: CanonicalProbeManifestRow, *, feature_mode: str) -> np.ndarray:
+    def load_features(
+        self,
+        row: CanonicalProbeManifestRow,
+        *,
+        feature_mode: str,
+        area6v_feature_dim: int | None = None,
+    ) -> np.ndarray:
         shard = self._get_shard(row)
         time_offsets = shard["time_offsets"]
         assert time_offsets is not None
@@ -370,9 +376,25 @@ class CanonicalShardAccessor:
         tx = shard["tx"]
         sbp = shard["sbp"]
         if tx is not None:
-            parts.append(np.asarray(tx[start:stop], dtype=np.float32))
+            tx_part = np.asarray(tx[start:stop], dtype=np.float32)
+            if area6v_feature_dim is not None:
+                if int(tx_part.shape[1]) < int(area6v_feature_dim):
+                    raise ValueError(
+                        f"Row {row.example_id} requested area6v_feature_dim={int(area6v_feature_dim)} "
+                        f"but tx width is only {int(tx_part.shape[1])}."
+                    )
+                tx_part = tx_part[:, : int(area6v_feature_dim)]
+            parts.append(tx_part)
         if feature_mode == "tx_sbp" and sbp is not None:
-            parts.append(np.asarray(sbp[start:stop], dtype=np.float32))
+            sbp_part = np.asarray(sbp[start:stop], dtype=np.float32)
+            if area6v_feature_dim is not None:
+                if int(sbp_part.shape[1]) < int(area6v_feature_dim):
+                    raise ValueError(
+                        f"Row {row.example_id} requested area6v_feature_dim={int(area6v_feature_dim)} "
+                        f"but sbp width is only {int(sbp_part.shape[1])}."
+                    )
+                sbp_part = sbp_part[:, : int(area6v_feature_dim)]
+            parts.append(sbp_part)
         if not parts:
             raise ValueError(
                 f"Shard {row.shard_relpath} does not contain features for feature_mode={feature_mode!r}"
@@ -686,6 +708,7 @@ def compute_feature_stats(
     cache_root: Path,
     mode: str,
     feature_mode: str,
+    area6v_feature_dim: int | None = None,
 ) -> dict[str, tuple[np.ndarray, np.ndarray]] | tuple[np.ndarray, np.ndarray]:
     accessor = CanonicalShardAccessor(cache_root)
     try:
@@ -694,7 +717,11 @@ def compute_feature_stats(
             sum_x = None
             sum_x2 = None
             for row in rows:
-                x = accessor.load_features(row, feature_mode=feature_mode)
+                x = accessor.load_features(
+                    row,
+                    feature_mode=feature_mode,
+                    area6v_feature_dim=area6v_feature_dim,
+                )
                 x64 = x.astype(np.float64, copy=False)
                 if sum_x is None:
                     sum_x = x64.sum(axis=0)
@@ -720,6 +747,7 @@ def compute_feature_stats(
                     cache_root=cache_root,
                     mode="global",
                     feature_mode=feature_mode,
+                    area6v_feature_dim=area6v_feature_dim,
                 )  # type: ignore[arg-type]
                 for session_id, session_rows in grouped.items()
             }
@@ -768,6 +796,8 @@ class CanonicalSequenceDataset(torch.utils.data.Dataset):
         boundary_key_mode: str = "session",
         dataset: str = "brain2text25",
         input_tail_bins: int | None = None,
+        pad_feature_dim_to: int | None = None,
+        area6v_feature_dim: int | None = None,
     ) -> None:
         self.rows = list(rows)
         self.stats = stats
@@ -775,6 +805,8 @@ class CanonicalSequenceDataset(torch.utils.data.Dataset):
         self.boundary_key_mode = str(boundary_key_mode)
         self.dataset = str(dataset)
         self.input_tail_bins = int(input_tail_bins) if input_tail_bins is not None else None
+        self.pad_feature_dim_to = int(pad_feature_dim_to) if pad_feature_dim_to is not None else None
+        self.area6v_feature_dim = int(area6v_feature_dim) if area6v_feature_dim is not None else None
         self._accessor = CanonicalShardAccessor(cache_root)
 
     def __len__(self) -> int:
@@ -782,11 +814,25 @@ class CanonicalSequenceDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
         row = self.rows[idx]
-        x = self._accessor.load_features(row, feature_mode=self.feature_mode)
+        x = self._accessor.load_features(
+            row,
+            feature_mode=self.feature_mode,
+            area6v_feature_dim=self.area6v_feature_dim,
+        )
         if self.stats is not None:
             x = apply_feature_stats(x, row=row, stats=self.stats)
         else:
             x = np.array(x, dtype=np.float32, copy=True)
+        if self.pad_feature_dim_to is not None:
+            target_dim = int(self.pad_feature_dim_to)
+            if int(x.shape[1]) > target_dim:
+                raise ValueError(
+                    f"Example {row.example_id} has feature dim {int(x.shape[1])}, "
+                    f"which exceeds requested padded dim {target_dim}."
+                )
+            if int(x.shape[1]) < target_dim:
+                pad = np.zeros((int(x.shape[0]), target_dim - int(x.shape[1])), dtype=np.float32)
+                x = np.concatenate([x, pad], axis=1)
         if self.input_tail_bins is not None and x.shape[0] > self.input_tail_bins:
             x = x[-self.input_tail_bins :, :]
         labels = self._accessor.load_labels(row)

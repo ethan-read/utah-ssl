@@ -1,0 +1,1763 @@
+Implicit Behavioral Decoding from Next-Step
+Spike Forecasts at Population Scale
+
+arXiv:2605.12999v1 [q-bio.NC] 13 May 2026
+
+John R. Minnick1,2,* , Jesus Gonzalez-Ferrer2,3 , Kamran Hussain4 ,
+Jinghui Geng2,5 , Ash Robbins1,2 , Mohammed A. Mostajo-Radji2 ,
+David Haussler2,3 , Jason Eshraghian1 , Mircea Teodorescu1,2,3
+1 Department of Electrical and Computer Engineering, University of California, Santa Cruz, CA, USA
+2 UC Santa Cruz Genomics Institute, University of California, Santa Cruz, CA, USA
+3 Department of Biomolecular Engineering, University of California, Santa Cruz, CA, USA
+4 Department of Applied Mathematics, University of California, Santa Cruz, CA, USA
+5 Department of Computer Science and Engineering, University of California, Santa Cruz, CA, USA
+
+Abstract
+Closed-loop brain–computer interfaces often require both a forecast of upcoming
+neural population activity and a readout of the animal’s behavioral state. A single
+Mamba forecaster, trained only on next-step spike counts at Neuropixels scale, can
+deliver both in one forward pass. A lightweight per-session linear head reading
+the model’s predicted rates decodes behavior better than the same linear classifier
+reading the raw spike counts, under matched temporal context. We test on the
+Steinmetz visual-discrimination benchmark, which spans 39 sessions, roughly
+27,000 neurons, and 1,994 held-out trials. Across three training seeds, Mamba’s
+predicted rates decode mouse choice at 75.7±0.2% trial vote, roughly 2.3 times
+chance level, and stimulus side at 66.1±0.6%, about twice chance. Compared to a
+matched 500 ms-context linear decoder on the raw spike counts, Mamba wins at trial
+vote by 4–6 pp on response and 4–6 pp on stimulus side. A session-start calibration
+block of about 100–150 trials brings the readout within 1–2 pp of asymptote, and
+the full pipeline fits inside the 50 ms bin budget on workstation-class GPUs typical
+of tethered chronic Neuropixels recordings.
+
+1
+
+Introduction
+
+Many closed-loop brain–computer interfaces (BCIs) benefit from two capabilities running over each
+incoming time bin of neural activity: forecasting population dynamics a few tens of milliseconds
+ahead, so downstream control can anticipate state transitions, and decoding the subject’s current
+behavioral state, so the stimulation policy can respond to intent. Neuropixels probes can record
+> 1,000 simultaneous neurons, making both capabilities high-dimensional; running one deep model
+for forecasting and a separate one for behavioral decoding would double the compute and memory
+requirements an implanted device must carry. We ask whether a single sequence model can do both
+at once.
+We find a useful property of modern spike-count forecasters: because the model’s training objective
+(next-step Poisson rate prediction) forces it to integrate population activity over a history window,
+its continuous-valued rate outputs serve as a behaviorally informative compression of the recent
+population state. Those predicted rates, at no additional inference cost, carry more behavioral
+information than the raw single-bin spike counts a standard linear decoder would read from. The
+* Correspondence: jrminnic@ucsc.edu
+
+Preprint.
+
+forecast also beats a matched 500 ms-context linear decoder on the raw spike counts at trial vote, on
+response and stimulus side. This is evidence that the forecaster is capturing behaviorally meaningful
+population dynamics, not just smoothing noise. A single linear readout over the forecaster’s output
+therefore replaces a separate, dedicated decoding network.
+We close this gap by reading behavior off the predicted rates of a single Mamba spike forecaster trained
+only to predict next-step population firing rates: a lightweight per-session linear head over the model’s
+continuous-valued rate outputs recovers the animal’s behavior, and against a matched-context (500 ms)
+linear decoder on the raw spike counts the model was trained on, the forecast wins on response and
+stimulus side. Behavior decodes implicitly from spike forecasts, even though the forecaster was never
+trained on a behavioral label. Our contributions:
+1. Behavior decodes implicitly from Mamba spike-rate forecasts under matched context (§4.2,
+Fig. 3). A Mamba forecaster trained only on spike counts produces predicted rates that decode
+mouse choice at 75.7±0.2% trial-vote (3-class; 2.3× chance, 3-seed mean±SEM) and stimulus
+side at 66.1±0.6% trial-vote (3-class; 2.0× chance). Against a matched-context (500 ms) linear
+decoder on raw spike counts, Mamba wins at trial vote by +4–6 pp on response and +4–6 pp on
+stimulus side. The effect generalizes to Transformer/LRU/NDT2-style architecture controls within
+∼1–3 pp on every target (Appendix B).
+2. A practitioner budget for closed-loop deployment (§4.3, §4.4, Appendix D). A session-start
+calibration block of ∼100–150 trials brings the per-session linear readout within 1–2 pp of its
+asymptotic accuracy on this task family. Mamba inference plus the per-session linear head fits
+comfortably inside the 50 ms bin budget on the workstation-class external compute tier typical of
+tethered chronic Neuropixels recordings.
+
+2
+
+Related work
+
+Neural population modeling. A long line of work models cortical population activity through
+recurrent dynamical systems. Task-trained RNN models of prefrontal cortex [Mante et al., 2013]
+established that low-dimensional recurrent dynamics can recapitulate context-dependent decision
+computations from population recordings, motivating sequence models as substrates for population
+activity. Switching state-space models such as rSLDS [Linderman et al., 2017] fit interpretable
+discrete-regime dynamics directly to spike trains. LFADS [Pandarinath et al., 2018] infers latent
+dynamics via sequential VAEs but targets smoothed firing rates, not causal forecasting. NDT [Ye
+and Pandarinath, 2021] and NDT2 [Ye et al., 2023] apply masked attention for behavioral decoding
+and multi-session pretraining respectively. POYO [Azabou et al., 2023] pretrains a unified decoder
+across many sessions and laboratories. NEDS [Zhang et al., 2025] extends this line to joint Poisson
+spike-rate encoding and behavioral decoding at scale and is the closest neighbor to our setup, sharing
+the Poisson-rate forecasting objective; we differ in asking whether the predicted rates beat raw spike
+counts at matched 500 ms temporal context as a behavioral readout. CEBRA [Schneider et al., 2023]
+learns structured embeddings but does not produce spike-level predictions. None of these evaluate
+the behavioral-decoding gain of the model’s predicted rates against a matched-temporal-context
+raw-count baseline as we do.
+Spike prediction. Per-neuron GLMs [Pillow et al., 2008] provide interpretable baselines but lack
+population context. Population-level SSMs [Duncker and Sahani, 2018, Linderman et al., 2017]
+model latent dynamics but not individual neuron spike counts. Autoregressive rate models (Mamba,
+LRU) achieve the best forecasting accuracy but are GPU-bound.
+Behavioral decoding from spikes. Standard practice fits a per-session linear (or shallow nonlinear)
+decoder directly to short windows of raw spike counts to recover choice or stimulus identity [Steinmetz
+et al., 2019, IBL et al., 2025]. Our matched-context baselines (1-bin LR, 𝐻=10 sum LR, 𝐻=10
+flat ridge) are the strongest such linear readouts on identical features and serve as the reference our
+forecaster-based decoder must beat to claim a forecaster-specific decoding gain.
+
+3
+
+Methods
+
+Figure 1 summarizes the pipeline; the following subsections detail each stage.
+2
+
+Figure 1: Architecture and processing pipeline. Spike-sorted Neuropixels recordings (𝑀 neurons,
+50 ms bins) are windowed into a history matrix 𝑋𝑡 ∈ R 𝑀 ×𝐻 (𝐻=10 bins, 500 ms context). A
+Mamba selective state-space model (inset: per-step recurrence ℎ𝑡 = 𝐴¯ ℎ𝑡 −1 + 𝐵¯ 𝑥 𝑡 , 𝑦 𝑡 = 𝐶 ℎ𝑡 )
+maps 𝑋𝑡 to predicted next-bin firing rates 𝜆ˆ 𝑡+1 ∈ R 𝑀 . A per-session multinomial linear readout
+𝑦ˆ = softmax(𝑊 𝜆ˆ + 𝑏) decodes mouse response and stimulus side (3-class each); the same rates are
+also delivered directly as a population-rate forecast, with no readout step. Mamba is trained only on
+next-step Poisson NLL on spike counts; behavioral labels are never used during forecaster training.
+
+3.1
+
+Task formulation
+
+Given a sliding window of 𝐻 population spike-count vectors, predict the next time bin:
+𝑀
+𝑋𝑡 = {x(𝑡−𝐻+1), . . . , x(𝑡)} −→ ˆ𝝀(𝑡+1) ∈ R>0
+,
+
+x(𝑡) ∈ Z 𝑀
+≥0
+
+(1)
+
+where 𝑀 is the number of simultaneously recorded neurons (up to 1,998), Δ𝑡 = 50 ms, and 𝐻 = 10
+bins (500 ms context). The model outputs predicted firing rates 𝜆ˆ 𝑖 > 0 via softplus activation, trained
+with Poisson negative log-likelihood. Only spike history is used as input; stimulus features are
+unavailable at BCI inference time.
+3.2
+
+Architectures
+
+Our forecaster is Mamba [Gu and Dao, 2023], a selective state-space model whose causal recurrence
+and content-aware gating make it well-matched to spike-count autoregression on long session-length
+sequences. Multi-session training pads to 𝑀max =1,998 neurons with a per-sample channel mask; the
+Poisson NLL loss operates only on real (unmasked) channels; per-session specialization is recovered
+by the post-hoc linear readout (§3.3). We additionally test whether a per-session input embedding
+closes the per-neuron 𝑟 gap (Appendix C) and find it does not. To verify the matched-context
+decoding gain is not a Mamba-specific artifact we also train Transformer (causal self-attention), LRU
+(linear recurrent unit), and an NDT2-style bidirectional masked-attention variant as architecture and
+objective controls; all share the same input pipeline, Poisson NLL loss, and training schedule, with
+full architecture details and behavioral-decoding numbers in Appendix B and hyperparameters in
+Appendix A.
+3.3
+
+Behavioral decoding evaluation
+
+We evaluate behavioral decodability post-hoc: each trained forecaster’s predicted rates serve as
+features for a per-session multinomial logistic-regression classifier over three targets (response 3-class,
+stimulus contrast 16-class, stimulus side 3-class). Trials are split with a 20% trial-level holdout
+3
+
+(seed 42), so that the readout never trains on and evaluates the same trial. No behavioral labels enter
+forecaster training; behavioral information in the predicted rates is therefore an emergent property
+of the forecasting objective, not the result of supervised behavioral pretraining. The same protocol
+applies to the matched-context raw baselines in §4.2, isolating the contribution of the forecasting
+objective.
+3.4
+
+Datasets and baseline architectures
+
+We use a cross-laboratory substrate combining Steinmetz 2019 [Steinmetz et al., 2019] (39 sessions,
+∼27K neurons) and the IBL Repeated Site release [IBL et al., 2025] (66 sessions, ∼63K neurons),
+giving 105 sessions and 89,768 real channels across 42 Allen CCF regions, padded to 𝑀max =1,998 for
+cross-session batching. Headline behavioral results are reported on Steinmetz 39 with a 3-seed Mamba
+ensemble (§4.2); cross-laboratory extension to the 66 IBL sessions appears in §4.2 (closing paragraph)
+and Appendix F. Trained forecasters: Mamba (selective SSM, 1.95M parameters), Transformer
+(causal attention, 2.22M), LRU (linear recurrent unit, 1.23M), and an NDT2-style bidirectionalmasked-attention variant matched in size to the Transformer. All share the same input pipeline,
+Poisson NLL, AdamW with cosine LR + warmup, 50 epochs, seed 42, and the same per-session
+temporal 70/15/15% train/val/test split (full hyperparameters in Appendix A). Behavioral evaluation
+uses a separate trial-level 20% holdout (seed 42).
+
+4
+
+Results
+
+4.1
+
+Forecaster checkpoints we use
+
+Fig. 2 illustrates the prediction substrate at four scales (25 Steinmetz sessions, one expanded session,
+a spike-level zoom, and a population-rate temporal-alignment quantification on the same session).
+Mamba’s forecasts on combined-105 achieve per-neuron Pearson 𝑟 = 0.176, population-rate 𝑟 = 0.783,
+and population-cosine 0.648: per-neuron predictions are noisy at 50 ms bins (single-neuron Poisson
+noise dominates) but population-level structure is reliably captured. The depth ablation, crosslaboratory scaling, and synthetic-spike-train validation that produced these checkpoints are in the
+companion submission.
+4.2
+
+Behavioral decodability under matched-context baselines
+
+We ask: from Mamba’s predicted rates at each held-out trial bin, how well can a downstream linear
+classifier recover the trial’s behavioral variables (response choice, stimulus contrast pair, stimulus
+side)? Mamba is trained as a forecast-only model and never sees a behavioral label at training time;
+behavioral information in the predicted rates is therefore an emergent property of the forecasting
+objective, not the result of supervised behavioral pretraining. At evaluation time, we hold out 20%
+of unique trials per session, fit a per-session multinomial logistic regression on Mamba’s predicted
+rates over the remaining 80%, and evaluate on the held-out trial bins. Identical splits and evaluation
+protocol are used for the matched-context raw-count baselines and for the architecture-control rows in
+Appendix B.
+Three non-forecasting reference baselines. Forecasters ingest a 10-bin (500 ms) history before
+producing a rate prediction. To prevent the temporal-context advantage from being attributed to the
+forecasting objective, we report three non-forecasting linear baselines. Linear / 1-bin raw counts
+reads a single 50 ms count vector at the trial bin (the original single-bin baseline). Linear / H=10
+raw counts (sum) sums the past 10 bins of raw counts and reads that 𝑀-dim vector with the same
+multinomial logistic regression: same temporal context window as the forecasters, same feature
+dimensionality as the forecaster’s output, and the cleanest comparison. Ridge / H=10 raw counts
+(flat) flattens the past 10 bins (𝑀·𝐻 ≈ 12,000 features) and uses ridge classification (closed-form L2
+linear classifier, since iterative LR solvers do not scale at this dimensionality on per-session train
+sets); this gives the linear classifier strictly more capacity than the forecaster and serves as a stress test
+of the matched-context decoding-gain claim.
+Mamba’s predicted rates carry behavioral information beyond matched-context baselines (on
+response and stimulus side, at trial vote). Comparing Mamba against the matched-context (H=10)
+raw baselines isolates the contribution of the forecasting objective from raw temporal integration
+4
+
+a.
+
+Recorded
+
+b.
+
+Recorded
+
+Recorded
+
+0
+
+Mamba forecast
+
+Recorded
+
+Mamba forecast
+
+200
+300
+400
+
+Mamba forecast
+
+Recorded
+
+Recorded
+
+0
+
+100
+
+Mamba forecast
+
+Mamba forecast
+
+10
+20
+30
+40
+
+500
+
+0
+
+5
+
+10
+
+Time (s)
+
+0
+
+5
+
+10
+
+3.8
+
+150
+
+100
+
+100
+
+50
+
+50
+
+0
+50
+
+100
+
+Population rate
+
+200
+
+300
+
+Population rate
+
+150
+
+Euclidean dist.
+
+250
+
+5.8 3.8
+
+4.8
+
+Time (s)
+
+e.
+
+0
+
+4.8
+
+Time (s)
+
+d.
+Time, Mamba forecast (bins)
+
+Recorded
+
+c.
+
+Mamba forecast
+
+Neurons 275–324
+
+Neurons (probe depth)
+
+Mamba forecast
+
+300
+
+5.8
+
+Time (s)
+
+Naive (bin-to-bin) MAE = 20.3 spikes/bin
+Recorded
+
+Mamba forecast
+
+200
+100
+
+DTW-aligned avg error = 11.9 spikes/bin (41% reduction)
+200
+100
+
+150
+
+0
+
+Time, recorded (bins)
+
+25
+
+50
+
+75
+
+100
+
+125
+
+150
+
+175
+
+200
+
+Time (50 ms bins)
+
+Figure 2: The prediction substrate our matched-context analysis reads from (Mamba forecaster,
+Steinmetz 39). (a) 5×5 grid of session pairs (ground truth vs. Mamba prediction, neurons sorted by
+physical probe depth) showing the 25 sessions with highest mean per-neuron Pearson 𝑟 out of the
+39-session benchmark (the highlighted session is promoted to position (2, 1) for the projection in (b)).
+(b) The expanded session is the one with the highest mean per-neuron 𝑟 across the dataset (session 10,
+¯𝑟=0.20; ∼10 s, full probe). (c) The 50-neuron, 2-second zoom is the contiguous (neurons × time)
+sub-rectangle of (b) with the highest local cosine similarity between recorded and predicted spike
+counts: a depth-band-resolved view of where Mamba’s forecast tracks the population activity most
+closely. (d) Dynamic Time Warping (DTW) pairwise distance matrix for the same session: optimal
+warping path in white over the Euclidean cost heatmap, naive bin-to-bin diagonal in dashed grey,
+marginal traces show the population-rate time series (recorded blue, Mamba forecast vermillion).
+(e) Top: naive bin-to-bin overlay of the two population-rate traces from (d) (MAE 20.3 spikes/bin).
+Bottom: the same overlay with grey lines visualising the DTW realignment, which reduces the
+average error to 11.9 spikes/bin (a 41% reduction). Per-neuron 𝑟 at fixed 50 ms bins is modest in
+absolute terms (𝑟=0.18); the matched-context behavioral decoding result in §4.2 reads from these
+rates without re-training the forecaster, and the DTW analysis confirms the predicted population
+rates are temporally well-aligned with ground truth at the 500 ms readout-window scale even when
+bin-locked Pearson 𝑟 underestimates fidelity (cross-session generalisation in Appendix E).
+
+(Table 1, Fig. 3). On response (motor choice), Mamba reaches 75.7±0.2% trial-vote (3-seed
+mean±SEM) vs. 69.6–71.3% for the matched-context raw baselines (+4–6 pp; +3.5 pp vs. the 72.1%
+1-bin LR); at the bin level the gain holds (Mamba 59.3 vs. raw 54.1–57.6). On stimulus side (3-class),
+Mamba reaches 66.1±0.6% trial-vote, exceeding the matched-context baselines (60.5% sum, 61.5%
+flat) by +4–6 pp; at the bin level Mamba (51.9±0.1%) also beats all raw baselines (47.1–49.1%) by
+∼3–5 pp. The flat ridge baseline, despite ten times the feature dimensionality, does not close either
+5
+
+Behavioral decodability from Mamba's predicted rates vs. matched-context raw counts (Steinmetz 39 sessions, 1,994 held-out trials)
+
+0.0
+
+0.2
+
+0.4
+
+0.6
+
+0.0
+
+0.2
+
+0.2
+
+0.6
+
+0.0
+
+0.2
+
+0.4
+
+0.6
+
+0.8
+
+0.4
+
+0.6
+
+Stim side 3-class
+(trial vote)
+
+chance
+
+chance
+
+0.0
+
+0.4
+
+Stimulus 16-class
+(trial vote)
+
+chance
+
+Response 3-class
+(trial vote)
+Linear / 1-bin raw counts
+Linear / H=10 raw (sum)
+Ridge / H=10 raw (flat)
+Mamba (s42)
+Mamba (s1)
+Mamba (s2)
+Transformer (s42)
+Transformer (s1)
+Transformer (s2)
+LRU (s42)
+LRU (s1)
+LRU (s2)
+NDT2-style (bidir+mask)
+
+Stim side 3-class
+(bin)
+
+chance
+
+chance
+
+Linear / 1-bin raw counts
+Linear / H=10 raw (sum)
+Ridge / H=10 raw (flat)
+Mamba (s42)
+Mamba (s1)
+Mamba (s2)
+Transformer (s42)
+Transformer (s1)
+Transformer (s2)
+LRU (s42)
+LRU (s1)
+LRU (s2)
+NDT2-style (bidir+mask)
+
+Stimulus 16-class
+(bin)
+
+chance
+
+Response 3-class
+(bin)
+
+0.0
+
+0.2
+
+Accuracy
+
+0.4
+
+0.6
+
+0.8
+
+0.0
+
+0.2
+
+Accuracy
+
+0.4
+
+0.6
+
+0.8
+
+Accuracy
+
+Figure 3: Behavioral decodability from Mamba’s predicted rates vs. matched-context raw
+counts (Steinmetz 39 sessions, 1,994 held-out trials, 20% trial-level holdout, 3 training seeds). Each
+row is a downstream linear decoder operating on a different feature set: raw spike counts in three
+context windows (1 bin, 𝐻=10 summed, 𝐻=10 flattened), or Mamba’s predicted rates (3 seeds).
+Top: bin-level accuracy with 95% bootstrap CI; bottom: trial-level majority vote. Dotted line =
+chance. Mamba’s rates decode response and stimulus side better than both matched-context raw
+baselines. Note: 16-class contrast top-1 numbers reported here sit on a 26% no-stim (0, 0) class
+prior; under class-balanced training the matched-context Mamba gain reduces from +2–3 pp top-1 to
++1.9 pp balanced accuracy (Appendix G). The headline gains reported in the abstract and conclusion
+are therefore the response and stimulus-side numbers, which are not affected by class imbalance.
+Transformer, LRU, and NDT2-style architecture-control replications appear in Appendix B.
+Table 1: Behavioral decoding accuracy from Mamba’s predicted rates vs. matched-context raw-count
+baselines (Steinmetz 39 sessions, 1,994 held-out trials, 95% bootstrap CIs at the bin level; 3-seed
+mean±SEM at trial vote). Mamba beats all three baselines on response and stimulus side (+4–6 pp
+gain at trial vote each); the 16-class contrast row is not headlined as its top-1 numbers sit on a 26%
+no-stim class prior (see Appendix G for prior-corrected metrics). Architecture controls (Transformer,
+LRU, NDT2-style) in Appendix B.
+Bin-level (95% CI)
+
+Trial-level majority vote
+
+Decoder input
+
+Resp. 3
+
+Stim. 16
+
+Side 3
+
+Resp. 3
+
+Stim. 16
+
+Side 3
+
+Linear / 1 bin
+Linear / 𝐻=10 sum
+Ridge / 𝐻=10 flat
+
+57.6
+55.5
+54.1
+
+26.2
+28.6
+28.3
+
+47.1
+49.1
+48.2
+
+72.1
+69.6
+71.3
+
+34.7
+35.5
+35.1
+
+49.8
+60.5
+61.5
+
+59.3±0.0
+
+27.9±0.1
+
+51.9±0.1
+
+75.7±0.2
+
+37.6±0.3
+
+66.1±0.6
+
+33.3
+
+6.25
+
+33.3
+
+33.3
+
+6.25
+
+33.3
+
+Mamba (3-seed mean±SEM)
+Chance
+
+gap. Earlier reporting that the side-decoding gain “did not survive matched-context comparison”
+was an artifact of how side accuracy was computed for the forecaster (post-hoc map from a 16-class
+stimulus-contrast classifier, vs. the raw baselines that always trained a direct 3-class side classifier);
+evaluating both with a direct 3-class side classifier restores the apples-to-apples comparison.
+The 16-class stimulus contrast row in Tab. 1 shows Mamba (37.6±0.3% trial-vote) ahead of the
+matched-context baselines (35.1–35.5%) by 2–3 pp top-1, but those numbers sit on a 26% no-stim
+(0, 0) class prior; an always-predict-(0, 0) classifier already reaches 26.1%. Under class-balanced
+training the matched-context Mamba gain reduces to +1.9 pp balanced accuracy and +2.6 pp on
+non-(0, 0) trials only (Appendix G). The matched-context claim on the 16-class target therefore holds,
+just at smaller magnitude than the default-training top-1 number suggests; we accordingly do not
+6
+
+headline 16-class accuracy and lead with response and side. The matched-context decoding gain is
+not Mamba-specific: Transformer, LRU, and an NDT2-style bidirectional masked-attention variant
+reproduce the response and side gains within ∼1–3 pp of Mamba (Appendix B).
+Robustness. Mamba response trial-vote is 75.7±0.2% (SEM across 3 seeds), far below the +4–6 pp
+gain over matched-context baselines; the architecture-control replication (Transformer/LRU within
+1 pp of Mamba, NDT2-style ∼3 pp below) is summarized in Appendix B.
+Cross-laboratory extension to IBL Repeated Site. The 39 Steinmetz sessions used in Table 1 cover
+one laboratory and one task variant; we asked whether the matched-context gain replicates on a second
+cohort. We re-ran the behavioral-decoding pipeline on the 66 IBL Repeated Site sessions [IBL et al.,
+2025] (7,651 held-out trials), using predicted rates from a single-seed Mamba trained on the combined
+Steinmetz+IBL substrate (105 sessions, 𝑀max =1,998, matching the spike-forecasting benchmark
+substrate). The matched-context (H=10 sum) raw-count baseline is fit on the same held-out trials
+per session. The resulting gains are mixed: at trial vote, Mamba reaches 85.1% on response, 59.8%
+on 16-class contrast, and 69.2% on stimulus side, vs. 85.2%/59.9%/67.1% for the matched-context
+baseline, a +2.1 pp gain on stimulus side but essentially no matched-context gain on response or
+contrast (Appendix F). The same single-seed combined-105 Mamba on the 39 Steinmetz sessions still
+shows the expected gains over the H=10 sum baseline (resp +4.5 pp, contrast +1.0 pp, side +3.8 pp at
+trial vote, vs. canonical 3-seed Steinmetz gains of +6/+2/+4–6 pp), so the IBL erosion is not solely
+a single-seed artifact: under the IBL task structure (binary forced-choice, no no-go) and longer
+trial-active bin counts, the H=10 sum baseline absorbs more of the response/contrast information that
+Mamba’s predicted rates carry. The matched-context gain on stimulus side is the component that
+survives across both laboratories.
+4.3
+
+Trials needed to calibrate the per-session readout
+
+Sweeping the per-session linear-readout fitting set from 5% to 80% of trial-active bins (fixed 20%
+trial-level holdout, 5 random training-subset draws per fraction) on Mamba’s predicted rates, trial-vote
+response reaches within ∼1 pp of the asymptotic 77% with a median of ∼120 training trials per session;
+16-class contrast asymptotes more slowly (∼160+ trials), and stimulus side at ∼140. A session-start
+calibration block of ∼100–150 trials therefore brings a deployed BCI close to its asymptotic decoding
+accuracy on this task family (Fig. 5, Appendix D).
+4.4
+
+Deployment scenario: latency budget and pipeline shape
+
+The matched-context behavioral-decoding result (§4.2) plus the calibration sweep (§4.3) describe a
+concrete closed-loop BCI:
+1. Forecaster. A single Mamba checkpoint trained once on the combined-105 substrate, held fixed at
+deployment. Per-session latency: a single 50 ms-bin Mamba forward pass over 𝐻=10 history bins
+(≤6.4 ms per batch of 512 windows on a single NVIDIA RTX 5000 Ada at 𝑀=1,240 neurons,
+152 MB peak VRAM; benchmark methodology in Appendix A), followed by a closed-form
+per-session multinomial logistic regression over the predicted rate vector (𝑀 scalar logits per class,
+sub-millisecond on the same hardware). Total per-bin inference time is well below the 50 ms bin
+budget on the external GPU class typical of tethered chronic Neuropixels recordings (on-implant
+deployment is not claimed).
+2. Per-session calibration block. 100–150 unique trials (∼5–8 minutes of task time at standard
+Steinmetz trial cadence) suffice to fit a per-session linear readout within 1–2 pp of its asymptotic
+accuracy (Fig. 5). The block is task-naive: only trial-aligned spike counts and trial labels are
+required.
+3. Online operation. At each new bin, the forecaster ingests the most recent 500 ms of raw spike
+counts, emits an 𝑀-dim predicted-rate vector, and the per-session head emits class probabilities.
+Reading from forecaster rates (rather than raw counts) buys +4–6 pp of response accuracy and
++2–3 pp of contrast accuracy at trial vote over the matched-context raw-count linear decoder under
+identical evaluation conditions (Tab. 1); the trial-vote stimulus-side gain disappears, while a
+1.5–3.5 pp Mamba edge persists at the bin level.
+4. Failure modes flagged for deployment (each expanded in the Limitations of §5). The per-session
+linear head does not transfer across sessions and must be re-fit for each recording session; the
+7
+
+a.
+
+b.
+Original
+
+Shuffled (mean=0.112)
+
+Shuffled
+
+Mean Pearson r
+
+Pearson r
+
+0.75
+
+Original (mean=0.195)
+
+0.50
+0.25
+0.00
+
+0.0
+
+5000 10000 15000
+Neurons (sorted by original r)
+
+S0
+
+S5
+
+S10
+
+S15
+
+S20
+
+S25
+
+S30
+
+S35
+
+Session
+
+c.
+
+d.
+
+2000
+
+Mean=48.4%
+
+No drop (y = x)
+
+Median=50.7%
+
+Shuffled Pearson r
+
+Neuron Count
+
+0.1
+
+Mean drop: 48.4%
+
+0
+
+1500
+1000
+500
+0
+
+0.2
+
+0.8
+
+Trend: y = 0.77x − 0.038
+
+0.6
+0.4
+0.2
+0.0
+
+−200
+0
+200
+% Drop in Pearson r
+
+0.0
+
+0.2
+0.4
+0.6
+0.8
+Original Pearson r
+
+Figure 4: Population shuffle test: cross-neuron coupling drives Mamba’s per-neuron predictability (39 Steinmetz sessions, 18,881 neurons after filtering out near-silent units whose per-neuron 𝑟 is
+dominated by zeros). (a) Per-neuron 𝑟 before (blue) and after (orange) shuffling other neurons’ time
+series within each session (sorted by original 𝑟). (b) Per-session mean 𝑟 before vs. after shuffle. (c)
+Distribution of % 𝑟 drop per neuron (mean 48.4%, median 50.7%). (d) Shuffled vs. original 𝑟 scatter;
+the regression line 𝑦 = 0.77𝑥 − 0.038 lies well below identity, with 38/39 sessions showing > 25%
+degradation. The universal degradation is direct evidence that Mamba is exploiting cross-neuron
+temporal coupling, not single-neuron autocorrelation, to make its predictions; the same coupling
+structure that the per-session linear behavioral head reads from in §4.2.
+
+forecaster’s modest per-neuron 𝑟 = 0.18 at 50 ms bins is the binding constraint on what the linear
+head can recover, and a per-session input embedding does not relax it (Appendix C).
+The pipeline is end-to-end realtime-feasible on the workstation-class external compute tier typical of
+tethered chronic Neuropixels recordings (on-implant deployment is not claimed); it is not a working
+closed-loop demonstration on a live animal, which we leave as future work.
+
+5
+
+Discussion
+
+Why behavior decodes implicitly from spike forecasts. The next-step Poisson NLL objective
+forces the model to integrate 500 ms of population history into a smoothed rate estimate at every
+bin. Single-bin raw counts at 50 ms are dominated by Poisson noise; matched-context summed/flat
+raw counts add temporal context but ignore population structure. Mamba’s predicted rate lies on
+the intersection: it has the same temporal context as the matched baselines but additionally exploits
+cross-neuron dependencies the training signal carves into its hidden state. The matched-context gains
+across all three behavioral targets (response, contrast, side) are the residual behavioral signal that
+population-aware temporal integration extracts beyond what either short windows or context-only
+summation can reach.
+8
+
+Direct evidence for the cross-neuron mechanism. We can verify the cross-neuron-coupling claim
+directly with a population shuffle test: at evaluation time, for each session, shuffle each neuron’s
+time series independently across trial-active bins (destroying cross-neuron temporal correlations
+while preserving per-neuron marginal firing-rate distributions), then re-compute per-neuron Pearson
+𝑟 on the shuffled inputs. If Mamba were predicting from single-neuron autocorrelation alone, 𝑟
+would be unchanged; if it relies on the cross-neuron coupling its hidden state has learned, 𝑟 should
+collapse. Across 39 Steinmetz sessions and 18,881 sufficiently active neurons, the shuffle drops mean
+per-neuron 𝑟 by 48.4% (median 50.7%; Fig. 4), with 38/39 sessions showing > 25% degradation.
+Cross-neuron coupling is therefore a load-bearing component of the forecaster’s accuracy: removing
+it alone collapses roughly half of the per-neuron predictive signal. The same coupling structure is
+what the per-session linear behavioral head exploits to recover behavior from the predicted rates in
+§4.2. A complementary DTW analysis on the population-summed rate (Fig. 2d/e for the exemplar
+session, Appendix E for the cross-session generalisation) confirms that what Mamba captures in
+that coupling is temporally faithful: under DTW alignment the average error against the recorded
+population rate falls by 42.5% relative to the naive bin-to-bin MAE, on every one of the 39 sessions,
+so the predicted rates are well-aligned at the population level even when per-bin Pearson 𝑟 at 50 ms is
+modest.
+Scope of the matched-context finding. The matched-context gains over 500 ms-context raw
+baselines apply to the ANN forecasters (Mamba, Transformer, LRU) on the Steinmetz 39-session
+benchmark, on response and stimulus side, when each target is decoded with its own dedicated linear
+head trained at the appropriate granularity. The 16-class contrast metric is reported in Tab. 1 for
+completeness but not headlined; its absolute accuracy is dominated by a 26% no-stim class prior, so
+the matched-context gain is best read on the prior-corrected metrics in Appendix G.
+Limitations. (1) 𝐻=1 horizon; greedy rollout regresses to session mean over ∼3–5 bins, so the
+pipeline is single-step-ahead in the form deployed. (2) 50 ms bins miss < 20 ms dynamics relevant
+to some motor BCI applications. (3) Cross-laboratory extension is partial: the headline 3-seed
+Mamba in Tab. 1 is Steinmetz-only, and we extended decoding to the 66-session IBL Repeated Site
+cohort with a single-seed combined-105 Mamba (§4.2 closing paragraph; Appendix F). Of the three
+behavioral targets, only stimulus side retains a matched-context gain on IBL (+2.1 pp); the response
+and 16-class contrast gains are absorbed by the H=10 sum baseline under IBL’s binary forced-choice
+task structure. Whether a 3-seed combined-105 ensemble would recover the full Steinmetz gain on
+IBL is open. (4) The 16-class stimulus contrast metric in Tab. 1 is dominated by a 26.1% no-stim
+(0, 0) class prior; an always-predict-(0, 0) classifier already reaches 26.1%, vs the 6.25% uniform
+baseline. Under class-balanced training (Appendix G) the matched-context Mamba gain reduces from
++2–3 pp top-1 to +1.9 pp balanced accuracy / +2.6 pp on non-(0, 0) trials only. We accordingly do
+not headline 16-class accuracy. (5) The Mamba checkpoint has modest per-neuron 𝑟=0.18 at 50 ms
+bins (§4.1); the matched-context behavioral gain is conditional on this fidelity regime, and we have not
+characterized how the +4–6 pp gain scales as per-neuron 𝑟 moves. The cross-neuron coupling story
+(Fig. 4, Appendix E) confirms that population-level structure is captured even when single-neuron 𝑟 is
+modest. (6) Cross-session transfer of the per-session linear readout is not demonstrated and the readout
+is fit per session in deployment (§4.4). (7) Per-session input bias does not improve per-neuron 𝑟 on
+Mamba (0.497 vs 0.499, Appendix C); the Poisson noise floor at 50 ms appears to be the single-neuron
+bottleneck. (8) Inference latency is reported as a per-batch GPU benchmark on a single NVIDIA
+RTX 5000 Ada (batch 512, 𝑀=1,240, 𝐻=10); per-trial single-step latency on a deployment-class
+compute substrate is not measured. (9) No comparison against the official NDT2 [Ye et al., 2023] or
+CEBRA [Schneider et al., 2023] pipelines; our NDT2-style variant (Appendix B) isolates bidirectional
+attention + bin masking only.
+
+6
+
+Conclusion
+
+A single Mamba forecaster, trained only on next-step Poisson NLL, covers two BCI components
+in one forward pass: population-rate forecasting (cosine 0.65, per-neuron 𝑟=0.18) and behavioral
+readout from the same rates (response 75.7±0.2% trial vote, side 66.1±0.6%; both ∼2× chance). The
+rates beat matched-context 500 ms raw-count baselines by +4–6 pp on both targets, and the pipeline
+fits the 50 ms bin budget on a workstation-class GPU after a ∼100–150 trial per-session calibration.
+9
+
+References
+M. Azabou, V. Arora, V. Ganesh, X. Mao, S. Nachimuthu, M. Mendelson, B. Richards, M. Perich, G. Lajoie, and
+E. Dyer. A Unified, Scalable Framework for Neural Population Decoding. In NeurIPS, 2023.
+L. Duncker and M. Sahani. Temporal alignment and latent Gaussian process factor inference in population spike
+trains. NeurIPS, 2018.
+A. Gu and T. Dao. Mamba: Linear-Time Sequence Modeling with Selective State Spaces. arXiv:2312.00752,
+2023.
+International Brain Laboratory, K. Banga, J. Benson, J. Bhagat, D. Biderman, D. Birman, N. Bonacchi, S. A.
+Bruijns, K. Buchanan, R. A. A. Campbell, et al. Reproducibility of in vivo electrophysiological measurements
+in mice. eLife, 13:RP100840, 2025.
+S. W. Linderman, M. J. Johnson, A. C. Miller, R. P. Adams, D. M. Blei, and L. Paninski. Bayesian Learning and
+Inference in Recurrent Switching Linear Dynamical Systems. In AISTATS, volume 54, pages 914–922, 2017.
+V. Mante, D. Sussillo, K. V. Shenoy, and W. T. Newsome. Context-dependent computation by recurrent dynamics
+in prefrontal cortex. Nature, 503(7474):78–84, 2013.
+C. Pandarinath et al. Inferring single-trial neural population dynamics using sequential auto-encoders. Nature
+Methods, 15(10):805–815, 2018.
+J. W. Pillow, J. Shlens, L. Paninski, A. Sher, A. M. Litke, E. J. Chichilnisky, and E. P. Simoncelli. Spatio-temporal
+correlations and visual signalling in a complete neuronal population. Nature, 454(7207):995–999, 2008.
+S. Schneider, J. H. Lee, and M. W. Mathis. Learnable latent embeddings for joint behavioural and neural analysis.
+Nature, 617(7960):360–368, 2023.
+N. A. Steinmetz, P. Zatka-Haas, M. Carandini, and K. D. Harris. Distributed coding of choice, action and
+engagement across the mouse brain. Nature, 576(7786):266–273, 2019.
+J. Ye and C. Pandarinath. Representation learning for neural population activity with neural data transformers.
+arXiv:2108.01210, 2021.
+J. Ye, J. Collinger, L. Wehbe, and R. Gaunt. Neural Data Transformer 2: Multi-context pretraining for neural
+spiking activity. In NeurIPS, 2023.
+Y. Zhang, Y. Wang, M. Azabou, A. Andre, Z. Wang, H. Lyu, The International Brain Laboratory, E. L. Dyer,
+L. Paninski, and C. L. Hurwitz. Neural encoding and decoding at scale. In Proceedings of the 42nd
+International Conference on Machine Learning (ICML), volume 267 of PMLR, 2025.
+
+A
+
+Training details and reproducibility
+
+Forecaster training. The Mamba forecaster (and the Transformer/LRU/NDT2-style architecture
+controls in Appendix B) is trained as a next-step Poisson NLL spike-count predictor on the combined105 Steinmetz 2019 + IBL Repeated Site substrate. Mamba: hidden size 256, 4 layers, AdamW
+with cosine LR (peak 10−3 , 1k warmup), batch 512, 50 epochs, weight decay 10−4 , seed 42 unless
+otherwise noted; 1.95M total parameters.
+Data. 𝑇 = 10 history bins (500 ms), 50 ms bin width; 70/15/15% train/val/test temporal split per
+session; padded to 𝑀max = 1,998 across 105 sessions (Steinmetz-39 used in this paper for behavioral
+decoding; combined-105 used for forecasting fidelity in §4.1). Behavioral targets extracted from
+Steinmetz NWB at the same temporal binning; trial-level 20% holdout (seed 42) for behavioral
+evaluation.
+Reproducibility. Seed 42 throughout, except where 3-seed multi-seed analyses (seeds 42, 1, 2) are
+explicitly reported. Forecaster training code, configs, and the matched-context evaluation harness are
+provided as supplementary material with this submission.
+10
+
+Table 2: Per-seed trial-vote accuracies on held-out trials. Mean ± SEM is computed where multiple
+seeds are available. NDT2-style is a single-seed (42) bidirectional masked-attention variant.
+Architecture
+
+Seed
+
+Resp. 3
+
+Stim. 16
+
+Side 3
+
+Mamba
+Mamba
+Mamba
+Mamba
+
+42
+1
+2
+mean (n=3)
+
+75.1
+75.9
+76.0
+75.7 ± 0.2
+
+38.3
+37.4
+37.2
+37.6 ± 0.3
+
+66.3
+67.3
+64.6
+66.1 ± 0.6
+
+Transformer
+Transformer
+Transformer
+Transformer
+
+42
+1
+2
+mean (n=3)
+
+76.0
+75.5
+76.3
+75.9 ± 0.2
+
+37.8
+38.0
+37.7
+37.8 ± 0.1
+
+66.4
+67.0
+65.9
+66.4 ± 0.2
+
+LRU
+LRU
+LRU
+LRU
+
+42
+1
+2
+mean (n=3)
+
+75.6
+74.8
+76.1
+75.5 ± 0.3
+
+36.2
+36.3
+36.4
+36.3 ± 0.0
+
+64.3
+64.4
+65.4
+64.7 ± 0.3
+
+42
+
+72.7
+
+36.3
+
+64.5
+
+NDT2-style
+
+B
+
+Multi-seed cross-architecture decoding
+
+We re-trained Mamba, Transformer, and LRU with two additional seeds (1, 2) on the Steinmetz 39session dataset and re-ran the same per-session linear-readout evaluation. Per-seed results below.
+The matched-context decoding gain replicates across architectures: Mamba, Transformer, and LRU
+response trial-votes cluster within ∼1 pp at 75.5–75.9% (cross-seed SEM ≤ 0.3 pp for each, sample std
+≤ 0.5 pp), all 4–6 pp above the 69.6–71.3% matched-context raw baselines (Tab. 1). The NDT2-style
+variant (bidirectional attention + 15% input-bin masking, otherwise matched to our Transformer)
+reaches 73.0% on response trial-vote, ∼3 pp below the causal forecasters; we attribute the gap to
+the masked-LM denoising objective being mismatched to next-bin forecasting and leave a targeted
+ablation isolating bidirectional attention from input-bin masking, plus a comparison against the official
+NDT2 [Ye et al., 2023] training pipeline, to future work.
+
+C
+
+Per-session input embedding ablation
+
+The shared 𝑀max × 𝑑 input projection (§3.2) is the natural candidate for a per-neuron-𝑟 bottleneck
+on this benchmark, since it forces all sessions through one set of input weights. To test, we trained
+a Mamba forecaster with a learned per-session bias vector 𝑒 𝑠 ∈ R𝑑 added to the input projection
+(InputProj(𝑥) + 𝑒 𝑠 ): one bias vector per training session (39 sessions × 256 dim = 9,984 extra
+parameters), otherwise identical to the seed-42 Mamba baseline.
+Table 3: Per-session input embedding ablation, Steinmetz 39 sessions, seed 42, val per-channel
+Pearson 𝑟 at the best epoch. Numbers are higher than the Mamba per-neuron 𝑟 = 0.176 reported
+in §4.1 because that is computed on the combined-105 test set at the final-epoch checkpoint and
+aggregated neuron-weighted across both Steinmetz and IBL sessions; the ablation here reads val
+per-channel 𝑟 at the best epoch on Steinmetz 39 only, where dynamics are more homogeneous and the
+metric is less constrained.
+Configuration
+
+Params
+
+Val per-neuron 𝑟
+
+Mamba (shared 𝑀max × 𝑑 input)
+Mamba + per-session input bias
+
+1,952,728
+1,962,712
+
+0.4994
+0.4968
+
+The two configurations are within 0.003 (≤ 0.01 relative) on val per-neuron 𝑟; the per-session
+bias does not improve single-neuron predictability. We read this as a clean negative result at this
+benchmark scale: the shared input projection is not the per-neuron bottleneck. The likely true
+bottleneck is the irreducible Poisson noise floor at 50 ms bin resolution (Limitation 5). Stronger forms
+of per-session adaptation (per-session input matrix rather than bias, low-rank adapters, session-specific
+normalization) remain worth exploring; we leave them to future work.
+11
+
+D
+
+Per-session linear readout: trials needed for calibration
+
+To quantify online-calibration feasibility, we sweep the per-session linear-readout fitting set from 5%
+to 80% of trial-active bins (fixed 20% trial holdout, 5 random training-subset draws per fraction)
+and track how trial-vote accuracy converges to the asymptotic value when reading from Mamba’s
+predicted rates.
+Per-session linear readout convergence on Mamba rate predictions
+0.8
+
+Trial-vote accuracy
+
+0.7
+0.6
+0.5
+0.4
+0.3
+Response (3-class)
+Stim 16-class
+Stim side (3-class)
+
+0.2
+0.1
+10
+
+1
+
+10
+
+2
+
+Training trials per session (median across 39 Steinmetz sessions)
+
+Figure 5: Per-session linear readout convergence on Mamba rate predictions (Steinmetz 39
+sessions, 5 random training-subset draws per fraction; direct 3-class side classifier matching Tab. 1).
+Asymptotic accuracies at 80% of trials (median 162 trials/session): response 76.9%, 16-class contrast
+37.8%, stimulus side 67.1%. The calibration sweep averages over 5 random training-subset draws
+(each draw resamples which 80% of train trials are used, while keeping the eval split fixed), which
+amounts to an implicit ensemble; the 1–2 pp lift over Tab. 1’s single-split numbers is consistent
+with that ensembling effect across all three targets. Approximate trial counts to reach within 1–2 pp
+of asymptote are response ∼120, stim 16 ∼160+, side ∼140. A session-start calibration block of
+∼100–150 trials therefore brings a deployed BCI close to its asymptotic decoding accuracy on this
+task family.
+
+E
+
+Population-rate temporal alignment: cross-session detail
+
+The single-session DTW story is in the body figure (Fig. 2d/e): for the exemplar session 10, DTW
+alignment reduces the average per-step error against the recorded population rate from 20.3 to 11.9
+spikes/bin (a 41% reduction). Here we generalise that result across all 39 Steinmetz sessions to
+confirm the temporal-alignment finding is not exemplar-specific.
+The cross-session result confirms that what Mamba captures in cross-neuron coupling is temporally
+faithful population dynamics rather than bin-locked noise, on every session in the benchmark.
+Combined with the population shuffle test (Fig. 4, mean per-neuron 𝑟 drop 48.4% when cross-neuron
+correlations are destroyed), this is the mechanism that makes the matched-context behavioral readout
+work: Mamba’s predicted rate is a population-aware, temporally aligned signal that the linear head
+can decode behavior from.
+
+F
+
+Cross-laboratory extension: IBL Repeated Site
+
+The headline behavioral results in §4.2 are on the 39 Steinmetz sessions with the canonical 3seed Steinmetz-trained Mamba. To probe cross-laboratory generalization, we ran behavioral
+decoding on the 66-session IBL Repeated Site cohort using a single-seed Mamba trained on the
+combined Steinmetz+IBL substrate (105 sessions, 𝑀max =1,998, identical training schedule to the
+spike-forecasting benchmark substrate). Per-session linear readout, 80/20 trial-level holdout, and
+matched-context (H=10 sum) raw-count baseline are identical to §4.2; the only differences are the
+model checkpoint and the session pool.
+The IBL gain pattern is informative for interpreting the Steinmetz result: under a task with longer
+trial-active windows and binary forced-choice responses, the H=10 sum baseline gathers enough
+12
+
+40
+35
+
+Mean DTW improvement: 42.5%
+(naive 18.8 → DTW 10.8 spikes/bin; 39/39 sessions)
+
+Naive bin-to-bin MAE
+DTW avg error
+
+Spikes / bin
+
+30
+25
+20
+15
+10
+5
+
+7
+2
+26
+0
+12
+22
+3
+19
+1
+36
+9
+6
+11
+24
+10
+34
+20
+27
+17
+21
+23
+29
+28
+18
+8
+25
+33
+4
+15
+30
+37
+14
+35
+5
+16
+32
+13
+31
+38
+
+0
+
+Session (sorted by naive MAE, descending)
+
+Figure 6: Cross-session population-rate temporal alignment (Mamba forecaster, Steinmetz 39).
+Naive bin-to-bin MAE (blue) vs. DTW-aligned average error (vermillion) for each session, sorted by
+naive MAE descending. Mean DTW improvement is 42.5% (naive 18.8 → DTW 10.8 spikes/bin)
+and every session benefits. The exemplar session 10 used in Fig. 2d/e is one of the average performers
+in this distribution, not a cherry-picked best.
+Table 4: IBL Repeated Site behavioral decoding from Mamba-combined-105 predicted rates vs.
+matched-context (H=10 sum) raw-count baseline, 66 sessions, 7,651 held-out trials, 458,295 evaluation
+bins. Side trial-vote retains a +2.1 pp matched-context gain on IBL; response and 16-class contrast
+gains seen on Steinmetz (Tab. 1) are absorbed by the H=10 sum baseline under IBL’s binary forcedchoice task structure. The same single-seed combined-105 Mamba on the 39 Steinmetz sessions still
+beats the H=10 sum baseline by +4.5 pp (resp), +1.0 pp (contrast), and +3.8 pp (side) at trial vote; the
+Steinmetz canonical 3-seed model in Tab. 1 reaches +6/+2–3/+4–6 pp.
+Bin-level
+
+Trial-level majority vote
+
+Decoder input
+
+Resp. 3
+
+Stim. 16
+
+Side 3
+
+Resp. 3
+
+Stim. 16
+
+Side 3
+
+Linear / 𝐻=10 sum
+Mamba-combined-105 (single seed)
+
+62.9
+62.3
+
+54.5
+55.5
+
+49.9
+49.5
+
+85.2
+85.1
+
+59.9
+59.8
+
+67.1
+69.2
+
+Chance (IBL effective)
+
+50.0
+
+6.25
+
+50.0
+
+50.0
+
+6.25
+
+50.0
+
+context to match or saturate Mamba on response and contrast, but stimulus side (which integrates
+over the relative left–right contrast and is invariant to the binary choice axis) still benefits from the
+population-coupled rate compression Mamba provides. The mechanism described in §5 (cross-neuron
+coupling + temporal alignment, App. E) predicts exactly this: the matched-context gain should survive
+most reliably for targets that require integrating distributed population signal into a spatially structured
+readout, which is what the side classifier does.
+Caveats. The IBL extension uses a different model checkpoint (single-seed combined-105 vs. the
+canonical 3-seed Steinmetz-only ensemble in Tab. 1); whether a 3-seed combined-105 ensemble
+would close the IBL response/contrast gap is open. We did not re-run the architecture controls
+(Transformer, LRU, NDT2-style) on IBL; the cross-laboratory robustness check here is for the Mamba
+vs. baseline matched-context gain only. See §5 item (3).
+
+G
+
+Class-balanced diagnostic for the 16-class contrast metric
+
+Across the 39 Steinmetz sessions, 26.1% of held-out trials are no-stimulus (0, 0) contrast pairs, by
+far the most common single class out of the 16. A trivially-always-predict-(0, 0) classifier already
+reaches 26.1% top-1 accuracy, so the apparent “6× chance” multiplier from Tab. 1 (Mamba 38%, raw
+baseline 35% vs uniform 6.25% chance) overstates the discrimination signal. We therefore re-trained
+13
+
+the same per-session classifiers on Mamba’s predicted rates and on the H=10 sum baseline counts
+with sklearn class_weight=‘balanced’ to remove the prior. The diagnostic uses the same §4.2
+80/20 trial-level holdout (seed 42).
+Table 5: Class-balanced 16-class diagnostic (Steinmetz 39, 1,994 held-out trials). The default classifier
+inherits the 26% no-stim (0, 0) prior, which inflates top-1 accuracy and the apparent matched-context
+gain. Under class-balanced training the top-1 gain collapses to a tie, but the gain on metrics that
+actually measure contrast discrimination (balanced accuracy across classes; accuracy restricted to
+non-(0, 0) trials) survives at +1.9 pp and +2.6 pp respectively. We accordingly do not headline
+16-class top-1 accuracy in the abstract, conclusion, or contributions list.
+Training
+
+Decoder input
+
+Top-1
+
+Balanced
+
+Non-(0, 0) only
+
+Top-1 Δ
+
+Default (prior-inheriting)
+
+Mamba seed 42
+H=10 sum baseline
+
+38.3
+35.4
++2.9
+
+18.7
+16.9
++1.8
+
+20.7
+18.9
++1.8
+
+—
+—
+ref
+
+Mamba seed 42
+H=10 sum baseline
+
+35.3
+35.5
+−0.2
+
+19.4
+17.5
++1.9
+
+22.4
+19.7
++2.6
+
+—
+—
+—
+
+—
+
+26.1
+
+1.6
+
+0.0
+
+—
+
+Δ (Mamba − baseline)
+Class-balanced
+Δ (Mamba − baseline)
+Reference: always-predict-(0, 0)
+
+The interpretation: most of the apparent “+3 pp on 16-class contrast” under default training is
+Mamba being slightly better than the matched H=10 sum baseline at recognizing no-stim trials, not at
+distinguishing actual contrast levels. After removing the prior, the matched-context gain on the metrics
+that actually measure contrast discrimination (+1.9 pp balanced accuracy and +2.6 pp on non-(0, 0)
+trials) is roughly half the headline number but still in the same direction. The matched-context claim
+on the 16-class target therefore holds, just at smaller magnitude than the default-training top-1 number
+suggests, which is why we drop the 16-class number from the headline (abstract, contributions,
+conclusion) and report it only in Tab. 1 with the caveat above. The response and stimulus-side metrics
+are not affected by class imbalance and remain headline numbers.
+
+14
+
+NeurIPS Paper Checklist
+1. Claims
+Question: Do the main claims made in the abstract and introduction accurately reflect the
+paper’s contributions and scope?
+Answer: [Yes]
+Justification: The abstract and §1 contributions enumerate two claims (behavior decodes
+implicitly from Mamba spike-rate forecasts under matched context; a practitioner budget for
+closed-loop deployment), each supported in §4.2–§4.4 and Appendix B.
+Guidelines:
+• The answer [N/A] means that the abstract and introduction do not include the claims
+made in the paper.
+• The abstract and/or introduction should clearly state the claims made, including the
+contributions made in the paper and important assumptions and limitations. A [No] or
+[N/A] answer to this question will not be perceived well by the reviewers.
+• The claims made should match theoretical and experimental results, and reflect how
+much the results can be expected to generalize to other settings.
+• It is fine to include aspirational goals as motivation as long as it is clear that these goals
+are not attained by the paper.
+2. Limitations
+Question: Does the paper discuss the limitations of the work performed by the authors?
+Answer: [Yes]
+Justification: §5 (“Limitations”) enumerates 9 items including the modest per-neuron 𝑟,
+single-step horizon, behavioral analysis on Steinmetz-39 only, cross-session readout transfer
+not demonstrated, per-batch (not per-trial) inference-latency benchmark, and the missing
+official NDT2/CEBRA comparison.
+Guidelines:
+• The answer [N/A] means that the paper has no limitation while the answer [No] means
+that the paper has limitations, but those are not discussed in the paper.
+• The authors are encouraged to create a separate “Limitations” section in their paper.
+• The paper should point out any strong assumptions and how robust the results are to
+violations of these assumptions (e.g., independence assumptions, noiseless settings,
+model well-specification, asymptotic approximations only holding locally). The authors
+should reflect on how these assumptions might be violated in practice and what the
+implications would be.
+• The authors should reflect on the scope of the claims made, e.g., if the approach was
+only tested on a few datasets or with a few runs. In general, empirical results often
+depend on implicit assumptions, which should be articulated.
+• The authors should reflect on the factors that influence the performance of the approach.
+For example, a facial recognition algorithm may perform poorly when image resolution
+is low or images are taken in low lighting. Or a speech-to-text system might not be
+used reliably to provide closed captions for online lectures because it fails to handle
+technical jargon.
+• The authors should discuss the computational efficiency of the proposed algorithms
+and how they scale with dataset size.
+• If applicable, the authors should discuss possible limitations of their approach to address
+problems of privacy and fairness.
+• While the authors might fear that complete honesty about limitations might be used by
+reviewers as grounds for rejection, a worse outcome might be that reviewers discover
+limitations that aren’t acknowledged in the paper. The authors should use their best
+judgment and recognize that individual actions in favor of transparency play an important
+role in developing norms that preserve the integrity of the community. Reviewers will
+be specifically instructed to not penalize honesty concerning limitations.
+3. Theory assumptions and proofs
+15
+
+Question: For each theoretical result, does the paper provide the full set of assumptions and
+a complete (and correct) proof?
+Answer: [N/A]
+Justification: The paper presents empirical results; no theorems or formal proofs.
+Guidelines:
+• The answer [N/A] means that the paper does not include theoretical results.
+• All the theorems, formulas, and proofs in the paper should be numbered and crossreferenced.
+• All assumptions should be clearly stated or referenced in the statement of any theorems.
+• The proofs can either appear in the main paper or the supplemental material, but if
+they appear in the supplemental material, the authors are encouraged to provide a short
+proof sketch to provide intuition.
+• Inversely, any informal proof provided in the core of the paper should be complemented
+by formal proofs provided in appendix or supplemental material.
+• Theorems and Lemmas that the proof relies upon should be properly referenced.
+4. Experimental result reproducibility
+Question: Does the paper fully disclose all the information needed to reproduce the main
+experimental results of the paper to the extent that it affects the main claims and/or conclusions
+of the paper (regardless of whether the code and data are provided or not)?
+Answer: [Yes]
+Justification: §3 specifies the post-hoc readout protocol, data splits, and seeds; Appendix A
+lists architecture hyperparameters and the training schedule. Forecaster training scripts
+(scripts/train_teacher.py, scripts/train_distill_multi_head.py), training
+and data configs, model architectures, and the matched-context evaluation harness are
+provided in the supplementary zip; trained forecaster checkpoints and the per-session
+prediction cache are referenced in REPRODUCING.md for separate download (excluded from
+the zip due to size, ∼36 GB).
+Guidelines:
+• The answer [N/A] means that the paper does not include experiments.
+• If the paper includes experiments, a [No] answer to this question will not be perceived
+well by the reviewers: Making the paper reproducible is important, regardless of
+whether the code and data are provided or not.
+• If the contribution is a dataset and/or model, the authors should describe the steps taken
+to make their results reproducible or verifiable.
+• Depending on the contribution, reproducibility can be accomplished in various ways.
+For example, if the contribution is a novel architecture, describing the architecture fully
+might suffice, or if the contribution is a specific model and empirical evaluation, it may
+be necessary to either make it possible for others to replicate the model with the same
+dataset, or provide access to the model. In general. releasing code and data is often
+one good way to accomplish this, but reproducibility can also be provided via detailed
+instructions for how to replicate the results, access to a hosted model (e.g., in the case
+of a large language model), releasing of a model checkpoint, or other means that are
+appropriate to the research performed.
+• While NeurIPS does not require releasing code, the conference does require all
+submissions to provide some reasonable avenue for reproducibility, which may depend
+on the nature of the contribution. For example
+(a) If the contribution is primarily a new algorithm, the paper should make it clear how
+to reproduce that algorithm.
+(b) If the contribution is primarily a new model architecture, the paper should describe
+the architecture clearly and fully.
+(c) If the contribution is a new model (e.g., a large language model), then there should
+either be a way to access this model for reproducing the results or a way to reproduce
+the model (e.g., with an open-source dataset or instructions for how to construct the
+dataset).
+16
+
+(d) We recognize that reproducibility may be tricky in some cases, in which case authors
+are welcome to describe the particular way they provide for reproducibility. In the
+case of closed-source models, it may be that access to the model is limited in some
+way (e.g., to registered users), but it should be possible for other researchers to have
+some path to reproducing or verifying the results.
+5. Open access to data and code
+Question: Does the paper provide open access to the data and code, with sufficient instructions
+to faithfully reproduce the main experimental results, as described in supplemental material?
+Answer: [Yes]
+Justification: Code is provided as the supplementary zip: training scripts (forecaster +
+SNN distillation + ablation), model architectures, all configs, the matched-context evaluation harness, the population-shuffle and DTW analysis scripts, and the figure-generation
+pipeline, together with README.md, INVENTORY.md, and end-to-end REPRODUCING.md
+recipes. Trained forecaster checkpoints and per-session prediction caches are too large to bundle (∼36 GB) and are pointed to in REPRODUCING.md for separate download. Steinmetz 2019
+and IBL Repeated Site are publicly released datasets.
+Guidelines:
+• The answer [N/A] means that paper does not include experiments requiring code.
+• Please see the NeurIPS code and data submission guidelines (https://neurips.cc/
+public/guides/CodeSubmissionPolicy) for more details.
+• While we encourage the release of code and data, we understand that this might not
+be possible, so [No] is an acceptable answer. Papers cannot be rejected simply for not
+including code, unless this is central to the contribution (e.g., for a new open-source
+benchmark).
+• The instructions should contain the exact command and environment needed to run to
+reproduce the results. See the NeurIPS code and data submission guidelines (https:
+//neurips.cc/public/guides/CodeSubmissionPolicy) for more details.
+• The authors should provide instructions on data access and preparation, including how
+to access the raw data, preprocessed data, intermediate data, and generated data, etc.
+• The authors should provide scripts to reproduce all experimental results for the new
+proposed method and baselines. If only a subset of experiments are reproducible, they
+should state which ones are omitted from the script and why.
+• At submission time, to preserve anonymity, the authors should release anonymized
+versions (if applicable).
+• Providing as much information as possible in supplemental material (appended to the
+paper) is recommended, but including URLs to data and code is permitted.
+6. Experimental setting/details
+Question: Does the paper specify all the training and test details (e.g., data splits, hyperparameters, how they were chosen, type of optimizer) necessary to understand the
+results?
+Answer: [Yes]
+Justification: Main text §3 and Appendix A together specify hidden sizes, depths, optimizer,
+LR schedule, batch size, dropout, history window 𝐻, and bin width.
+Guidelines:
+• The answer [N/A] means that the paper does not include experiments.
+• The experimental setting should be presented in the core of the paper to a level of detail
+that is necessary to appreciate the results and make sense of them.
+• The full details can be provided either with the code, in appendix, or as supplemental
+material.
+7. Experiment statistical significance
+Question: Does the paper report error bars suitably and correctly defined or other appropriate
+information about the statistical significance of the experiments?
+17
+
+Answer: [Yes]
+Justification: Tab. 1 reports 95% bootstrap CIs at the bin level; Appendix B reports
+mean±SEM across 3 training seeds for Mamba, Transformer, and LRU.
+Guidelines:
+• The answer [N/A] means that the paper does not include experiments.
+• The authors should answer [Yes] if the results are accompanied by error bars, confidence
+intervals, or statistical significance tests, at least for the experiments that support the
+main claims of the paper.
+• The factors of variability that the error bars are capturing should be clearly stated (for
+example, train/test split, initialization, random drawing of some parameter, or overall
+run with given experimental conditions).
+• The method for calculating the error bars should be explained (closed form formula,
+call to a library function, bootstrap, etc.)
+• The assumptions made should be given (e.g., Normally distributed errors).
+• It should be clear whether the error bar is the standard deviation or the standard error of
+the mean.
+• It is OK to report 1-sigma error bars, but one should state it. The authors should
+preferably report a 2-sigma error bar than state that they have a 96% CI, if the hypothesis
+of Normality of errors is not verified.
+• For asymmetric distributions, the authors should be careful not to show in tables or
+figures symmetric error bars that would yield results that are out of range (e.g., negative
+error rates).
+• If error bars are reported in tables or plots, the authors should explain in the text how
+they were calculated and reference the corresponding figures or tables in the text.
+8. Experiments compute resources
+Question: For each experiment, does the paper provide sufficient information on the computer
+resources (type of compute workers, memory, time of execution) needed to reproduce the
+experiments?
+Answer: [Yes]
+Justification: Forecaster training (Mamba 1.95 M params, 4 layers, hidden 256; Transformer
+/ LRU / NDT2-style controls of comparable size) was performed on National Research
+Platform cluster GPUs (RTX 3090 / L40 / A6000 / A40 class), at 50 epochs and batch 512 over
+the combined-105 substrate (Appendix A). Three-seed multi-seed runs in Appendix B cost
+∼3× that. Per-batch latency, throughput, and peak-VRAM benchmarks for all architectures
+are reported in the body on a single NVIDIA RTX 5000 Ada at batch 512, 𝑀=1,240, 𝐻=10,
+the deployment-class workstation tier. Per-session linear-readout fitting and matched-context
+behavioral evaluation run on a single workstation CPU.
+Guidelines:
+• The answer [N/A] means that the paper does not include experiments.
+• The paper should indicate the type of compute workers CPU or GPU, internal cluster,
+or cloud provider, including relevant memory and storage.
+• The paper should provide the amount of compute required for each of the individual
+experimental runs as well as estimate the total compute.
+• The paper should disclose whether the full research project required more compute
+than the experiments reported in the paper (e.g., preliminary or failed experiments that
+didn’t make it into the paper).
+9. Code of ethics
+Question: Does the research conducted in the paper conform, in every respect, with the
+NeurIPS Code of Ethics https://neurips.cc/public/EthicsGuidelines?
+Answer: [Yes]
+Justification: The work uses publicly available animal-electrophysiology datasets (Steinmetz 2019, IBL Repeated Site) and conforms to the NeurIPS Code of Ethics; no human
+subjects.
+18
+
+Guidelines:
+• The answer [N/A] means that the authors have not reviewed the NeurIPS Code of
+Ethics.
+• If the authors answer [No], they should explain the special circumstances that require a
+deviation from the Code of Ethics.
+• The authors should make sure to preserve anonymity (e.g., if there is a special
+consideration due to laws or regulations in their jurisdiction).
+10. Broader impacts
+Question: Does the paper discuss both potential positive societal impacts and negative
+societal impacts of the work performed?
+Answer: [Yes]
+Justification: Positive impacts. A matched-context-aware evaluation protocol contributes
+to more reliable BCI-decoder design and benchmarking; the headline finding (a single
+forecaster can serve both population-rate forecasting and behavioral readout in one forward
+pass at workstation-class compute) is directly relevant to closed-loop assistive devices for
+motor disability where the bin-budget compute constraint we identify is binding. Negative
+impacts. Behavioral-state decoding from neural activity has a recognized dual-use profile in
+surveillance and forensic contexts if extended to non-consenting human subjects. Mitigation.
+The empirical work uses publicly released mouse electrophysiology (Steinmetz 2019, IBL
+Repeated Site) and not human data; the methodological contribution is an evaluation protocol
+that does not by itself increase any decoder’s deployable misuse capacity.
+Guidelines:
+• The answer [N/A] means that there is no societal impact of the work performed.
+• If the authors answer [N/A] or [No], they should explain why their work has no societal
+impact or why the paper does not address societal impact.
+• Examples of negative societal impacts include potential malicious or unintended uses
+(e.g., disinformation, generating fake profiles, surveillance), fairness considerations
+(e.g., deployment of technologies that could make decisions that unfairly impact specific
+groups), privacy considerations, and security considerations.
+• The conference expects that many papers will be foundational research and not tied
+to particular applications, let alone deployments. However, if there is a direct path to
+any negative applications, the authors should point it out. For example, it is legitimate
+to point out that an improvement in the quality of generative models could be used to
+generate Deepfakes for disinformation. On the other hand, it is not needed to point out
+that a generic algorithm for optimizing neural networks could enable people to train
+models that generate Deepfakes faster.
+• The authors should consider possible harms that could arise when the technology is
+being used as intended and functioning correctly, harms that could arise when the
+technology is being used as intended but gives incorrect results, and harms following
+from (intentional or unintentional) misuse of the technology.
+• If there are negative societal impacts, the authors could also discuss possible mitigation
+strategies (e.g., gated release of models, providing defenses in addition to attacks,
+mechanisms for monitoring misuse, mechanisms to monitor how a system learns from
+feedback over time, improving the efficiency and accessibility of ML).
+11. Safeguards
+Question: Does the paper describe safeguards that have been put in place for responsible
+release of data or models that have a high risk for misuse (e.g., pre-trained language models,
+image generators, or scraped datasets)?
+Answer: [N/A]
+Justification: The released benchmark and forecasting models are not high-misuse-risk
+artifacts (no generative content models, no personal data).
+Guidelines:
+• The answer [N/A] means that the paper poses no such risks.
+19
+
+• Released models that have a high risk for misuse or dual-use should be released with
+necessary safeguards to allow for controlled use of the model, for example by requiring
+that users adhere to usage guidelines or restrictions to access the model or implementing
+safety filters.
+• Datasets that have been scraped from the Internet could pose safety risks. The authors
+should describe how they avoided releasing unsafe images.
+• We recognize that providing effective safeguards is challenging, and many papers do
+not require this, but we encourage authors to take this into account and make a best
+faith effort.
+12. Licenses for existing assets
+Question: Are the creators or original owners of assets (e.g., code, data, models), used in
+the paper, properly credited and are the license and terms of use explicitly mentioned and
+properly respected?
+Answer: [Yes]
+Justification: Steinmetz 2019 [Steinmetz et al., 2019] (CC-BY-4.0; figshare DOI
+10.6084/m9.figshare.9598406) and IBL Repeated Site [IBL et al., 2025] (CC-BY-4.0)
+are public datasets, cited in the references. Mamba [Gu and Dao, 2023] is used via the
+official state-spaces/mamba implementation under Apache 2.0. PyTorch and other
+scientific-Python dependencies are used under their respective permissive licenses (BSD
+/ MIT). All assets are credited via citation; requirements.txt in the supplementary zip
+enumerates the dependency set.
+Guidelines:
+• The answer [N/A] means that the paper does not use existing assets.
+• The authors should cite the original paper that produced the code package or dataset.
+• The authors should state which version of the asset is used and, if possible, include a
+URL.
+• The name of the license (e.g., CC-BY 4.0) should be included for each asset.
+• For scraped data from a particular source (e.g., website), the copyright and terms of
+service of that source should be provided.
+• If assets are released, the license, copyright information, and terms of use in the
+package should be provided. For popular datasets, paperswithcode.com/datasets
+has curated licenses for some datasets. Their licensing guide can help determine the
+license of a dataset.
+• For existing datasets that are re-packaged, both the original license and the license of
+the derived asset (if it has changed) should be provided.
+• If this information is not available online, the authors are encouraged to reach out to the
+asset’s creators.
+13. New assets
+Question: Are new assets introduced in the paper well documented and is the documentation
+provided alongside the assets?
+Answer: [Yes]
+Justification: This paper does not introduce new datasets. The matched-context evaluation
+harness (a Python module wrapping the per-session linear-readout protocol used in Tab. 1) and
+the architecture and training code for the forecasters are bundled in the supplementary zip with
+documentation (README.md, INVENTORY.md, REPRODUCING.md) and an MIT LICENSE.
+Trained forecaster checkpoints are referenced for separate download via REPRODUCING.md
+(excluded from the zip due to size).
+Guidelines:
+• The answer [N/A] means that the paper does not release new assets.
+• Researchers should communicate the details of the dataset/code/model as part of their
+submissions via structured templates. This includes details about training, license,
+limitations, etc.
+20
+
+• The paper should discuss whether and how consent was obtained from people whose
+asset is used.
+• At submission time, remember to anonymize your assets (if applicable). You can either
+create an anonymized URL or include an anonymized zip file.
+14. Crowdsourcing and research with human subjects
+Question: For crowdsourcing experiments and research with human subjects, does the paper
+include the full text of instructions given to participants and screenshots, if applicable, as
+well as details about compensation (if any)?
+Answer: [N/A]
+Justification: No crowdsourcing or human subjects involved.
+Guidelines:
+• The answer [N/A] means that the paper does not involve crowdsourcing nor research
+with human subjects.
+• Including this information in the supplemental material is fine, but if the main
+contribution of the paper involves human subjects, then as much detail as possible
+should be included in the main paper.
+• According to the NeurIPS Code of Ethics, workers involved in data collection, curation,
+or other labor should be paid at least the minimum wage in the country of the data
+collector.
+15. Institutional review board (IRB) approvals or equivalent for research with human
+subjects
+Question: Does the paper describe potential risks incurred by study participants, whether
+such risks were disclosed to the subjects, and whether Institutional Review Board (IRB)
+approvals (or an equivalent approval/review based on the requirements of your country or
+institution) were obtained?
+Answer: [N/A]
+Justification: No human subjects research; animal data was collected by the original
+Steinmetz et al. and IBL studies under their respective institutional approvals.
+Guidelines:
+• The answer [N/A] means that the paper does not involve crowdsourcing nor research
+with human subjects.
+• Depending on the country in which research is conducted, IRB approval (or equivalent)
+may be required for any human subjects research. If you obtained IRB approval, you
+should clearly state this in the paper.
+• We recognize that the procedures for this may vary significantly between institutions
+and locations, and we expect authors to adhere to the NeurIPS Code of Ethics and the
+guidelines for their institution.
+• For initial submissions, do not include any information that would break anonymity (if
+applicable), such as the institution conducting the review.
+16. Declaration of LLM usage
+Question: Does the paper describe the usage of LLMs if it is an important, original, or
+non-standard component of the core methods in this research? Note that if the LLM is used
+only for writing, editing, or formatting purposes and does not impact the core methodology,
+scientific rigor, or originality of the research, declaration is not required.
+Answer: [N/A]
+Justification: LLMs were used only as general-purpose coding and writing assistants (editing
+prose, generating boilerplate); they were not involved in research methodology, scientific
+judgment, or generating empirical results.
+Guidelines:
+• The answer [N/A] means that the core method development in this research does not
+involve LLMs as any important, original, or non-standard components.
+• Please refer to our LLM policy in the NeurIPS handbook for what should or should not
+be described.
+21
+
+

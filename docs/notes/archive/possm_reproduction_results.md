@@ -362,7 +362,7 @@ This suggests the reproduction is now on a plausible path. The result is not yet
 
 ## Willett Smoothing Comparison
 
-Willett's `speechBCI` decoder applies Gaussian smoothing inside the training input transform, after normalization and after training-time input augmentations such as white noise and constant offsets. The local reference code lives at `external/speechBCI`; the relevant functions are `NeuralDecoder/neuralDecoder/neuralSequenceDecoder.py::gaussSmooth` and `_datasetLayerTransform`.
+Willett's `speechBCI` decoder applies Gaussian smoothing inside the training input transform, after normalization and after training-time input augmentations such as white noise and constant offsets. In the published Stanford/Card reference repository, the relevant functions are `NeuralDecoder/neuralDecoder/neuralSequenceDecoder.py::gaussSmooth` and `_datasetLayerTransform`.
 
 Earlier POSSM reconstruction runs used a pre-smoothed cache (`cache_v1_smoothed_sigma2p0`) and kept runtime smoothing disabled. The cache is built by `analysis/active/ssl_experiments/build_smoothed_cache.py`, which calls `masked_ssl.cache._apply_gaussian_smoothing`. That implementation applies an analytic sigma-bin Gaussian with reflect padding to feature arrays before training and records smoothing provenance in dataset metadata.
 

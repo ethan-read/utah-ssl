@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -10,6 +11,7 @@ import numpy as np
 import torch
 
 try:
+    from masked_ssl.probe import apply_feature_stats
     from ssl_core.cache import (
         resolve_boundary_key,
     )
@@ -24,6 +26,7 @@ try:
         compute_feature_stats,
     )
 except ModuleNotFoundError:  # pragma: no cover - repo-root unittest fallback
+    from analysis.active.ssl_experiments.masked_ssl.probe import apply_feature_stats
     from analysis.active.ssl_experiments.ssl_core.cache import (
         resolve_boundary_key,
     )
@@ -48,6 +51,67 @@ class WillettInputTransformConfig:
     constant_offset_sd: float = 0.2
 
 
+class FuturePredictionExportAccessor:
+    def __init__(self, export_root: str | Path) -> None:
+        self.export_root = Path(export_root)
+        manifest_path = self.export_root / "manifest.json"
+        if not manifest_path.exists():
+            raise FileNotFoundError(f"Future-prediction export manifest not found: {manifest_path}")
+        payload = json.loads(manifest_path.read_text())
+        self.temporal_bin_stride = int(payload.get("temporal_bin_stride", 1))
+        self.future_bins = int(payload.get("future_bins", 1))
+        self.tx_dim = int(payload.get("tx_dim", 0))
+        self._rows_by_key: dict[tuple[str, int], dict[str, Any]] = {
+            (str(row["shard_relpath"]), int(row["example_index"])): dict(row)
+            for row in payload.get("rows", [])
+        }
+        self._shard_cache: dict[str, dict[int, dict[str, Any]]] = {}
+
+    def _prediction_shard_path(self, *, dataset: str, shard_relpath: str) -> Path:
+        return self.export_root / "predictions" / str(dataset) / Path(shard_relpath).with_suffix(".future_pred.pt")
+
+    def _load_shard_rows(self, *, dataset: str, shard_relpath: str) -> dict[int, dict[str, Any]]:
+        cache_key = f"{dataset}:{shard_relpath}"
+        cached = self._shard_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        shard_path = self._prediction_shard_path(dataset=str(dataset), shard_relpath=str(shard_relpath))
+        if not shard_path.exists():
+            raise FileNotFoundError(f"Future-prediction shard export not found: {shard_path}")
+        payload = torch.load(shard_path, map_location="cpu", weights_only=False)
+        rows_by_example_index = {
+            int(row_payload["example_index"]): row_payload
+            for row_payload in payload.get("rows", [])
+        }
+        self._shard_cache[cache_key] = rows_by_example_index
+        return rows_by_example_index
+
+    def duplicated_predicted_tx_for_row(self, row: Any) -> np.ndarray:
+        manifest_row = self._rows_by_key.get((str(row.shard_relpath), int(row.example_index)))
+        if manifest_row is None:
+            raise KeyError(
+                "Future-prediction export does not contain row "
+                f"{row.shard_relpath}:{row.example_index} ({getattr(row, 'example_id', 'unknown')})."
+            )
+        shard_rows = self._load_shard_rows(
+            dataset=str(manifest_row["dataset"]),
+            shard_relpath=str(row.shard_relpath),
+        )
+        payload = shard_rows.get(int(row.example_index))
+        if payload is None:
+            raise KeyError(f"Missing exported prediction payload for {row.shard_relpath}:{row.example_index}.")
+        forecast_raw = payload["forecast_raw"]
+        tensor = (
+            forecast_raw.detach().cpu().to(dtype=torch.float32)
+            if isinstance(forecast_raw, torch.Tensor)
+            else torch.as_tensor(forecast_raw, dtype=torch.float32)
+        )
+        if tensor.ndim == 3:
+            tensor = tensor[:, 0, :]
+        predicted_tx = tensor[:, : int(self.tx_dim)].numpy()
+        return np.repeat(np.asarray(predicted_tx, dtype=np.float32), max(1, int(self.temporal_bin_stride)), axis=0)
+
+
 def normalization_key_for_row(row: Any) -> str:
     block_num = getattr(row, "block_num", None)
     if block_num is not None:
@@ -56,6 +120,14 @@ def normalization_key_for_row(row: Any) -> str:
     if normalization_group is not None:
         return str(normalization_group)
     return str(row.session_id)
+
+
+def _stats_group_key(row: Any, *, mode: str) -> str:
+    if str(mode) == "block":
+        return normalization_key_for_row(row)
+    if str(mode) == "per_session":
+        return str(row.session_id)
+    raise ValueError(f"Unsupported grouped stats mode: {mode!r}")
 
 
 def normalization_stats_missing_rows(
@@ -78,6 +150,67 @@ def normalization_stats_missing_rows(
             continue
         missing.append(str(getattr(row, "example_id", row)))
     return missing
+
+
+def compute_predicted_tx_normalization_stats(
+    rows: tuple[Any, ...] | list[Any],
+    *,
+    export_accessor: FuturePredictionExportAccessor,
+    mode: str,
+) -> dict[str, tuple[np.ndarray, np.ndarray]] | tuple[np.ndarray, np.ndarray] | None:
+    resolved_mode = str(mode)
+    if resolved_mode == "none":
+        return None
+    if resolved_mode == "global":
+        total_count = 0
+        sum_x = None
+        sum_x2 = None
+        for row in rows:
+            x64 = export_accessor.duplicated_predicted_tx_for_row(row).astype(np.float64, copy=False)
+            if x64.shape[0] <= 0:
+                continue
+            if sum_x is None:
+                sum_x = x64.sum(axis=0)
+                sum_x2 = np.square(x64).sum(axis=0)
+            else:
+                sum_x += x64.sum(axis=0)
+                sum_x2 += np.square(x64).sum(axis=0)
+            total_count += int(x64.shape[0])
+        if sum_x is None or sum_x2 is None or total_count <= 0:
+            raise ValueError("Cannot compute predicted-tx global stats on an empty record set.")
+        mean = sum_x / total_count
+        var = np.maximum(sum_x2 / total_count - np.square(mean), 1e-6)
+        return mean.astype(np.float32), np.sqrt(var).astype(np.float32)
+    if resolved_mode not in {"block", "per_session"}:
+        raise ValueError("mode must be one of {'block', 'global', 'per_session', 'none'}")
+    grouped: dict[str, list[Any]] = {}
+    for row in rows:
+        grouped.setdefault(_stats_group_key(row, mode=resolved_mode), []).append(row)
+    stats: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    for key, group_rows in grouped.items():
+        total_count = 0
+        sum_x = None
+        sum_x2 = None
+        for row in group_rows:
+            x64 = export_accessor.duplicated_predicted_tx_for_row(row).astype(np.float64, copy=False)
+            if x64.shape[0] <= 0:
+                continue
+            if sum_x is None:
+                sum_x = x64.sum(axis=0)
+                sum_x2 = np.square(x64).sum(axis=0)
+            else:
+                sum_x += x64.sum(axis=0)
+                sum_x2 += np.square(x64).sum(axis=0)
+            total_count += int(x64.shape[0])
+        if sum_x is None or sum_x2 is None or total_count <= 0:
+            raise ValueError(f"Cannot compute predicted-tx stats for empty group {key!r}.")
+        mean = sum_x / total_count
+        var = np.maximum(sum_x2 / total_count - np.square(mean), 1e-6)
+        stats[str(key)] = (
+            mean.astype(np.float32, copy=False),
+            np.sqrt(var).astype(np.float32, copy=False),
+        )
+    return stats
 
 
 def adapter_keys_from_rows(
@@ -356,6 +489,69 @@ def compute_willett_normalization_stats(
     finally:
         accessor.close()
 
+
+class ConcatenatedPredictedTxSequenceDataset(torch.utils.data.Dataset):
+    def __init__(
+        self,
+        rows: tuple[Any, ...] | list[Any],
+        *,
+        cache_root: Path,
+        raw_stats: dict[str, tuple[np.ndarray, np.ndarray]] | tuple[np.ndarray, np.ndarray] | None,
+        predicted_stats: dict[str, tuple[np.ndarray, np.ndarray]] | tuple[np.ndarray, np.ndarray] | None,
+        export_accessor: FuturePredictionExportAccessor,
+        boundary_key_mode: str = "session",
+        dataset: str = "brain2text24",
+    ) -> None:
+        self.rows = list(rows)
+        self.raw_stats = raw_stats
+        self.predicted_stats = predicted_stats
+        self.boundary_key_mode = str(boundary_key_mode)
+        self.dataset = str(dataset)
+        self.export_accessor = export_accessor
+        self._base = CanonicalSequenceDataset(
+            self.rows,
+            cache_root=cache_root,
+            stats=None,
+            feature_mode="tx_only",
+            boundary_key_mode=self.boundary_key_mode,
+            dataset=self.dataset,
+        )
+        self._accessor = self._base._accessor
+
+    def __len__(self) -> int:
+        return len(self.rows)
+
+    def __getitem__(self, idx: int) -> dict[str, Any]:
+        row = self.rows[idx]
+        raw_tx = np.asarray(self._accessor.load_features(row, feature_mode="tx_only"), dtype=np.float32)
+        predicted_tx = np.asarray(self.export_accessor.duplicated_predicted_tx_for_row(row), dtype=np.float32)
+        usable = min(int(raw_tx.shape[0]), int(predicted_tx.shape[0]))
+        if usable <= 0:
+            raise ValueError(f"Concatenated predicted-tx example has no usable frames: {row.example_id}")
+        raw_tx = np.asarray(raw_tx[:usable], dtype=np.float32)
+        predicted_tx = np.asarray(predicted_tx[:usable], dtype=np.float32)
+        if self.raw_stats is not None:
+            raw_tx = apply_feature_stats(raw_tx, row=row, stats=self.raw_stats)
+        if self.predicted_stats is not None:
+            predicted_tx = apply_feature_stats(predicted_tx, row=row, stats=self.predicted_stats)
+        x = np.concatenate([raw_tx, predicted_tx], axis=1).astype(np.float32, copy=False)
+        labels = self._accessor.load_labels(row)
+        labels = np.zeros((0,), dtype=np.int64) if labels is None else np.array(labels, dtype=np.int64, copy=True)
+        return {
+            "x": torch.from_numpy(x),
+            "input_length": int(x.shape[0]),
+            "labels": torch.from_numpy(labels),
+            "label_length": int(labels.shape[0]),
+            "session_id": row.session_id,
+            "boundary_key": resolve_boundary_key(
+                dataset=self.dataset,
+                session_id=row.session_id,
+                subject_id=None if getattr(row, "subject_id", None) is None else str(row.subject_id),
+                boundary_key_mode=self.boundary_key_mode,
+            ),
+            "example_id": row.example_id,
+        }
+
 def make_length_aware_batch_sampler(
     rows: tuple[Any, ...] | list[Any],
     *,
@@ -385,9 +581,12 @@ def loader_kwargs(device: torch.device) -> dict[str, Any]:
 
 __all__ = [
     "CanonicalSequenceDataset",
+    "ConcatenatedPredictedTxSequenceDataset",
+    "FuturePredictionExportAccessor",
     "WillettInputTransformConfig",
     "adapter_keys_from_rows",
     "build_willett_problem",
+    "compute_predicted_tx_normalization_stats",
     "compute_willett_normalization_stats",
     "collate_sequence_batch",
     "compute_feature_stats",

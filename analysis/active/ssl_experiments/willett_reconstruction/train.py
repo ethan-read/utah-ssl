@@ -7,7 +7,7 @@ import json
 import math
 import random
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -33,9 +33,12 @@ except ModuleNotFoundError:  # pragma: no cover - repo-root unittest fallback
     )
 
 from .data import (
+    ConcatenatedPredictedTxSequenceDataset,
+    FuturePredictionExportAccessor,
     WillettInputTransformConfig,
     adapter_keys_from_rows,
     build_willett_problem,
+    compute_predicted_tx_normalization_stats,
     compute_willett_normalization_stats,
     group_rows_by_adapter_key,
     loader_kwargs,
@@ -90,6 +93,8 @@ class WillettReconstructionConfig:
     patch_size: int = 14
     patch_stride: int = 4
     session_adapter_enabled: bool = True
+    input_feature_source: str = "raw"
+    predicted_export_root: str | Path | None = None
     input_smoothing_sigma_bins: float = 2.0
     input_smoothing_kernel_size: int = 100
     input_smoothing_threshold: float = 0.01
@@ -127,6 +132,13 @@ class WillettReconstructionConfig:
             raise ValueError("input_projection_size must be positive")
         if self.decoder_backbone_type not in {"gru", "s5", "s4d"}:
             raise ValueError("decoder_backbone_type must be one of {'gru', 's5', 's4d'}")
+        if self.input_feature_source not in {"raw", "raw_plus_predicted_tx"}:
+            raise ValueError("input_feature_source must be one of {'raw', 'raw_plus_predicted_tx'}")
+        if self.input_feature_source == "raw_plus_predicted_tx":
+            if self.predicted_export_root is None:
+                raise ValueError("predicted_export_root is required when input_feature_source='raw_plus_predicted_tx'")
+            if self.feature_mode != "tx_only":
+                raise ValueError("raw_plus_predicted_tx currently requires feature_mode='tx_only'")
         if int(self.gru_hidden_size) <= 0 or int(self.gru_num_layers) <= 0:
             raise ValueError("GRU sizes must be positive")
         if int(self.s5_hidden_size) <= 0 or int(self.s5_state_size) <= 0 or int(self.s5_num_layers) <= 0:
@@ -294,7 +306,17 @@ def run_willett_reconstruction(config: WillettReconstructionConfig) -> dict[str,
     checkpoint_final_path = run_dir / "checkpoint_final.pt"
     checkpoints_dir.mkdir(parents=True, exist_ok=True)
 
-    sample_dim = int(problem["train_rows"][0].n_tx_features if config.feature_mode == "tx_only" else problem["train_rows"][0].n_tx_features + problem["train_rows"][0].n_sbp_features)
+    base_sample_dim = int(
+        problem["train_rows"][0].n_tx_features
+        if config.feature_mode == "tx_only"
+        else problem["train_rows"][0].n_tx_features + problem["train_rows"][0].n_sbp_features
+    )
+    export_accessor = (
+        FuturePredictionExportAccessor(config.predicted_export_root)
+        if str(config.input_feature_source) == "raw_plus_predicted_tx"
+        else None
+    )
+    sample_dim = int(base_sample_dim * 2 if export_accessor is not None else base_sample_dim)
     loaded_stats_path = None
     stats_metadata = None
     if str(config.normalization_mode) == "global" and (
@@ -316,7 +338,7 @@ def run_willett_reconstruction(config: WillettReconstructionConfig) -> dict[str,
             boundary_key_mode=str(problem["boundary_key_mode"]),
             train_split_name=str(problem["train_split_name"]),
             val_split_name=str(problem["val_split_name"]),
-            expected_dim=sample_dim,
+            expected_dim=base_sample_dim,
         )
         train_stats = (
             mean_t.numpy().astype(np.float32, copy=False),
@@ -347,18 +369,51 @@ def run_willett_reconstruction(config: WillettReconstructionConfig) -> dict[str,
             f"First missing examples: {preview}"
         )
 
-    val_dataset = CanonicalSequenceDataset(
-        problem["val_rows"],
-        cache_root=Path(problem["cache_root"]),
-        stats=val_stats,
-        feature_mode=str(problem["feature_mode"]),
-        boundary_key_mode=str(problem["boundary_key_mode"]),
-        dataset=str(problem["dataset"]),
+    predicted_train_stats = (
+        compute_predicted_tx_normalization_stats(
+            problem["train_rows"],
+            export_accessor=export_accessor,
+            mode=str(config.normalization_mode),
+        )
+        if export_accessor is not None
+        else None
     )
+    predicted_val_stats = predicted_train_stats
+    if export_accessor is None:
+        val_dataset = CanonicalSequenceDataset(
+            problem["val_rows"],
+            cache_root=Path(problem["cache_root"]),
+            stats=val_stats,
+            feature_mode=str(problem["feature_mode"]),
+            boundary_key_mode=str(problem["boundary_key_mode"]),
+            dataset=str(problem["dataset"]),
+        )
+    else:
+        val_dataset = ConcatenatedPredictedTxSequenceDataset(
+            problem["val_rows"],
+            cache_root=Path(problem["cache_root"]),
+            raw_stats=val_stats,
+            predicted_stats=predicted_val_stats,
+            export_accessor=export_accessor,
+            boundary_key_mode=str(problem["boundary_key_mode"]),
+            dataset=str(problem["dataset"]),
+        )
+    val_sampler_rows = problem["val_rows"]
+    if export_accessor is not None:
+        val_sampler_rows = tuple(
+            replace(
+                row,
+                n_time_bins=min(
+                    int(getattr(row, "n_time_bins", 0) or 0),
+                    int(export_accessor.duplicated_predicted_tx_for_row(row).shape[0]),
+                ),
+            )
+            for row in problem["val_rows"]
+        )
     val_loader = DataLoader(
         val_dataset,
         batch_sampler=make_length_aware_batch_sampler(
-            problem["val_rows"],
+            val_sampler_rows,
             batch_size=int(config.batch_size),
             shuffle=False,
             seed=int(config.seed) + 1,
@@ -381,8 +436,21 @@ def run_willett_reconstruction(config: WillettReconstructionConfig) -> dict[str,
         boundary_key_mode=str(problem["boundary_key_mode"]),
     )
     session_adapter_keys = tuple(dict.fromkeys(train_adapter_keys + val_adapter_keys))
-    train_loaders_by_adapter_key = {
-        adapter_key: DataLoader(
+    train_loaders_by_adapter_key = {}
+    for adapter_idx, (adapter_key, adapter_rows) in enumerate(train_rows_by_adapter_key.items(), start=1):
+        sampler_rows = adapter_rows
+        if export_accessor is not None:
+            sampler_rows = tuple(
+                replace(
+                    row,
+                    n_time_bins=min(
+                        int(getattr(row, "n_time_bins", 0) or 0),
+                        int(export_accessor.duplicated_predicted_tx_for_row(row).shape[0]),
+                    ),
+                )
+                for row in adapter_rows
+            )
+        dataset_obj = (
             CanonicalSequenceDataset(
                 adapter_rows,
                 cache_root=Path(problem["cache_root"]),
@@ -390,17 +458,28 @@ def run_willett_reconstruction(config: WillettReconstructionConfig) -> dict[str,
                 feature_mode=str(problem["feature_mode"]),
                 boundary_key_mode=str(problem["boundary_key_mode"]),
                 dataset=str(problem["dataset"]),
-            ),
-            batch_sampler=make_length_aware_batch_sampler(
+            )
+            if export_accessor is None
+            else ConcatenatedPredictedTxSequenceDataset(
                 adapter_rows,
+                cache_root=Path(problem["cache_root"]),
+                raw_stats=train_stats,
+                predicted_stats=predicted_train_stats,
+                export_accessor=export_accessor,
+                boundary_key_mode=str(problem["boundary_key_mode"]),
+                dataset=str(problem["dataset"]),
+            )
+        )
+        train_loaders_by_adapter_key[adapter_key] = DataLoader(
+            dataset_obj,
+            batch_sampler=make_length_aware_batch_sampler(
+                sampler_rows,
                 batch_size=int(config.batch_size),
                 shuffle=True,
                 seed=int(config.seed) + adapter_idx,
             ),
             **loader_kwargs(device),
         )
-        for adapter_idx, (adapter_key, adapter_rows) in enumerate(train_rows_by_adapter_key.items(), start=1)
-    }
     model = WillettPhonemeModel(
         input_dim=sample_dim,
         vocab_size=int(problem["vocab"]["num_classes"]),
@@ -629,6 +708,8 @@ def run_willett_reconstruction(config: WillettReconstructionConfig) -> dict[str,
         "cv_num_folds": problem.get("cv_num_folds"),
         "cv_fold_index": problem.get("cv_fold_index"),
         "normalization_mode": str(config.normalization_mode),
+        "input_feature_source": str(config.input_feature_source),
+        "predicted_export_root": None if config.predicted_export_root is None else str(config.predicted_export_root),
         "train_examples": int(len(problem["train_rows"])),
         "val_examples": int(len(problem["val_rows"])),
         "train_session_ids": list(problem["train_session_ids"]),
@@ -707,6 +788,12 @@ def _parse_args() -> WillettReconstructionConfig:
     parser.add_argument("--s4d-ffn-multiplier", type=float, default=2.0)
     parser.add_argument("--patch-size", type=int, default=14)
     parser.add_argument("--patch-stride", type=int, default=4)
+    parser.add_argument(
+        "--input-feature-source",
+        choices=("raw", "raw_plus_predicted_tx"),
+        default="raw",
+    )
+    parser.add_argument("--predicted-export-root", type=str, default=None)
     parser.add_argument("--input-smoothing-sigma-bins", type=float, default=2.0)
     parser.add_argument("--input-smoothing-kernel-size", type=int, default=100)
     parser.add_argument("--input-smoothing-threshold", type=float, default=0.01)
@@ -760,6 +847,8 @@ def _parse_args() -> WillettReconstructionConfig:
         patch_size=int(args.patch_size),
         patch_stride=int(args.patch_stride),
         session_adapter_enabled=not bool(args.disable_session_adapter),
+        input_feature_source=str(args.input_feature_source),
+        predicted_export_root=args.predicted_export_root,
         input_smoothing_sigma_bins=float(args.input_smoothing_sigma_bins),
         input_smoothing_kernel_size=int(args.input_smoothing_kernel_size),
         input_smoothing_threshold=float(args.input_smoothing_threshold),
