@@ -152,7 +152,7 @@ def evaluate_checkpoint(
         model=model,
         loader=loader,
         device=device,
-        blank_index=int(problem["vocab"]["blank_id"]),
+        blank_index=int(problem["vocab"]["blank_index"]),
         input_transform_config=_build_input_transform_config(config),
     )
     return {
