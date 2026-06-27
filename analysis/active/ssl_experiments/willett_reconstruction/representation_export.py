@@ -115,6 +115,7 @@ class RepresentationExportConfig:
     export_root: str | Path
     model_key: str
     split: str = "val"
+    allowed_session_ids: tuple[str, ...] | list[str] | None = None
     max_examples: int | None = None
     batch_size: int = 32
     shard_size_tokens: int = 50000
@@ -355,13 +356,21 @@ def _load_train_stats(
     ), None
 
 
-def _select_rows(problem: dict[str, Any], split: str, max_examples: int | None) -> tuple[Any, ...]:
+def _select_rows(
+    problem: dict[str, Any],
+    split: str,
+    max_examples: int | None,
+    allowed_session_ids: tuple[str, ...] | list[str] | None = None,
+) -> tuple[Any, ...]:
     if str(split) == "train":
         rows = tuple(problem["train_rows"])
     elif str(split) in {"val", "test", "competition_test"}:
         rows = tuple(problem["val_rows"])
     else:
         raise ValueError("split must be one of {'train', 'val', 'test', 'competition_test'}")
+    if allowed_session_ids is not None:
+        allowed = {str(session_id) for session_id in allowed_session_ids}
+        rows = tuple(row for row in rows if str(row.session_id) in allowed)
     if max_examples is not None:
         rows = rows[: int(max_examples)]
     if not rows:
@@ -489,7 +498,12 @@ def export_willett_representations(config: RepresentationExportConfig) -> dict[s
         if export_accessor is not None
         else None
     )
-    selected_rows = _select_rows(problem, config.split, config.max_examples)
+    selected_rows = _select_rows(
+        problem,
+        config.split,
+        config.max_examples,
+        config.allowed_session_ids,
+    )
     missing_rows = normalization_stats_missing_rows(train_stats, selected_rows)
     if missing_rows:
         raise ValueError(
@@ -691,7 +705,7 @@ def export_willett_representations(config: RepresentationExportConfig) -> dict[s
         "created_utc": _timestamp_utc(),
         "model_key": str(config.model_key),
         "checkpoint_path": str(checkpoint_path),
-        "checkpoint_step": int(payload.get("step", -1)),
+        "checkpoint_step": int(payload.get("step", payload.get("steps", -1))),
         "dataset": str(problem["dataset"]),
         "feature_mode": str(problem["feature_mode"]),
         "boundary_key_mode": str(problem["boundary_key_mode"]),

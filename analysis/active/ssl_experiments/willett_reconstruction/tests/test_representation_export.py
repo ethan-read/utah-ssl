@@ -31,6 +31,10 @@ from analysis.active.ssl_experiments.willett_reconstruction.representation_expor
     export_willett_representations,
     patch_timing_for_token,
 )
+from analysis.active.ssl_experiments.willett_reconstruction.released_tf_checkpoint import (
+    _reorder_keras_gru_gates,
+    _reorder_stanford_logits_to_local_vocab,
+)
 from analysis.active.ssl_experiments.willett_reconstruction.tests.test_willett_reconstruction import (
     _write_tiny_competition_probe_cache,
 )
@@ -84,6 +88,22 @@ class WillettRepresentationExportTest(unittest.TestCase):
         self.assertEqual(timing["patch_end_bin"], 26)
         self.assertEqual(timing["patch_start_ms"], 240)
         self.assertEqual(timing["patch_end_ms"], 520)
+
+    def test_released_checkpoint_gate_reorder_maps_keras_to_torch(self) -> None:
+        value = np.arange(12, dtype=np.float32).reshape(2, 6)
+        reordered = _reorder_keras_gru_gates(value)
+        np.testing.assert_array_equal(
+            reordered,
+            np.array([[2, 3, 0, 1, 4, 5], [8, 9, 6, 7, 10, 11]], dtype=np.float32),
+        )
+
+    def test_released_checkpoint_classifier_reorder_moves_blank_to_zero(self) -> None:
+        kernel = np.arange(2 * 41, dtype=np.float32).reshape(2, 41)
+        bias = np.arange(41, dtype=np.float32)
+        reordered_kernel, reordered_bias = _reorder_stanford_logits_to_local_vocab(kernel, bias)
+        np.testing.assert_array_equal(reordered_kernel[:, 0], kernel[:, 40])
+        np.testing.assert_array_equal(reordered_kernel[:, 1:], kernel[:, :40])
+        np.testing.assert_array_equal(reordered_bias, np.concatenate([bias[40:41], bias[:40]]))
 
     def test_export_writes_consistent_shards_and_tables(self) -> None:
         cache_root = self._tmp_dir()
