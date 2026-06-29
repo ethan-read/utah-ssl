@@ -89,6 +89,25 @@ class WillettRepresentationExportTest(unittest.TestCase):
         self.assertEqual(timing["patch_start_ms"], 240)
         self.assertEqual(timing["patch_end_ms"], 520)
 
+    def test_existing_export_without_input_windows_must_be_regenerated(self) -> None:
+        checkpoint_path = self._tmp_dir() / "checkpoint_best.pt"
+        checkpoint_path.write_bytes(b"placeholder")
+        export_root = self._tmp_dir()
+        export_dir = export_root / "tiny_gru"
+        export_dir.mkdir(parents=True)
+        (export_dir / "metadata.json").write_text(json.dumps({"input_window_dim": None}))
+
+        with self.assertRaisesRegex(FileExistsError, "does not contain saved input windows"):
+            export_willett_representations(
+                RepresentationExportConfig(
+                    checkpoint_path=checkpoint_path,
+                    export_root=export_root,
+                    model_key="tiny_gru",
+                    save_input_windows=True,
+                    overwrite=False,
+                )
+            )
+
     def test_released_checkpoint_gate_reorder_maps_keras_to_torch(self) -> None:
         value = np.arange(12, dtype=np.float32).reshape(2, 6)
         reordered = _reorder_keras_gru_gates(value)
@@ -198,6 +217,7 @@ class WillettRepresentationExportTest(unittest.TestCase):
                 batch_size=2,
                 shard_size_tokens=3,
                 overwrite=True,
+                save_input_windows=True,
             )
         )
 
@@ -212,6 +232,8 @@ class WillettRepresentationExportTest(unittest.TestCase):
         self.assertEqual(int(tokens.shape[0]), int(metadata["token_count"]))
         self.assertEqual(int(examples.shape[0]), 2)
         self.assertIn("hidden_dim", metadata)
+        self.assertEqual(metadata["input_window_dim"], 6)
+        self.assertEqual(metadata["adapted_input_window_dim"], 16)
         self.assertIn("transition_type", tokens.columns)
         shard_manifest = json.loads((export_dir / "shards.json").read_text())
         self.assertGreaterEqual(len(shard_manifest), 1)
@@ -219,6 +241,10 @@ class WillettRepresentationExportTest(unittest.TestCase):
         for shard in shard_manifest:
             arrays = np.load(export_dir / "shards" / shard["shard"])
             self.assertEqual(arrays["hidden"].shape[0], arrays["logits"].shape[0])
+            self.assertEqual(arrays["hidden"].shape[0], arrays["input_windows"].shape[0])
+            self.assertEqual(arrays["hidden"].shape[0], arrays["adapted_input_windows"].shape[0])
+            self.assertEqual(arrays["input_windows"].shape[1], 6)
+            self.assertEqual(arrays["adapted_input_windows"].shape[1], 16)
             shard_token_count += int(arrays["hidden"].shape[0])
         self.assertEqual(shard_token_count, int(metadata["token_count"]))
 

@@ -125,6 +125,7 @@ class RepresentationExportConfig:
     repo_dir: str | Path | None = None
     cache_root_override: str | Path | None = None
     precomputed_split_stats_path_override: str | Path | None = None
+    save_input_windows: bool = False
 
 
 def _timestamp_utc() -> str:
@@ -423,21 +424,30 @@ def _flush_shard(
     shard_dir.mkdir(parents=True, exist_ok=True)
     shard_name = f"part-{int(shard_index):05d}.npz"
     shard_path = shard_dir / shard_name
-    np.savez_compressed(
-        shard_path,
-        hidden=hidden,
-        logits=logits,
-        token_example_index=token_example_index,
-        token_index=token_index,
-        patch_start_bin=patch_start_bin,
-        patch_end_bin=patch_end_bin,
-    )
-    return {
+    shard_arrays: dict[str, np.ndarray] = {
+        "hidden": hidden,
+        "logits": logits,
+        "token_example_index": token_example_index,
+        "token_index": token_index,
+        "patch_start_bin": patch_start_bin,
+        "patch_end_bin": patch_end_bin,
+    }
+    shard_payload: dict[str, Any] = {
         "shard": shard_name,
         "token_count": int(hidden.shape[0]),
         "hidden_dim": int(hidden.shape[1]),
         "vocab_size": int(logits.shape[1]),
     }
+    if arrays.get("input_windows"):
+        input_windows = np.concatenate(arrays["input_windows"], axis=0).astype(np.float32, copy=False)
+        shard_arrays["input_windows"] = input_windows
+        shard_payload["input_window_dim"] = int(input_windows.shape[1])
+    if arrays.get("adapted_input_windows"):
+        adapted_input_windows = np.concatenate(arrays["adapted_input_windows"], axis=0).astype(np.float32, copy=False)
+        shard_arrays["adapted_input_windows"] = adapted_input_windows
+        shard_payload["adapted_input_window_dim"] = int(adapted_input_windows.shape[1])
+    np.savez_compressed(shard_path, **shard_arrays)
+    return shard_payload
 
 
 def export_willett_representations(config: RepresentationExportConfig) -> dict[str, Any]:
@@ -449,7 +459,13 @@ def export_willett_representations(config: RepresentationExportConfig) -> dict[s
         if not bool(config.overwrite):
             metadata_path = export_dir / "metadata.json"
             if metadata_path.exists():
-                return json.loads(metadata_path.read_text())
+                metadata = json.loads(metadata_path.read_text())
+                if bool(config.save_input_windows) and metadata.get("input_window_dim") is None:
+                    raise FileExistsError(
+                        "Existing representation export does not contain saved input windows. "
+                        f"Set overwrite=True to regenerate it: {export_dir}"
+                    )
+                return metadata
             raise FileExistsError(f"Export directory exists without metadata.json: {export_dir}")
         shutil.rmtree(export_dir)
     export_dir.mkdir(parents=True, exist_ok=True)
@@ -572,6 +588,9 @@ def export_willett_representations(config: RepresentationExportConfig) -> dict[s
         "patch_start_bin": [],
         "patch_end_bin": [],
     }
+    if bool(config.save_input_windows):
+        arrays["input_windows"] = []
+        arrays["adapted_input_windows"] = []
     shard_index = 0
     buffered_tokens = 0
     total_tokens = 0
@@ -588,9 +607,17 @@ def export_willett_representations(config: RepresentationExportConfig) -> dict[s
                 config=transform_config,
                 is_training=False,
             )
+            input_windows = None
+            if bool(config.save_input_windows):
+                input_windows = model._patch_batch(x, input_lengths)[0].detach().cpu().numpy()
             outputs = model(x, input_lengths, session_ids=batch["boundary_keys"])
             hidden = outputs["hidden"].detach().cpu().numpy()
             logits = outputs["logits"].detach().cpu().numpy()
+            adapted_input_windows = (
+                outputs["patched_inputs"].detach().cpu().numpy()
+                if bool(config.save_input_windows)
+                else None
+            )
             token_lengths = outputs["token_lengths"].detach().cpu().numpy().astype(np.int64)
             decoded = ctc_greedy_decode(
                 outputs["logits"].detach().cpu(),
@@ -610,6 +637,16 @@ def export_willett_representations(config: RepresentationExportConfig) -> dict[s
                     continue
                 row_hidden = hidden[batch_idx, :length]
                 row_logits = logits[batch_idx, :length]
+                row_input_windows = (
+                    input_windows[batch_idx, :length]
+                    if input_windows is not None
+                    else None
+                )
+                row_adapted_input_windows = (
+                    adapted_input_windows[batch_idx, :length]
+                    if adapted_input_windows is not None
+                    else None
+                )
                 row_probs = probs[batch_idx, :length]
                 row_category_frame = category_probability_frame(row_probs, vocab=vocab)
                 top_ids = row_probs.argmax(axis=1).astype(np.int64)
@@ -621,6 +658,10 @@ def export_willett_representations(config: RepresentationExportConfig) -> dict[s
 
                 arrays["hidden"].append(row_hidden)
                 arrays["logits"].append(row_logits)
+                if row_input_windows is not None:
+                    arrays["input_windows"].append(row_input_windows)
+                if row_adapted_input_windows is not None:
+                    arrays["adapted_input_windows"].append(row_adapted_input_windows)
                 arrays["token_example_index"].append(np.full((length,), example_export_index, dtype=np.int64))
                 arrays["token_index"].append(token_indices)
                 arrays["patch_start_bin"].append(patch_start.astype(np.int64, copy=False))
@@ -726,6 +767,16 @@ def export_willett_representations(config: RepresentationExportConfig) -> dict[s
         "example_count": int(total_examples),
         "token_count": int(total_tokens),
         "hidden_dim": int(model.decoder_output_size),
+        "input_window_dim": (
+            int(sample_dim) * int(model_config.patch_size)
+            if bool(config.save_input_windows)
+            else None
+        ),
+        "adapted_input_window_dim": (
+            int(model.adapter_output_dim) * int(model_config.patch_size)
+            if bool(config.save_input_windows)
+            else None
+        ),
         "vocab": _json_safe(vocab),
         "category_order": list(PHONEME_CATEGORY_ORDER),
         "consonant_categories": sorted(CONSONANT_CATEGORIES),
