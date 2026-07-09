@@ -8,14 +8,14 @@ from pathlib import Path
 
 import numpy as np
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
+REPO_ROOT = Path(__file__).resolve().parents[5]
 EXPERIMENTS_DIR = REPO_ROOT / "analysis" / "active" / "ssl_experiments"
 for path in (REPO_ROOT, EXPERIMENTS_DIR):
     path_str = str(path)
     if path_str not in sys.path:
         sys.path.insert(0, path_str)
 
-from trim_area6v_cache import trim_area6v_cache
+from ssl_core.scripts.trim_area6v_cache import trim_area6v_cache
 from masked_ssl.probe import CanonicalShardAccessor, build_competition_split_problem
 
 

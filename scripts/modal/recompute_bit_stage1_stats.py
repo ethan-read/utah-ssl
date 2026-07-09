@@ -59,7 +59,7 @@ def recompute_stats() -> dict[str, str]:
 
     command = [
         sys.executable,
-        "analysis/active/ssl_experiments/recompute_session_feature_stats.py",
+        "analysis/active/ssl_experiments/ssl_core/scripts/recompute_session_feature_stats.py",
         "--cache-root",
         str(cache_root),
         "--output-path",

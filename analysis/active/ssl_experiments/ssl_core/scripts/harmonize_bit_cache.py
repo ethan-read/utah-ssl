@@ -7,11 +7,19 @@ import json
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+import sys
+
+EXPERIMENTS_DIR = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[5]
+for _path in (REPO_ROOT, EXPERIMENTS_DIR):
+    _path_str = str(_path)
+    if _path_str not in sys.path:
+        sys.path.insert(0, _path_str)
 from typing import Any
 
 import numpy as np
 
-from bit_cache_contract import (
+from ssl_core.bit_cache_contract import (
     BIT_CANONICAL_FEATURE_POLICY,
     BIT_STAGE1_BOUNDARY_KEY_MODE,
     BIT_STAGE1_DEFAULT_EXCLUDED_DATASETS,
@@ -19,7 +27,7 @@ from bit_cache_contract import (
     BIT_STAGE1_FEATURE_MODE,
     BIT_STAGE1_TX_DIM,
 )
-from trim_area6v_cache import trim_area6v_cache
+from ssl_core.scripts.trim_area6v_cache import trim_area6v_cache
 
 
 @dataclass(frozen=True)

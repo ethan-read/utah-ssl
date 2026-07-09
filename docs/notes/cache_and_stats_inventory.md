@@ -22,7 +22,7 @@ Current feature-mode semantics are therefore:
 
 Older full-array cache artifacts with `256` TX + `256` SBP columns should be
 trimmed in place with
-`analysis/active/ssl_experiments/trim_area6v_cache.py`. Recompute all reusable
+`analysis/active/ssl_experiments/ssl_core/scripts/trim_area6v_cache.py`. Recompute all reusable
 normalization stats after trimming; checkpoints trained with the old
 `256`-dimensional `tx_only` or `512`-dimensional `tx_sbp` layouts should not be
 resumed.

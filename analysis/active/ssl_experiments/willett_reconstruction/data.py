@@ -19,6 +19,7 @@ try:
         CanonicalSequenceDataset,
         LengthAwareBatchSampler,
         build_competition_split_problem,
+        build_source_split_problem,
         canonical_rows_padded_time_percentile,
         collate_sequence_batch,
     )
@@ -34,6 +35,7 @@ except ModuleNotFoundError:  # pragma: no cover - repo-root unittest fallback
         CanonicalSequenceDataset,
         LengthAwareBatchSampler,
         build_competition_split_problem,
+        build_source_split_problem,
         canonical_rows_padded_time_percentile,
         collate_sequence_batch,
     )
@@ -347,16 +349,37 @@ def build_willett_problem(
     cv_num_folds: int = 5,
     cv_fold_index: int = 0,
 ) -> dict[str, Any]:
+    if str(split_policy) == "competition_train_test":
+        problem = build_competition_split_problem(
+            cache_root=Path(cache_root),
+            dataset=str(dataset),
+            feature_mode=str(feature_mode),
+            boundary_key_mode=str(boundary_key_mode),
+        )
+        return problem
+    if str(split_policy) == "source_train_val":
+        problem = build_source_split_problem(
+            cache_root=Path(cache_root),
+            dataset=str(dataset),
+            feature_mode=str(feature_mode),
+            boundary_key_mode=str(boundary_key_mode),
+            train_split_name="train",
+            val_split_name="val",
+        )
+        updated = dict(problem)
+        updated["split_policy"] = "source_train_val"
+        return updated
+    if str(split_policy) != "competition_train_kfold":
+        raise ValueError(
+            "split_policy must be one of "
+            "{'competition_train_test', 'competition_train_kfold', 'source_train_val'}"
+        )
     problem = build_competition_split_problem(
         cache_root=Path(cache_root),
         dataset=str(dataset),
         feature_mode=str(feature_mode),
         boundary_key_mode=str(boundary_key_mode),
     )
-    if str(split_policy) == "competition_train_test":
-        return problem
-    if str(split_policy) != "competition_train_kfold":
-        raise ValueError("split_policy must be one of {'competition_train_test', 'competition_train_kfold'}")
 
     num_folds = int(cv_num_folds)
     fold_index = int(cv_fold_index)

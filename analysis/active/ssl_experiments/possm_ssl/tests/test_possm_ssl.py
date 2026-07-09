@@ -13,10 +13,10 @@ import numpy as np
 import torch
 
 from masked_ssl.cache import _compute_cache_source_signature
-from recompute_split_feature_stats import (
+from ssl_core.scripts.recompute_split_feature_stats import (
     resolve_precomputed_split_stats_path as resolve_canonical_split_stats_path,
 )
-from analysis.active.ssl_experiments.stats_artifact_test_utils import (
+from analysis.active.ssl_experiments.ssl_core.stats_artifact_test_utils import (
     write_valid_split_stats_artifact as _write_valid_split_stats_artifact,
 )
 

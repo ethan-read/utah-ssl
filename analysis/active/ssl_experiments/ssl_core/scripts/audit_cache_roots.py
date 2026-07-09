@@ -8,6 +8,14 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+import sys
+
+EXPERIMENTS_DIR = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[5]
+for _path in (REPO_ROOT, EXPERIMENTS_DIR):
+    _path_str = str(_path)
+    if _path_str not in sys.path:
+        sys.path.insert(0, _path_str)
 from typing import Any, Iterable, Sequence
 
 import numpy as np

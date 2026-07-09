@@ -6,6 +6,14 @@ import argparse
 import json
 from datetime import datetime, timezone
 from pathlib import Path
+import sys
+
+EXPERIMENTS_DIR = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[5]
+for _path in (REPO_ROOT, EXPERIMENTS_DIR):
+    _path_str = str(_path)
+    if _path_str not in sys.path:
+        sys.path.insert(0, _path_str)
 from typing import Any
 
 import torch
@@ -18,7 +26,11 @@ try:
         _load_artifact_payload_and_sidecar,
         _validate_common_artifact_metadata,
     )
-    from masked_ssl.probe import build_competition_split_problem, compute_feature_stats
+    from masked_ssl.probe import (
+        build_competition_split_problem,
+        build_source_split_problem,
+        compute_feature_stats,
+    )
 except ModuleNotFoundError:  # pragma: no cover - repo-root unittest fallback
     from analysis.active.ssl_experiments.masked_ssl.cache import (
         _cache_variant_name,
@@ -29,6 +41,7 @@ except ModuleNotFoundError:  # pragma: no cover - repo-root unittest fallback
     )
     from analysis.active.ssl_experiments.masked_ssl.probe import (
         build_competition_split_problem,
+        build_source_split_problem,
         compute_feature_stats,
     )
 
@@ -68,12 +81,13 @@ def build_recompute_split_feature_stats_command(
     dataset: str,
     feature_mode: str,
     boundary_key_mode: str,
+    split_policy: str,
     output_path: str | Path,
 ) -> str:
     return " ".join(
         [
             "python",
-            "analysis/active/ssl_experiments/recompute_split_feature_stats.py",
+            "analysis/active/ssl_experiments/ssl_core/scripts/recompute_split_feature_stats.py",
             "--cache-root",
             str(Path(cache_root)),
             "--dataset",
@@ -82,6 +96,8 @@ def build_recompute_split_feature_stats_command(
             str(feature_mode),
             "--boundary-key-mode",
             str(boundary_key_mode),
+            "--split-policy",
+            str(split_policy),
             "--output-path",
             str(Path(output_path)),
             "--overwrite",
@@ -117,6 +133,7 @@ def load_precomputed_split_feature_stats(
     train_split_name: str,
     val_split_name: str,
     expected_dim: int,
+    split_policy: str = "competition_train_test",
 ) -> tuple[tuple[torch.Tensor, torch.Tensor], dict[str, Any], Path]:
     path = Path(stats_path)
     canonical_path = _default_output_path(
@@ -130,6 +147,7 @@ def load_precomputed_split_feature_stats(
         dataset=str(dataset),
         feature_mode=str(feature_mode),
         boundary_key_mode=str(boundary_key_mode),
+        split_policy=str(split_policy),
         output_path=canonical_path,
     )
     payload, metadata, path, _ = _load_artifact_payload_and_sidecar(
@@ -198,18 +216,32 @@ def recompute_split_feature_stats(
     dataset: str = DEFAULT_DATASET,
     feature_mode: str = DEFAULT_FEATURE_MODE,
     boundary_key_mode: str = DEFAULT_BOUNDARY_KEY_MODE,
+    split_policy: str = "competition_train_test",
     overwrite: bool = False,
 ) -> dict[str, Any]:
     cache_root = Path(cache_root)
     if not cache_root.is_dir():
         raise FileNotFoundError(f"Cache root does not exist: {cache_root}")
 
-    problem = build_competition_split_problem(
-        cache_root=cache_root,
-        dataset=str(dataset),
-        feature_mode=str(feature_mode),
-        boundary_key_mode=str(boundary_key_mode),
-    )
+    if str(split_policy) == "competition_train_test":
+        problem = build_competition_split_problem(
+            cache_root=cache_root,
+            dataset=str(dataset),
+            feature_mode=str(feature_mode),
+            boundary_key_mode=str(boundary_key_mode),
+        )
+    elif str(split_policy) == "source_train_val":
+        problem = build_source_split_problem(
+            cache_root=cache_root,
+            dataset=str(dataset),
+            feature_mode=str(feature_mode),
+            boundary_key_mode=str(boundary_key_mode),
+            train_split_name="train",
+            val_split_name="val",
+        )
+        problem = {**problem, "split_policy": "source_train_val"}
+    else:
+        raise ValueError("split_policy must be one of {'competition_train_test', 'source_train_val'}")
     train_split_name = str(problem.get("train_split_name", DEFAULT_SPLIT_NAME))
     val_split_name = str(problem.get("val_split_name", "competition_test"))
     resolved_output_path = (
@@ -298,6 +330,12 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_BOUNDARY_KEY_MODE,
         help="Boundary-key mode used when building the competition split.",
     )
+    parser.add_argument(
+        "--split-policy",
+        choices=("competition_train_test", "source_train_val"),
+        default="competition_train_test",
+        help="Source split policy used when computing train-split stats.",
+    )
     parser.add_argument("--overwrite", action="store_true", help="Replace an existing output file.")
     return parser.parse_args()
 
@@ -310,6 +348,7 @@ def main() -> None:
         dataset=str(args.dataset),
         feature_mode=str(args.feature_mode),
         boundary_key_mode=str(args.boundary_key_mode),
+        split_policy=str(args.split_policy),
         overwrite=bool(args.overwrite),
     )
     print(

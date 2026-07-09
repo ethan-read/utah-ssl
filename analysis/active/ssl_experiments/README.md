@@ -8,6 +8,8 @@ encoders, evaluated by downstream Brain2Text24 phoneme CTC decoding.
 
 - `ssl_core/`: shared cache, stat, CTC, patching, import-path, and reporting
   helpers. New experiment code should import reusable pieces from here.
+  Shared cache-prep, cache-audit, and normalization-stat command-line
+  entrypoints live in `ssl_core/scripts/`.
 - `ssm_ssl/`: active generic SSM SSL path. Use this for masked neural modeling
   with `S5`/`Mamba`, raw-bin/temporal-patch/causal-conv-stem inputs, and
   pretrained-vs-random downstream CTC controls.

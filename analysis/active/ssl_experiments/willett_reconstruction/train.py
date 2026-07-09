@@ -18,7 +18,7 @@ from torch.utils.data import DataLoader
 
 try:
     from ssl_core.ctc import CanonicalSequenceDataset, compute_ctc_loss_sum
-    from recompute_split_feature_stats import (
+    from ssl_core.scripts.recompute_split_feature_stats import (
         load_precomputed_split_feature_stats,
         resolve_precomputed_split_stats_path,
     )
@@ -27,7 +27,7 @@ except ModuleNotFoundError:  # pragma: no cover - repo-root unittest fallback
         CanonicalSequenceDataset,
         compute_ctc_loss_sum,
     )
-    from analysis.active.ssl_experiments.recompute_split_feature_stats import (
+    from analysis.active.ssl_experiments.ssl_core.scripts.recompute_split_feature_stats import (
         load_precomputed_split_feature_stats,
         resolve_precomputed_split_stats_path,
     )
@@ -112,8 +112,11 @@ class WillettReconstructionConfig:
             raise ValueError("feature_mode must be one of {'tx_only', 'tx_sbp'}")
         if self.boundary_key_mode not in {"session", "subject_if_available"}:
             raise ValueError("boundary_key_mode must be one of {'session', 'subject_if_available'}")
-        if self.split_policy not in {"competition_train_test", "competition_train_kfold"}:
-            raise ValueError("split_policy must be one of {'competition_train_test', 'competition_train_kfold'}")
+        if self.split_policy not in {"competition_train_test", "competition_train_kfold", "source_train_val"}:
+            raise ValueError(
+                "split_policy must be one of "
+                "{'competition_train_test', 'competition_train_kfold', 'source_train_val'}"
+            )
         if int(self.cv_num_folds) < 2:
             raise ValueError("cv_num_folds must be at least 2")
         if int(self.cv_fold_index) < 0 or int(self.cv_fold_index) >= int(self.cv_num_folds):
@@ -336,6 +339,7 @@ def run_willett_reconstruction(config: WillettReconstructionConfig) -> dict[str,
             dataset=str(problem["dataset"]),
             feature_mode=str(problem["feature_mode"]),
             boundary_key_mode=str(problem["boundary_key_mode"]),
+            split_policy=str(problem["split_policy"]),
             train_split_name=str(problem["train_split_name"]),
             val_split_name=str(problem["val_split_name"]),
             expected_dim=base_sample_dim,
@@ -750,7 +754,7 @@ def _parse_args() -> WillettReconstructionConfig:
     parser.add_argument("--boundary-key-mode", choices=("session", "subject_if_available"), default="session")
     parser.add_argument(
         "--split-policy",
-        choices=("competition_train_test", "competition_train_kfold"),
+        choices=("competition_train_test", "competition_train_kfold", "source_train_val"),
         default="competition_train_test",
     )
     parser.add_argument("--cv-num-folds", type=int, default=5)

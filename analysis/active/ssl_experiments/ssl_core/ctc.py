@@ -16,6 +16,7 @@ try:
         CanonicalSequenceDataset,
         LengthAwareBatchSampler,
         build_competition_split_problem,
+        build_source_split_problem,
         canonical_rows_padded_time_percentile,
         collate_sequence_batch,
     )
@@ -26,6 +27,7 @@ except ModuleNotFoundError:  # pragma: no cover - repo-root unittest fallback
         CanonicalSequenceDataset,
         LengthAwareBatchSampler,
         build_competition_split_problem,
+        build_source_split_problem,
         canonical_rows_padded_time_percentile,
         collate_sequence_batch,
     )
@@ -178,6 +180,7 @@ __all__ = [
     "CanonicalSequenceDataset",
     "LengthAwareBatchSampler",
     "build_competition_split_problem",
+    "build_source_split_problem",
     "canonical_rows_padded_time_percentile",
     "collate_sequence_batch",
     "compute_ctc_loss_sum",

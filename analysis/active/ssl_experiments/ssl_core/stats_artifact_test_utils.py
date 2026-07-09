@@ -10,7 +10,7 @@ from analysis.active.ssl_experiments.masked_ssl.cache import (
     _cache_variant_name,
     _compute_cache_source_signature,
 )
-from analysis.active.ssl_experiments.recompute_split_feature_stats import (
+from analysis.active.ssl_experiments.ssl_core.scripts.recompute_split_feature_stats import (
     FEATURE_POLICY as SPLIT_FEATURE_POLICY,
 )
 

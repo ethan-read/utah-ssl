@@ -71,7 +71,7 @@ def _ensure_import_paths() -> None:
 def _recompute_tx_only_stats(*, cache_root: Path) -> None:
     cmd = [
         sys.executable,
-        str(REMOTE_REPO_ROOT / "analysis" / "active" / "ssl_experiments" / "recompute_split_feature_stats.py"),
+        str(REMOTE_REPO_ROOT / "analysis" / "active" / "ssl_experiments" / "ssl_core" / "scripts" / "recompute_split_feature_stats.py"),
         "--cache-root",
         str(cache_root),
         "--dataset",

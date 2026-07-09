@@ -6,7 +6,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from bit_cache_contract import (
+from ssl_core.bit_cache_contract import (
     BIT_STAGE1_DEFAULT_EXCLUDED_DATASETS,
     BIT_STAGE1_FEATURE_MODE,
     BIT_STAGE1_SBP_DIM,

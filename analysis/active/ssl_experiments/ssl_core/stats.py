@@ -17,12 +17,12 @@ except ModuleNotFoundError:  # pragma: no cover - repo-root unittest fallback
     )
 
 try:
-    from recompute_split_feature_stats import (
+    from ssl_core.scripts.recompute_split_feature_stats import (
         load_precomputed_split_feature_stats,
         resolve_precomputed_split_stats_path,
     )
 except ModuleNotFoundError:  # pragma: no cover - repo-root unittest fallback
-    from analysis.active.ssl_experiments.recompute_split_feature_stats import (
+    from analysis.active.ssl_experiments.ssl_core.scripts.recompute_split_feature_stats import (
         load_precomputed_split_feature_stats,
         resolve_precomputed_split_stats_path,
     )

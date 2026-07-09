@@ -13,6 +13,7 @@ scratch/
 *.pt
 *.pth
 *.ckpt
+*.zip
 
 # Array / dataset artifacts
 *.npy
@@ -39,6 +40,7 @@ tmp/
 analysis/active/channel_ablation/
 analysis/active/ssl_experiments/willett_reconstruction/derived/
 analysis/active/ssl_experiments/willett_reconstruction/derived.tar.gz
+analysis/active/ssl_experiments/willett_reconstruction/stanford_released_baseline_rnn/
 docs/learning_notes/deep_state_space_models/main.pdf
 docs/learning_notes/deep_state_space_models/main.tex
 docs/learning_notes/deep_state_space_models/main.pdf

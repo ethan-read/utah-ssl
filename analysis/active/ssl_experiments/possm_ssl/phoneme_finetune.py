@@ -29,7 +29,7 @@ from masked_ssl.probe import (
     compute_ctc_loss_sum,
     compute_feature_stats,
 )
-from recompute_split_feature_stats import (
+from ssl_core.scripts.recompute_split_feature_stats import (
     load_precomputed_split_feature_stats,
     resolve_precomputed_split_stats_path,
 )

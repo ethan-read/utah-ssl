@@ -15,6 +15,14 @@ import json
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
+import sys
+
+EXPERIMENTS_DIR = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[5]
+for _path in (REPO_ROOT, EXPERIMENTS_DIR):
+    _path_str = str(_path)
+    if _path_str not in sys.path:
+        sys.path.insert(0, _path_str)
 from typing import Any
 
 import numpy as np
@@ -396,7 +404,7 @@ def repack_dataset(
     notes = metadata.setdefault("build_notes", [])
     if isinstance(notes, list):
         notes.append(
-            f"Repacked into fused shards targeting ~{float(target_mb):.1f} MB using analysis/active/ssl_experiments/repack_cache_shards.py."
+            f"Repacked into fused shards targeting ~{float(target_mb):.1f} MB using analysis/active/ssl_experiments/ssl_core/scripts/repack_cache_shards.py."
         )
     metadata["repack_provenance"] = {
         "source_cache_root": str(src_root),

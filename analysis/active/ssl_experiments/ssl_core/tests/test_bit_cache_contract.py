@@ -9,14 +9,14 @@ from pathlib import Path
 import numpy as np
 import torch
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
+REPO_ROOT = Path(__file__).resolve().parents[5]
 EXPERIMENTS_DIR = REPO_ROOT / "analysis" / "active" / "ssl_experiments"
 for path in (REPO_ROOT, EXPERIMENTS_DIR):
     path_str = str(path)
     if path_str not in sys.path:
         sys.path.insert(0, path_str)
 
-from bit_cache_contract import (
+from ssl_core.bit_cache_contract import (
     BIT_CANONICAL_FEATURE_POLICY,
     BIT_STAGE1_DEFAULT_EXCLUDED_DATASETS,
     BIT_STAGE1_DEFAULT_INCLUDED_DATASETS,
@@ -25,10 +25,10 @@ from bit_cache_contract import (
     BIT_STAGE1_SBP_DIM,
     BIT_STAGE1_TX_DIM,
 )
-from harmonize_bit_cache import harmonize_bit_cache
+from ssl_core.scripts.harmonize_bit_cache import harmonize_bit_cache
 from masked_ssl.cache import CacheAccessConfig, prepare_cache_context
-from prepare_bit_cache import prepare_bit_cache
-from stats_artifact_test_utils import write_valid_session_stats_artifact
+from ssl_core.scripts.prepare_bit_cache import prepare_bit_cache
+from ssl_core.stats_artifact_test_utils import write_valid_session_stats_artifact
 
 
 def _write_manifest(dataset_root: Path, rows: list[dict[str, object]]) -> None:

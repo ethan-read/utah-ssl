@@ -18,7 +18,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from bit_cache_contract import (
+from ssl_core.bit_cache_contract import (
     BIT_CANONICAL_FEATURE_POLICY,
     canonical_stage1_stats_stem,
 )
@@ -429,7 +429,7 @@ def build_recompute_session_feature_stats_command(
 ) -> str:
     cmd = [
         "python",
-        "analysis/active/ssl_experiments/recompute_session_feature_stats.py",
+        "analysis/active/ssl_experiments/ssl_core/scripts/recompute_session_feature_stats.py",
         "--cache-root",
         str(Path(cache_root)),
         "--output-path",
@@ -1429,7 +1429,7 @@ def prepare_cache_context(
                 row = full_width_rows[0]
                 raise ValueError(
                     "brain2text24 cache is still full-array width. Run "
-                    "analysis/active/ssl_experiments/trim_area6v_cache.py before training. "
+                    "analysis/active/ssl_experiments/ssl_core/scripts/trim_area6v_cache.py before training. "
                     f"Example {row.shard_relpath}:{row.example_index} reports "
                     f"n_tx_features={row.n_tx_features}, n_sbp_features={row.n_sbp_features}."
                 )

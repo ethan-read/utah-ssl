@@ -8,6 +8,14 @@ import os
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
+import sys
+
+EXPERIMENTS_DIR = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[5]
+for _path in (REPO_ROOT, EXPERIMENTS_DIR):
+    _path_str = str(_path)
+    if _path_str not in sys.path:
+        sys.path.insert(0, _path_str)
 
 os.environ.setdefault("MPLCONFIGDIR", str(Path(".mplconfig").resolve()))
 
@@ -18,7 +26,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-from tx_dataset_stats import DEFAULT_CACHE_ROOT, DEFAULT_SUSPICIOUS_VALUES
+from ssl_core.scripts.tx_dataset_stats import DEFAULT_CACHE_ROOT, DEFAULT_SUSPICIOUS_VALUES
 
 
 TX_PLOT_DATASETS_DEFAULT = (

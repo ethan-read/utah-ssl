@@ -8,10 +8,11 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from analysis.active.ssl_experiments.recompute_split_feature_stats import (
+from analysis.active.ssl_experiments.ssl_core.scripts.recompute_split_feature_stats import (
+    recompute_split_feature_stats,
     resolve_precomputed_split_stats_path as resolve_canonical_split_stats_path,
 )
-from analysis.active.ssl_experiments.stats_artifact_test_utils import (
+from analysis.active.ssl_experiments.ssl_core.stats_artifact_test_utils import (
     write_valid_split_stats_artifact as _write_valid_split_stats_artifact,
 )
 from analysis.active.ssl_experiments.willett_reconstruction.data import (
@@ -88,6 +89,70 @@ def _write_tiny_competition_probe_cache(cache_root: Path) -> None:
     (dataset_dir / "manifest.jsonl").write_text("".join(json.dumps(row) + "\n" for row in manifest_rows))
     metadata = {
         "dataset_family": "brain2text24",
+        "phoneme_vocabulary": {
+            "index_to_symbol": ["BLANK", "AA", "AE", "SIL"],
+            "num_classes": 4,
+            "blank_index": 0,
+            "sil_index": 3,
+        },
+    }
+    (dataset_dir / "metadata.json").write_text(json.dumps(metadata))
+
+
+def _write_tiny_brain2text25_probe_cache(cache_root: Path) -> None:
+    dataset_dir = cache_root / "brain2text25"
+    shards_dir = dataset_dir / "shards"
+    shard_dir = shards_dir / "toy_shard"
+    shard_dir.mkdir(parents=True, exist_ok=True)
+
+    manifest_rows = []
+    examples = [
+        ("train-0", "train", "t15.2025.01.01", np.full((4, 5), 1.0, dtype=np.float32), np.full((4, 5), 2.0, dtype=np.float32), [1, 2], True),
+        ("train-1", "train", "t15.2025.01.01", np.full((4, 5), 3.0, dtype=np.float32), np.full((4, 5), 4.0, dtype=np.float32), [2, 1], True),
+        ("val-0", "val", "t15.2025.01.02", np.full((4, 5), 5.0, dtype=np.float32), np.full((4, 5), 6.0, dtype=np.float32), [1, 1], True),
+        ("test-0", "test", "t15.2025.01.03", np.full((4, 5), 7.0, dtype=np.float32), np.full((4, 5), 8.0, dtype=np.float32), [], False),
+    ]
+    tx_rows = []
+    sbp_rows = []
+    phoneme_ids = []
+    time_offsets = [0]
+    phoneme_offsets = [0]
+    for example_index, (example_id, source_split, session_id, tx, sbp, labels, has_labels) in enumerate(examples):
+        tx_rows.append(tx)
+        sbp_rows.append(sbp)
+        if has_labels:
+            phoneme_ids.extend(labels)
+        time_offsets.append(time_offsets[-1] + int(tx.shape[0]))
+        phoneme_offsets.append(phoneme_offsets[-1] + (len(labels) if has_labels else 0))
+        manifest_rows.append(
+            {
+                "example_id": example_id,
+                "session_id": session_id,
+                "subject_id": "t15",
+                "session_date": session_id.split(".", 1)[1],
+                "source_split": source_split,
+                "has_labels": has_labels,
+                "shard_relpath": "brain2text25/shards/toy_shard",
+                "example_index": example_index,
+                "block_num": 200 + example_index,
+                "normalization_group": session_id,
+                "n_tx_features": 5,
+                "n_sbp_features": 5,
+                "n_time_bins": int(tx.shape[0]),
+                "target_length": len(labels) if has_labels else None,
+                "transcript": "AA" if has_labels else "",
+                "has_tx": True,
+                "has_sbp": True,
+            }
+        )
+    np.save(shard_dir / "tx.npy", np.concatenate(tx_rows, axis=0).astype(np.float32))
+    np.save(shard_dir / "sbp.npy", np.concatenate(sbp_rows, axis=0).astype(np.float32))
+    np.save(shard_dir / "time_offsets.npy", np.asarray(time_offsets, dtype=np.int64))
+    np.save(shard_dir / "phoneme_offsets.npy", np.asarray(phoneme_offsets, dtype=np.int64))
+    np.save(shard_dir / "phoneme_ids.npy", np.asarray(phoneme_ids, dtype=np.int64))
+    (dataset_dir / "manifest.jsonl").write_text("".join(json.dumps(row) + "\n" for row in manifest_rows))
+    metadata = {
+        "dataset_family": "brain2text25",
         "phoneme_vocabulary": {
             "index_to_symbol": ["BLANK", "AA", "AE", "SIL"],
             "num_classes": 4,
@@ -216,6 +281,27 @@ class WillettReconstructionTest(unittest.TestCase):
         self.assertTrue(all(row.source_split == "competition_train" for row in problem["val_rows"]))
         self.assertEqual(set(problem["train_session_ids"]), {"t12.2022.08.10", "t12.2022.08.11"})
         self.assertEqual(set(problem["val_session_ids"]), {"t12.2022.08.10", "t12.2022.08.11"})
+
+    def test_build_problem_can_use_source_train_val_for_brain2text25(self) -> None:
+        cache_root = Path(self._tmp_dir())
+        _write_tiny_brain2text25_probe_cache(cache_root)
+        problem = build_willett_problem(
+            cache_root=cache_root,
+            dataset="brain2text25",
+            feature_mode="tx_sbp",
+            boundary_key_mode="session",
+            split_policy="source_train_val",
+        )
+        self.assertEqual(problem["dataset"], "brain2text25")
+        self.assertEqual(problem["split_policy"], "source_train_val")
+        self.assertEqual(problem["train_split_name"], "train")
+        self.assertEqual(problem["val_split_name"], "val")
+        self.assertEqual(len(problem["train_rows"]), 2)
+        self.assertEqual(len(problem["val_rows"]), 1)
+        self.assertTrue(all(row.source_split == "train" for row in problem["train_rows"]))
+        self.assertTrue(all(row.source_split == "val" for row in problem["val_rows"]))
+        self.assertEqual(problem["train_rows"][0].n_tx_features, 5)
+        self.assertEqual(problem["train_rows"][0].n_sbp_features, 5)
 
     def test_adapter_keys_follow_boundary_key_mode(self) -> None:
         cache_root = Path(self._tmp_dir())
@@ -566,6 +652,67 @@ class WillettReconstructionTest(unittest.TestCase):
         summary = run_willett_reconstruction(config)
         self.assertEqual(summary["input_feature_source"], "raw_plus_predicted_tx")
         self.assertTrue((output_root / "tiny_predicted_concat_run" / "checkpoint_final.pt").exists())
+
+    def test_short_brain2text25_training_run_uses_source_train_val(self) -> None:
+        cache_root = Path(self._tmp_dir())
+        _write_tiny_brain2text25_probe_cache(cache_root)
+        output_root = Path(self._tmp_dir())
+        config = WillettReconstructionConfig(
+            cache_root=cache_root,
+            output_root=output_root,
+            run_name="tiny_b2t25_run",
+            dataset="brain2text25",
+            feature_mode="tx_sbp",
+            split_policy="source_train_val",
+            max_steps=1,
+            batch_size=2,
+            learning_rate=1e-3,
+            min_learning_rate=1e-4,
+            warmup_steps=0,
+            adam_epsilon=1e-1,
+            val_every_steps=1,
+            checkpoint_every_steps=1,
+            progress_every_steps=1,
+            input_smoothing_sigma_bins=0.0,
+            white_noise_sd=0.0,
+            constant_offset_sd=0.0,
+            patch_size=2,
+            patch_stride=1,
+            input_projection_size=8,
+            gru_hidden_size=16,
+            gru_num_layers=1,
+            gru_dropout=0.0,
+        )
+        summary = run_willett_reconstruction(config)
+        self.assertEqual(summary["dataset"], "brain2text25")
+        self.assertEqual(summary["feature_mode"], "tx_sbp")
+        self.assertEqual(summary["split_policy"], "source_train_val")
+        self.assertEqual(summary["train_split_name"], "train")
+        self.assertEqual(summary["val_split_name"], "val")
+        self.assertEqual(summary["train_examples"], 2)
+        self.assertEqual(summary["val_examples"], 1)
+        self.assertTrue((output_root / "tiny_b2t25_run" / "checkpoint_final.pt").exists())
+
+    def test_recompute_split_stats_supports_brain2text25_source_train_val(self) -> None:
+        cache_root = Path(self._tmp_dir())
+        _write_tiny_brain2text25_probe_cache(cache_root)
+        output_path = Path(self._tmp_dir()) / "b2t25_source_train_val_stats.pt"
+        result = recompute_split_feature_stats(
+            cache_root=cache_root,
+            output_path=output_path,
+            dataset="brain2text25",
+            feature_mode="tx_sbp",
+            boundary_key_mode="session",
+            split_policy="source_train_val",
+            overwrite=True,
+        )
+        metadata = result["metadata"]
+        self.assertTrue(output_path.exists())
+        self.assertEqual(metadata["dataset"], "brain2text25")
+        self.assertEqual(metadata["split_policy"], "source_train_val")
+        self.assertEqual(metadata["train_split_name"], "train")
+        self.assertEqual(metadata["val_split_name"], "val")
+        self.assertEqual(metadata["feature_dim"], 10)
 
     def test_short_s5_training_run_writes_outputs(self) -> None:
         cache_root = Path(self._tmp_dir())

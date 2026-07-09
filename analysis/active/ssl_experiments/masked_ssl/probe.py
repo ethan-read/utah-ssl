@@ -638,7 +638,7 @@ def build_competition_split_problem(
             row = full_width_rows[0]
             raise ValueError(
                 "brain2text24 cache is still full-array width. Run "
-                "analysis/active/ssl_experiments/trim_area6v_cache.py before building "
+                "analysis/active/ssl_experiments/ssl_core/scripts/trim_area6v_cache.py before building "
                 f"competition splits. Example {row.shard_relpath}:{row.example_index} "
                 f"reports n_tx_features={row.n_tx_features}, n_sbp_features={row.n_sbp_features}."
             )
@@ -693,6 +693,83 @@ def build_competition_split_problem(
         "split_policy": "competition_train_test",
         "train_split_name": "competition_train",
         "val_split_name": "competition_test",
+        "train_rows": train_rows,
+        "val_rows": val_rows,
+        "train_examples_by_session": train_examples_by_session,
+        "val_examples_by_session": val_examples_by_session,
+        "train_session_ids": train_session_ids,
+        "val_session_ids": val_session_ids,
+    }
+
+
+def build_source_split_problem(
+    *,
+    cache_root: Path,
+    dataset: str,
+    feature_mode: str,
+    boundary_key_mode: str = "session",
+    train_split_name: str = "train",
+    val_split_name: str = "val",
+) -> dict[str, Any]:
+    canonical_root, manifest_path, metadata_path = _validate_canonical_probe_assets(
+        cache_root,
+        dataset=str(dataset),
+    )
+    manifest_rows = _load_canonical_probe_manifest(manifest_path)
+    metadata = _load_probe_metadata_json(metadata_path)
+
+    if feature_mode not in {"tx_only", "tx_sbp"}:
+        raise ValueError("feature_mode must be one of {'tx_only', 'tx_sbp'}")
+
+    def _row_matches_feature_mode(row: CanonicalProbeManifestRow) -> bool:
+        if feature_mode == "tx_only":
+            return int(row.n_tx_features) > 0
+        return int(row.n_tx_features) > 0 and int(row.n_sbp_features) > 0
+
+    train_key = str(train_split_name).strip().lower()
+    val_key = str(val_split_name).strip().lower()
+    split_counts: Counter[str] = Counter()
+    train_candidates: list[CanonicalProbeManifestRow] = []
+    val_candidates: list[CanonicalProbeManifestRow] = []
+    for row in manifest_rows:
+        split_name = str(row.source_split).strip().lower()
+        if bool(row.has_labels):
+            split_counts[split_name] += 1
+        if not bool(row.has_labels) or not _row_matches_feature_mode(row):
+            continue
+        if split_name == train_key:
+            train_candidates.append(row)
+        elif split_name == val_key:
+            val_candidates.append(row)
+
+    if not train_candidates:
+        raise ValueError(
+            f"No labeled {train_split_name!r} rows were found for the source split problem. "
+            f"Observed labeled split counts: {dict(split_counts)}"
+        )
+    if not val_candidates:
+        raise ValueError(
+            f"No labeled {val_split_name!r} rows were found for the source split problem. "
+            f"Observed labeled split counts: {dict(split_counts)}"
+        )
+
+    train_rows, train_examples_by_session, train_session_ids = _group_rows_by_session(train_candidates)
+    val_rows, val_examples_by_session, val_session_ids = _group_rows_by_session(val_candidates)
+
+    return {
+        "canonical_root": canonical_root,
+        "manifest_path": manifest_path,
+        "metadata_path": metadata_path,
+        "manifest_rows": manifest_rows,
+        "metadata": metadata,
+        "vocab": _resolve_phoneme_vocabulary(metadata),
+        "cache_root": Path(cache_root),
+        "dataset": str(dataset),
+        "feature_mode": str(feature_mode),
+        "boundary_key_mode": str(boundary_key_mode),
+        "split_policy": "source_split",
+        "train_split_name": str(train_split_name),
+        "val_split_name": str(val_split_name),
         "train_rows": train_rows,
         "val_rows": val_rows,
         "train_examples_by_session": train_examples_by_session,

@@ -14,9 +14,17 @@ import argparse
 import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
+import sys
+
+EXPERIMENTS_DIR = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[5]
+for _path in (REPO_ROOT, EXPERIMENTS_DIR):
+    _path_str = str(_path)
+    if _path_str not in sys.path:
+        sys.path.insert(0, _path_str)
 from typing import Any, Sequence
 
-from bit_cache_contract import (
+from ssl_core.bit_cache_contract import (
     BIT_STAGE1_BOUNDARY_KEY_MODE,
     BIT_STAGE1_DEFAULT_EXCLUDED_DATASETS,
     BIT_STAGE1_FEATURE_MODE,
@@ -25,13 +33,13 @@ from bit_cache_contract import (
     BIT_STAGE1_TX_DIM,
     canonical_stage1_stats_stem,
 )
-from build_smoothed_cache import build_smoothed_cache
-from harmonize_bit_cache import harmonize_bit_cache
+from ssl_core.scripts.build_smoothed_cache import build_smoothed_cache
+from ssl_core.scripts.harmonize_bit_cache import harmonize_bit_cache
 from masked_ssl.cache import (
     _canonical_session_stats_dir,
     _canonical_session_stats_stem_from_included,
 )
-from recompute_session_feature_stats import recompute_session_feature_stats
+from ssl_core.scripts.recompute_session_feature_stats import recompute_session_feature_stats
 
 
 DEFAULT_SIGMA_BINS = BIT_STAGE1_SIGMA_BINS

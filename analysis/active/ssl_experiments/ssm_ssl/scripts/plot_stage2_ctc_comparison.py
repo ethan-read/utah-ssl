@@ -2,7 +2,7 @@
 
 Example:
 
-python analysis/active/ssl_experiments/plot_stage2_ctc_comparison.py \
+python analysis/active/ssl_experiments/ssm_ssl/scripts/plot_stage2_ctc_comparison.py \
   --pretrained /path/to/ctc_pretrained_tx_only/progress.jsonl \
   --random-init /path/to/ctc_random_init_tx_only/progress.jsonl \
   --output /tmp/ctc_stage2_comparison.png
@@ -12,8 +12,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 from typing import Any
+
+os.environ.setdefault("MPLCONFIGDIR", str(Path(".mplconfig").resolve()))
 
 import matplotlib
 

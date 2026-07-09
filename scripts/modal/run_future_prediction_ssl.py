@@ -520,7 +520,7 @@ def recompute_remote_session_stats(
 ) -> dict[str, object]:
     _ensure_import_paths()
 
-    from analysis.active.ssl_experiments.recompute_session_feature_stats import (
+    from analysis.active.ssl_experiments.ssl_core.scripts.recompute_session_feature_stats import (
         recompute_session_feature_stats,
     )
 

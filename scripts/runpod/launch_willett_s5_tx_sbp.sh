@@ -101,7 +101,7 @@ PY
 
 if [[ "${RECOMPUTE_SPLIT_STATS}" == "1" && "${SPLIT_POLICY}" == "competition_train_test" ]]; then
   echo "recomputing canonical raw tx_sbp split stats for uploaded cache"
-  python analysis/active/ssl_experiments/recompute_split_feature_stats.py \
+  python analysis/active/ssl_experiments/ssl_core/scripts/recompute_split_feature_stats.py \
     --cache-root "${CACHE_ROOT}" \
     --dataset brain2text24 \
     --feature-mode tx_sbp \
