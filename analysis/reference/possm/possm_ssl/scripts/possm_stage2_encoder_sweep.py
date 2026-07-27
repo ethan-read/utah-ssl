@@ -1,16 +1,16 @@
-"""Run a small POSSM Stage-2 phoneme fine-tuning hyperparameter sweep.
+"""Run a frozen Stage-2 POSSM checkpoint sweep across Stage-1 encoders.
 
-This script is intended to be launched from Colab after the repository is
-available on the Python path. It keeps the current best Stage-2 recipe fixed
-except for targeted regularization / learning-rate variants while using the
-released Willett ``competition_train -> competition_test`` split.
+This is intended for quick Colab comparisons when full Stage-2 finetuning is
+too slow. Each variant reuses one Stage-1 checkpoint and trains only the Stage-2
+phoneme decoder in ``probe_frozen`` mode on the released Willett
+``competition_train -> competition_test`` split.
 """
 
 from __future__ import annotations
 
 import argparse
-import csv
 import json
+import re
 import sys
 import time
 import traceback
@@ -19,19 +19,24 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-EXPERIMENTS_DIR = Path(__file__).resolve().parents[2]
-if str(EXPERIMENTS_DIR) not in sys.path:
-    sys.path.insert(0, str(EXPERIMENTS_DIR))
+POSSM_DIR = Path(__file__).resolve().parents[1]
+if str(POSSM_DIR) not in sys.path:
+    sys.path.insert(0, str(POSSM_DIR))
 
 import torch
 
-import possm_ssl.phoneme_finetune as possm_phoneme_finetune
 from possm_ssl import POSSMFinetuneConfig, resolve_possm_checkpoint_path, run_possm_phoneme_finetuning
-
-
-DEFAULT_DRIVE_ROOT = Path("/content/drive/MyDrive")
-DEFAULT_OUTPUT_ROOT = DEFAULT_DRIVE_ROOT / "utah_ssl" / "outputs" / "ssl_experiments" / "possm_masked_reconstruction"
-DEFAULT_STAGE2_CACHE_ROOT = DEFAULT_DRIVE_ROOT / "utah_ssl" / "data" / "cache_v1"
+from possm_ssl.scripts.possm_stage2_hyperparam_sweep import (
+    DEFAULT_OUTPUT_ROOT,
+    DEFAULT_STAGE2_CACHE_ROOT,
+    flatten_summary_row,
+    install_stdout_progress_hook,
+    load_json,
+    make_logger,
+    write_json,
+    write_results_csv,
+    write_text_atomic,
+)
 
 
 def timestamp_utc() -> str:
@@ -76,184 +81,69 @@ def base_config(args: argparse.Namespace) -> POSSMFinetuneConfig:
     )
 
 
-def make_config(base: POSSMFinetuneConfig, **overrides: Any) -> POSSMFinetuneConfig:
-    payload = asdict(base)
-    payload.update(overrides)
-    return POSSMFinetuneConfig(**payload)
+def _sanitize_variant_label(label: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", str(label)).strip("._-")
+    return cleaned or "checkpoint"
 
 
-def default_variants(base: POSSMFinetuneConfig) -> dict[str, POSSMFinetuneConfig]:
-    """Targeted sweep around the current best POSSM Stage-2 run."""
-
-    return {
-        "baseline_locked": make_config(base),
-        "dropout_0p3": make_config(base, gru_dropout=0.3),
-        "weight_decay_3e-3": make_config(base, weight_decay=3e-3),
-        "decoder_lr_1e-4": make_config(base, learning_rate=1e-4),
-    }
-
-
-def flatten_summary_row(*, variant_name: str, summary: dict[str, Any]) -> dict[str, Any]:
-    metrics = dict(summary.get("metrics", {}))
-    collapse = dict(metrics.get("collapse_diagnostics") or {})
-    best_collapse = dict(metrics.get("best_collapse_diagnostics") or {})
-    return {
-        "variant": variant_name,
-        "run_name": summary.get("run_name"),
-        "run_dir": summary.get("run_dir"),
-        "decoder_backbone_type": summary.get("decoder_backbone_type"),
-        "s5_direction": summary.get("s5_direction"),
-        "s5_hidden_size": summary.get("s5_hidden_size"),
-        "s5_state_size": summary.get("s5_state_size"),
-        "s5_num_layers": summary.get("s5_num_layers"),
-        "s5_dropout": summary.get("s5_dropout"),
-        "steps": summary.get("steps"),
-        "val_ctc_bpphone": metrics.get("val_ctc_bpphone"),
-        "val_phoneme_error_rate": metrics.get("val_phoneme_error_rate"),
-        "best_step": metrics.get("best_step"),
-        "best_val_ctc_bpphone": metrics.get("best_val_ctc_bpphone"),
-        "best_val_phoneme_error_rate": metrics.get("best_val_phoneme_error_rate"),
-        "predicted_to_reference_token_ratio": collapse.get("predicted_to_reference_token_ratio"),
-        "blank_frame_rate": collapse.get("blank_frame_rate"),
-        "best_predicted_to_reference_token_ratio": best_collapse.get("predicted_to_reference_token_ratio"),
-        "best_blank_frame_rate": best_collapse.get("blank_frame_rate"),
-        "checkpoint_best_path": summary.get("checkpoint_best_path"),
-        "checkpoint_final_path": summary.get("checkpoint_final_path"),
-    }
+def _checkpoint_variant_label(checkpoint_path: Path, *, used_labels: set[str]) -> str:
+    run_dir = checkpoint_path.parent.parent if checkpoint_path.parent.name == "checkpoints" else checkpoint_path.parent
+    base_label = run_dir.name
+    if checkpoint_path.name not in {"checkpoint_best.pt", "checkpoint_final.pt"}:
+        base_label = f"{base_label}_{checkpoint_path.stem}"
+    label = _sanitize_variant_label(base_label)
+    resolved = label
+    suffix = 2
+    while resolved in used_labels:
+        resolved = f"{label}_{suffix}"
+        suffix += 1
+    used_labels.add(resolved)
+    return resolved
 
 
-def install_stdout_progress_hook() -> None:
-    original_emit = getattr(
-        possm_phoneme_finetune,
-        "_sweep_original_emit_progress",
-        possm_phoneme_finetune._emit_progress,
-    )
-    possm_phoneme_finetune._sweep_original_emit_progress = original_emit
+def _resolve_checkpoint_variants(args: argparse.Namespace) -> list[dict[str, str]]:
+    checkpoint_entries: list[Path] = []
+    for value in args.stage1_checkpoint:
+        checkpoint_entries.append(Path(value))
+    for value in args.stage1_run_dir:
+        checkpoint_entries.append(resolve_possm_checkpoint_path(run_dir=Path(value)))
+    if not checkpoint_entries:
+        raise ValueError("Provide at least one --stage1-checkpoint or --stage1-run-dir.")
 
-    def _fmt(value: Any, digits: int = 3) -> str:
-        if value is None:
-            return "nan"
-        try:
-            return f"{float(value):.{digits}f}"
-        except (TypeError, ValueError):
-            return str(value)
-
-    def emit_with_stdout(progress_log_path: Path | None, **payload: Any) -> None:
-        original_emit(progress_log_path, **payload)
-        event = str(payload.get("event", "progress"))
-        step = payload.get("step")
-        elapsed = _fmt(payload.get("elapsed_seconds"), digits=1)
-        if event == "phoneme_train_report":
-            train_loss = _fmt(payload.get("train_ctc_bpphone"))
-            sample_s = _fmt(payload.get("sample_seconds"), digits=2)
-            model_s = _fmt(payload.get("model_seconds"), digits=2)
-            print(
-                f"[stage2 train] step={step} train_ctc_bpphone={train_loss} "
-                f"sample_s={sample_s} model_s={model_s} elapsed_s={elapsed}",
-                flush=True,
-            )
-        elif event == "phoneme_resume":
-            checkpoint_path = payload.get("resumed_from_checkpoint")
-            print(
-                f"[stage2 resume] step={step} from={checkpoint_path} elapsed_s={elapsed}",
-                flush=True,
-            )
-        elif event == "phoneme_val_report":
-            collapse = dict(payload.get("collapse_diagnostics") or {})
-            print(
-                "[stage2 val] "
-                f"step={step} "
-                f"val_ctc_bpphone={_fmt(payload.get('val_ctc_bpphone'))} "
-                f"val_PER={_fmt(payload.get('val_phoneme_error_rate'))} "
-                f"pred/ref={_fmt(collapse.get('predicted_to_reference_token_ratio'))} "
-                f"blank={_fmt(collapse.get('blank_frame_rate'))} "
-                f"elapsed_s={elapsed}",
-                flush=True,
-            )
-
-    possm_phoneme_finetune._emit_progress = emit_with_stdout
-
-
-def resolve_stage1_checkpoint(args: argparse.Namespace) -> Path:
-    if args.stage1_checkpoint is not None:
-        checkpoint = Path(args.stage1_checkpoint)
-        if not checkpoint.exists():
-            raise FileNotFoundError(f"Stage-1 checkpoint does not exist: {checkpoint}")
-        return checkpoint
-    return resolve_possm_checkpoint_path(output_root=Path(args.stage1_output_root))
-
-
-def load_json(path: Path) -> dict[str, Any]:
-    if not path.exists():
-        return {}
-    try:
-        payload = json.loads(path.read_text())
-    except (json.JSONDecodeError, OSError):
-        return {}
-    if not isinstance(payload, dict):
-        raise TypeError(f"Expected JSON object in {path}, got {type(payload).__name__}")
-    return payload
-
-
-def write_text_atomic(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_name(f".{path.name}.tmp")
-    tmp_path.write_text(text)
-    tmp_path.replace(path)
-
-
-def write_json(path: Path, payload: dict[str, Any]) -> None:
-    write_text_atomic(path, json.dumps(payload, indent=2))
-
-
-def load_saved_result_row(variant_name: str, payload: dict[str, Any]) -> dict[str, Any] | None:
-    row = payload.get("row")
-    if isinstance(row, dict):
-        return dict(row)
-    summary = payload.get("summary")
-    if isinstance(summary, dict):
-        restored = flatten_summary_row(variant_name=variant_name, summary=summary)
-        if payload.get("elapsed_seconds") is not None:
-            restored["elapsed_seconds"] = payload.get("elapsed_seconds")
-        return restored
-    if payload.get("run_name") is not None:
-        return dict(payload)
-    return None
-
-
-def make_logger(log_path: Path):
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-
-    def _log(message: str) -> None:
-        stamp = datetime.now(timezone.utc).isoformat()
-        line = f"[{stamp}] {message}"
-        print(line, flush=True)
-        with log_path.open("a") as handle:
-            handle.write(line + "\n")
-
-    return _log
-
-
-def write_results_csv(csv_path: Path, rows: list[dict[str, Any]]) -> None:
-    if not rows:
-        return
-    fieldnames: list[str] = []
-    for row in rows:
-        for key in row:
-            if key not in fieldnames:
-                fieldnames.append(key)
-    tmp_path = csv_path.with_name(f".{csv_path.name}.tmp")
-    with tmp_path.open("w", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(rows)
-    tmp_path.replace(csv_path)
+    used_labels: set[str] = set()
+    variants: list[dict[str, str]] = []
+    seen_paths: set[str] = set()
+    for checkpoint_path in checkpoint_entries:
+        resolved_path = checkpoint_path.resolve()
+        if not resolved_path.exists():
+            raise FileNotFoundError(f"Stage-1 checkpoint does not exist: {resolved_path}")
+        resolved_key = str(resolved_path)
+        if resolved_key in seen_paths:
+            continue
+        seen_paths.add(resolved_key)
+        variants.append(
+            {
+                "variant": _checkpoint_variant_label(resolved_path, used_labels=used_labels),
+                "checkpoint_path": resolved_key,
+            }
+        )
+    return variants
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--stage1-checkpoint", type=Path, default=None)
-    parser.add_argument("--stage1-output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
+    parser.add_argument(
+        "--stage1-checkpoint",
+        action="append",
+        default=[],
+        help="Explicit Stage-1 checkpoint path. May be repeated.",
+    )
+    parser.add_argument(
+        "--stage1-run-dir",
+        action="append",
+        default=[],
+        help="Stage-1 run directory; resolves to checkpoint_best.pt when present. May be repeated.",
+    )
     parser.add_argument("--stage2-cache-root", type=Path, default=DEFAULT_STAGE2_CACHE_ROOT)
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT / "phoneme_finetune")
     parser.add_argument("--sweep-name", default=None)
@@ -268,16 +158,10 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Keep running remaining variants if one variant fails.",
     )
-    parser.add_argument(
-        "--variant",
-        action="append",
-        default=None,
-        help="Variant name to run. May be repeated. Defaults to all built-in variants.",
-    )
     parser.add_argument("--dry-run", action="store_true")
 
     parser.add_argument("--seed", type=int, default=7)
-    parser.add_argument("--mode", choices=("probe_frozen", "finetune_full"), default="finetune_full")
+    parser.add_argument("--mode", choices=("probe_frozen", "finetune_full"), default="probe_frozen")
     parser.add_argument("--dataset", default="brain2text24")
     parser.add_argument("--feature-mode", choices=("tx_only", "tx_sbp"), default="tx_only")
     parser.add_argument("--data-mode", choices=("raw", "normalized"), default="normalized")
@@ -316,24 +200,20 @@ def main() -> None:
     args = parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     base = base_config(args)
-    variants = default_variants(base)
-    selected_names = list(args.variant) if args.variant else list(variants)
-    missing = [name for name in selected_names if name not in variants]
-    if missing:
-        raise ValueError(f"Unknown variants {missing}. Available: {sorted(variants)}")
+    checkpoint_variants = _resolve_checkpoint_variants(args)
+    selected_names = [entry["variant"] for entry in checkpoint_variants]
 
     if args.dry_run:
         print("device:", device)
         print("selected variants:", ", ".join(selected_names))
-        print(json.dumps({name: asdict(variants[name]) for name in selected_names}, indent=2))
+        print(json.dumps({"base_config": asdict(base), "checkpoints": checkpoint_variants}, indent=2))
         return
 
-    stage1_checkpoint = resolve_stage1_checkpoint(args)
     stage2_cache_root = Path(args.stage2_cache_root)
     if not stage2_cache_root.exists():
         raise FileNotFoundError(f"Stage-2 cache root does not exist: {stage2_cache_root}")
 
-    sweep_name = args.sweep_name or f"stage2_hparam_sweep_{timestamp_utc()}"
+    sweep_name = args.sweep_name or f"stage2_encoder_sweep_{timestamp_utc()}"
     sweep_dir = Path(args.output_root) / "sweeps" / sweep_name
     sweep_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = sweep_dir / "sweep_manifest.json"
@@ -353,27 +233,31 @@ def main() -> None:
             "created_utc": str(manifest.get("created_utc", datetime.now(timezone.utc).isoformat())),
             "updated_utc": datetime.now(timezone.utc).isoformat(),
             "device": str(device),
-            "stage1_checkpoint": str(stage1_checkpoint),
             "stage2_cache_root": str(stage2_cache_root),
             "output_root": str(args.output_root),
             "base_config": asdict(base),
-            "selected_variants": selected_names,
-            "variants": {name: asdict(variants[name]) for name in selected_names},
+            "checkpoint_variants": checkpoint_variants,
         }
     )
+    requested_checkpoint_by_variant = {
+        entry["variant"]: entry["checkpoint_path"] for entry in checkpoint_variants
+    }
     results_by_variant = dict(manifest.get("results_by_variant") or {})
     normalized_results_by_variant: dict[str, dict[str, Any]] = {}
     for variant_name in selected_names:
         payload = results_by_variant.get(variant_name)
         if not isinstance(payload, dict):
             continue
-        row = load_saved_result_row(variant_name, payload)
-        if row is None:
+        if str(payload.get("checkpoint_path")) != requested_checkpoint_by_variant[variant_name]:
+            continue
+        row = payload.get("row")
+        if not isinstance(row, dict):
             continue
         normalized_results_by_variant[variant_name] = {
-            "row": row,
+            "row": dict(row),
             "summary": payload.get("summary"),
             "elapsed_seconds": row.get("elapsed_seconds"),
+            "checkpoint_path": payload.get("checkpoint_path"),
             "completed_utc": payload.get("completed_utc"),
         }
     results_by_variant = normalized_results_by_variant
@@ -397,10 +281,10 @@ def main() -> None:
     write_json(manifest_path, manifest)
     write_json(state_path, sweep_state)
 
-    log(f"stage1 checkpoint: {stage1_checkpoint}")
     log(f"stage2 cache root: {stage2_cache_root}")
     log(f"sweep dir: {sweep_dir}")
     log(f"device: {device}")
+    log(f"mode: {base.mode}")
     log(f"variants: {', '.join(selected_names)}")
     log(f"resume enabled: {bool(args.resume)}")
 
@@ -411,7 +295,12 @@ def main() -> None:
         for name in selected_names
         if name in results_by_variant and isinstance(results_by_variant[name].get("row"), dict)
     }
+    checkpoint_by_variant = {
+        entry["variant"]: Path(entry["checkpoint_path"]) for entry in checkpoint_variants
+    }
+
     for variant_name in selected_names:
+        checkpoint_path = checkpoint_by_variant[variant_name]
         if args.resume and variant_name in rows_by_variant:
             log(f"skipping completed variant: {variant_name}")
             sweep_state["status_by_variant"][variant_name] = "completed"
@@ -419,22 +308,22 @@ def main() -> None:
             write_json(state_path, sweep_state)
             continue
 
-        config = variants[variant_name]
         variant_output_root = Path(args.output_root) / sweep_name / variant_name
         variant_output_root.mkdir(parents=True, exist_ok=True)
         sweep_state["status_by_variant"][variant_name] = "running"
         sweep_state["updated_utc"] = datetime.now(timezone.utc).isoformat()
         write_json(state_path, sweep_state)
         log(f"starting variant: {variant_name}")
-        print(json.dumps(asdict(config), indent=2), flush=True)
+        log(f"stage1 checkpoint: {checkpoint_path}")
+        print(json.dumps(asdict(base), indent=2), flush=True)
 
         t0 = time.time()
         try:
             summary = run_possm_phoneme_finetuning(
-                checkpoint_path=stage1_checkpoint,
+                checkpoint_path=checkpoint_path,
                 cache_root=stage2_cache_root,
                 output_root=variant_output_root,
-                config=config,
+                config=base,
                 device=device,
                 run_name="run",
                 resume_from_latest=bool(args.resume),
@@ -456,11 +345,13 @@ def main() -> None:
         elapsed_s = round(time.time() - t0, 3)
         row = flatten_summary_row(variant_name=variant_name, summary=summary)
         row["elapsed_seconds"] = elapsed_s
+        row["stage1_checkpoint_path"] = str(checkpoint_path)
         rows_by_variant[variant_name] = dict(row)
         results_by_variant[variant_name] = {
             "row": row,
             "summary": summary,
             "elapsed_seconds": elapsed_s,
+            "checkpoint_path": str(checkpoint_path),
             "completed_utc": datetime.now(timezone.utc).isoformat(),
         }
         manifest["updated_utc"] = datetime.now(timezone.utc).isoformat()

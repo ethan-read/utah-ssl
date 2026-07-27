@@ -21,7 +21,7 @@ For the current interpretation of experiment results, start with
   - shared cache, normalization-stat, CTC, temporal patching, and reporting helpers
 - `analysis/active/ssl_experiments/ssm_ssl`
   - active generic `S5`/`Mamba` SSL experiments with downstream CTC controls
-- `analysis/active/ssl_experiments/possm_ssl`
+- `analysis/reference/possm/possm_ssl`
   - POSSM reconstruction and phoneme fine-tuning reference implementation
 - `docs/paper_notes/`
   - paper architecture notes that informed the benchmark design

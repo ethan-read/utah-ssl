@@ -12,6 +12,14 @@ from unittest import mock
 import numpy as np
 import torch
 
+REPO_ROOT = Path(__file__).resolve().parents[5]
+EXPERIMENTS_DIR = REPO_ROOT / "analysis" / "active" / "ssl_experiments"
+POSSM_DIR = REPO_ROOT / "analysis" / "reference" / "possm"
+for path in (REPO_ROOT, EXPERIMENTS_DIR, POSSM_DIR):
+    path_str = str(path)
+    if path_str not in sys.path:
+        sys.path.insert(0, path_str)
+
 from masked_ssl.cache import _compute_cache_source_signature
 from ssl_core.scripts.recompute_split_feature_stats import (
     resolve_precomputed_split_stats_path as resolve_canonical_split_stats_path,
@@ -19,14 +27,6 @@ from ssl_core.scripts.recompute_split_feature_stats import (
 from analysis.active.ssl_experiments.ssl_core.stats_artifact_test_utils import (
     write_valid_split_stats_artifact as _write_valid_split_stats_artifact,
 )
-
-
-REPO_ROOT = Path(__file__).resolve().parents[5]
-EXPERIMENTS_DIR = REPO_ROOT / "analysis" / "active" / "ssl_experiments"
-for path in (REPO_ROOT, EXPERIMENTS_DIR):
-    path_str = str(path)
-    if path_str not in sys.path:
-        sys.path.insert(0, path_str)
 
 from possm_ssl.model import (
     POSSMPhonemeModel,

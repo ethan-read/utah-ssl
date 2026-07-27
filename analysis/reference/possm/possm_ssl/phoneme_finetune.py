@@ -24,6 +24,7 @@ from masked_ssl.probe import (
     CanonicalSequenceDataset,
     LengthAwareBatchSampler,
     build_competition_split_problem,
+    build_source_split_problem,
     canonical_rows_padded_time_percentile,
     collate_sequence_batch,
     compute_ctc_loss_sum,
@@ -48,6 +49,7 @@ class POSSMFinetuneConfig:
     mode: str = "finetune_full"
     init_source: str = "stage1"
     dataset: str = "brain2text24"
+    split_policy: str = "competition_train_test"
     feature_mode: str | None = None
     data_mode: str | None = None
     boundary_key_mode: str | None = None
@@ -113,6 +115,10 @@ class POSSMFinetuneConfig:
             raise ValueError("mode must be one of {'probe_frozen', 'finetune_full'}")
         if self.init_source not in {"stage1", "random"}:
             raise ValueError("init_source must be one of {'stage1', 'random'}")
+        if self.split_policy not in {"competition_train_test", "source_train_val"}:
+            raise ValueError(
+                "split_policy must be one of {'competition_train_test', 'source_train_val'}"
+            )
         if self.feature_mode is not None and self.feature_mode not in {"tx_only", "tx_sbp"}:
             raise ValueError("feature_mode must be one of {'tx_only', 'tx_sbp'} when provided")
         if self.data_mode is not None and self.data_mode not in {"raw", "normalized"}:
@@ -629,6 +635,15 @@ def _build_problem(
     feature_mode: str,
     boundary_key_mode: str,
 ) -> dict[str, Any]:
+    if config.split_policy == "source_train_val":
+        return build_source_split_problem(
+            cache_root=cache_root,
+            dataset=str(config.dataset),
+            feature_mode=str(feature_mode),
+            boundary_key_mode=str(boundary_key_mode),
+            train_split_name="train",
+            val_split_name="val",
+        )
     return build_competition_split_problem(
         cache_root=cache_root,
         dataset=str(config.dataset),
@@ -931,6 +946,7 @@ def run_possm_phoneme_finetuning(
             train_split_name=str(problem.get("train_split_name", "competition_train")),
             val_split_name=str(problem.get("val_split_name", "competition_test")),
             expected_dim=int(base_encoder.input_dim),
+            split_policy=str(problem.get("split_policy", resolved_config.split_policy)),
         )
         target_stats = (
             mean_t.numpy().astype(np.float32, copy=False),

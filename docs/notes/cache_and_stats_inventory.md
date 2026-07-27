@@ -126,7 +126,7 @@ dataset list, and creation time.
 
 ## Current Notebook Defaults
 
-### `s6_possm_maskedreconstruction.ipynb`
+### `analysis/reference/possm/notebooks/s6_possm_maskedreconstruction.ipynb`
 - current intended setup:
   - stage 1 uses `USE_SMOOTHED_CACHE = True`
   - stage 1 keeps `GAUSSIAN_SMOOTHING_SIGMA_BINS = 0.0`

@@ -15,8 +15,8 @@ encoders, evaluated by downstream Brain2Text24 phoneme CTC decoding.
   pretrained-vs-random downstream CTC controls.
 - `willett_reconstruction/`: supervised Willett-style CTC baseline and recipe
   reference.
-- `possm_ssl/`: POSSM implementation retained as a reference and evidence
-  source.
+- POSSM is kept separately under `analysis/reference/possm/`; the active tree
+  contains the generic SSL and supervised decoder experiments.
 - `masked_ssl/` and `contrastive_ssl/`: legacy SSL paths kept for compatibility
   while useful pieces are migrated into `ssl_core` and `ssm_ssl`.
 

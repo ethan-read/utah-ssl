@@ -58,12 +58,18 @@ class CacheAccessConfig:
     gaussian_smoothing_sigma_bins: float = 0.0
     shard_cache_ram_gb: float | None = None
     precomputed_session_stats_path: str | Path | None = None
+    pretrain_source_splits: tuple[str, ...] | None = None
 
     def __post_init__(self) -> None:
         normalized_excluded = tuple(
             sorted({str(item).strip() for item in self.excluded_datasets if str(item).strip()})
         )
         self.excluded_datasets = normalized_excluded
+        if self.pretrain_source_splits is not None:
+            normalized_splits = tuple(
+                sorted({str(item).strip().lower() for item in self.pretrain_source_splits if str(item).strip()})
+            )
+            self.pretrain_source_splits = normalized_splits or None
         if self.mode not in {"copy_to_local", "drive_direct"}:
             raise ValueError("mode must be either 'copy_to_local' or 'drive_direct'")
         if self.segment_bins <= 0:
@@ -426,6 +432,7 @@ def build_recompute_session_feature_stats_command(
     segment_bins: int,
     examples_per_shard: int,
     excluded_datasets: Sequence[str],
+    pretrain_source_splits: Sequence[str] | None = None,
 ) -> str:
     cmd = [
         "python",
@@ -449,6 +456,8 @@ def build_recompute_session_feature_stats_command(
     ]
     for dataset in tuple(sorted({str(item).strip() for item in excluded_datasets if str(item).strip()})):
         cmd.extend(["--excluded-dataset", str(dataset)])
+    for source_split in tuple(sorted({str(item).strip().lower() for item in (pretrain_source_splits or ()) if str(item).strip()})):
+        cmd.extend(["--source-split", str(source_split)])
     cmd.append("--overwrite")
     return " ".join(cmd)
 
@@ -965,6 +974,7 @@ def _load_precomputed_session_feature_stats(
     sbp_dim: int,
     segment_bins: int,
     examples_per_shard: int,
+    pretrain_source_splits: Sequence[str] | None = None,
 ) -> tuple[dict[str, tuple[torch.Tensor, torch.Tensor]], dict[str, Any], Path]:
     path = Path(stats_path)
     canonical_path = resolve_precomputed_session_stats_path(
@@ -983,6 +993,7 @@ def _load_precomputed_session_feature_stats(
         segment_bins=int(segment_bins),
         examples_per_shard=int(examples_per_shard),
         excluded_datasets=excluded_datasets,
+        pretrain_source_splits=pretrain_source_splits,
     )
     payload, metadata, path, _ = _load_artifact_payload_and_sidecar(
         path=path,
@@ -1033,6 +1044,11 @@ def _load_precomputed_session_feature_stats(
             sorted({str(item).strip() for item in excluded_datasets if str(item).strip()})
         ),
     }
+    normalized_source_splits = tuple(
+        sorted({str(item).strip().lower() for item in (pretrain_source_splits or ()) if str(item).strip()})
+    )
+    if normalized_source_splits:
+        session_metadata["pretrain_source_splits"] = list(normalized_source_splits)
     mismatches = _validate_common_artifact_metadata(
         metadata=metadata,
         expected_metadata=common_metadata,
@@ -1399,6 +1415,9 @@ def prepare_cache_context(
         with manifest_path.open() as handle:
             for line in handle:
                 payload = json.loads(line)
+                source_split = str(payload.get("source_split", "")).strip().lower()
+                if config.pretrain_source_splits and source_split not in set(config.pretrain_source_splits):
+                    continue
                 rows.append(
                     ExampleRow(
                         dataset=dataset,
@@ -1493,6 +1512,7 @@ def prepare_cache_context(
             sbp_dim=int(config.sbp_dim),
             segment_bins=int(config.segment_bins),
             examples_per_shard=int(config.examples_per_shard),
+            pretrain_source_splits=config.pretrain_source_splits,
         )
         print(f"loaded precomputed SSL session-level featurewise z-scoring stats: {stats_path}")
 

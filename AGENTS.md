@@ -32,8 +32,10 @@ The active generic SSM SSL path is in
 `analysis/active/ssl_experiments/ssm_ssl`, with shared experiment utilities in
 `analysis/active/ssl_experiments/ssl_core`.
 
-The POSSM implementation is in `analysis/active/ssl_experiments/possm_ssl` and
-is now best treated as a reference implementation and evidence source.
+The POSSM reference implementation is in
+`analysis/reference/possm/possm_ssl` and is best treated as a reference
+implementation and evidence source. Its notebooks live under
+`analysis/reference/possm/notebooks`.
 
 The Willett speechBCI reference code is not kept in this repo anymore. Use the
 published Stanford/Card repository or archived notes for architecture and

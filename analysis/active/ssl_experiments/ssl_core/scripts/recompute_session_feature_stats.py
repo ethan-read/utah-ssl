@@ -78,6 +78,7 @@ def recompute_session_feature_stats(
     seed: int = 7,
     examples_per_shard: int = 8,
     excluded_datasets: Sequence[str] = DEFAULT_EXCLUDED_DATASETS,
+    source_splits: Sequence[str] | None = None,
     overwrite: bool = False,
 ) -> dict[str, Any]:
     """Recompute and save session-featurewise stats for a cache root."""
@@ -123,6 +124,11 @@ def recompute_session_feature_stats(
         sbp_dim=int(sbp_dim),
         feature_mode=str(feature_mode),
         boundary_key_mode=str(boundary_key_mode),
+        pretrain_source_splits=(
+            tuple(str(item).strip().lower() for item in source_splits if str(item).strip())
+            if source_splits is not None
+            else None
+        ),
     )
 
     context = prepare_cache_context(cache_candidates=[cache_root], config=config)
@@ -152,6 +158,7 @@ def recompute_session_feature_stats(
         "segment_bins": int(segment_bins),
         "examples_per_shard": int(examples_per_shard),
         "excluded_datasets": list(excluded_datasets),
+        "pretrain_source_splits": list(context.config.pretrain_source_splits or ()),
         "dataset_names": list(context.pretrain_datasets),
         "dataset_count": int(len(context.pretrain_datasets)),
         "session_count": int(len(session_feature_stats)),
@@ -210,6 +217,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Dataset names to exclude. May be repeated.",
     )
+    parser.add_argument(
+        "--source-split",
+        action="append",
+        default=None,
+        help="Source split(s) to include in session stats and SSL sampling. May be repeated.",
+    )
     parser.add_argument("--overwrite", action="store_true", help="Replace an existing output file.")
     return parser.parse_args()
 
@@ -229,6 +242,7 @@ def main() -> None:
         seed=int(args.seed),
         examples_per_shard=int(args.examples_per_shard),
         excluded_datasets=excluded_datasets,
+        source_splits=tuple(args.source_split) if args.source_split else None,
         overwrite=bool(args.overwrite),
     )
     print(json.dumps({k: str(v) if isinstance(v, Path) else v for k, v in result.items()}, indent=2))

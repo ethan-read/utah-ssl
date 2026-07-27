@@ -22,9 +22,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-EXPERIMENTS_DIR = Path(__file__).resolve().parents[2]
-if str(EXPERIMENTS_DIR) not in sys.path:
-    sys.path.insert(0, str(EXPERIMENTS_DIR))
+POSSM_DIR = Path(__file__).resolve().parents[1]
+if str(POSSM_DIR) not in sys.path:
+    sys.path.insert(0, str(POSSM_DIR))
 
 from possm_ssl import POSSMFinetuneConfig, resolve_possm_checkpoint_path, run_possm_phoneme_finetuning
 from possm_ssl.scripts.possm_stage2_hyperparam_sweep import (

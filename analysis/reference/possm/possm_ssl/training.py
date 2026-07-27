@@ -577,6 +577,7 @@ def _serialize_config(
         **asdict(config),
         "input_dim": int(cache_context.full_dim),
         "cache_use_normalization": bool(cache_context.use_normalization),
+        "pretrain_source_splits": list(cache_context.config.pretrain_source_splits or ()),
         "cache_source_signature": (
             None
             if getattr(cache_context, "source_cache_signature", None) is None

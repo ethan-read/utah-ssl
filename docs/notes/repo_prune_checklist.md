@@ -18,7 +18,7 @@ Keep these in the active tree:
 - `analysis/active/ssl_experiments/future_prediction_ssl`
 - `analysis/active/ssl_experiments/cross_trained_mamba`
 - `analysis/active/ssl_experiments/timestep_flexible_ssm`
-- `analysis/active/ssl_experiments/possm_ssl` as reference/evidence
+- `analysis/reference/possm/possm_ssl` as reference/evidence
 - `analysis/active/transfer_benchmark/ssl_autoresearch` as the S5/reference
   benchmark scaffold
 

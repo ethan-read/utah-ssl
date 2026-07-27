@@ -19,20 +19,20 @@ The earlier flat / suspicious stage-1 reconstruction loss behavior was traced to
 ## Active Workflow Layout
 
 The active notebook is
-`analysis/active/ssl_experiments/s6_possm_maskedreconstruction.ipynb`. It is now
+`analysis/reference/possm/notebooks/s6_possm_maskedreconstruction.ipynb`. It is now
 intended to be a thin experiment driver: Colab setup, workflow switches,
 Stage-1 run/recover, Stage-2 run/recover/resume, and optional one-line reports.
 
-Reusable implementation lives in `analysis/active/ssl_experiments/possm_ssl`:
+Reusable implementation lives in `analysis/reference/possm/possm_ssl`:
 
 - training/recovery helpers: `possm_ssl.training` and `possm_ssl.phoneme_finetune`
 - notebook display/diagnostic helpers: `possm_ssl.reporting`
 - sweep/launcher scripts: `possm_ssl/scripts`
 
-The old top-level `analysis/active/ssl_experiments/possm_stage*.py` script paths
-are compatibility wrappers. New script references should prefer
+The former top-level POSSM script paths were compatibility wrappers. New script
+references should prefer
 `python -m possm_ssl.scripts.<script_name>` from
-`analysis/active/ssl_experiments`, or the direct files under
+`analysis/reference/possm`, or the direct files under
 `possm_ssl/scripts`.
 
 Reusable normalization stats should be treated as data artifacts rather than
@@ -158,7 +158,7 @@ The latest inspected run returned to the `kernel_size=14`, `stride=4` post-GRU e
 
 Run:
 
-- notebook: `analysis/active/ssl_experiments/s6_possm_maskedreconstruction.ipynb`
+- notebook: `analysis/reference/possm/notebooks/s6_possm_maskedreconstruction.ipynb`
 - stage-1 checkpoint: `possm_stage1_tx_only_normalized_20260512T101159Z/checkpoint_best.pt`
 - stage-2 run: `possm_stage2_finetune_full_tx_only_20260512T143912Z`
 - mode: `finetune_full`
