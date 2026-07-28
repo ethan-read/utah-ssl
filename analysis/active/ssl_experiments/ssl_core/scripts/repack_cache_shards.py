@@ -14,8 +14,12 @@ import argparse
 import json
 import shutil
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 import sys
+from typing import Any
+
+import numpy as np
 
 EXPERIMENTS_DIR = Path(__file__).resolve().parents[2]
 REPO_ROOT = Path(__file__).resolve().parents[5]
@@ -23,12 +27,19 @@ for _path in (REPO_ROOT, EXPERIMENTS_DIR):
     _path_str = str(_path)
     if _path_str not in sys.path:
         sys.path.insert(0, _path_str)
-from typing import Any
-
-import numpy as np
 
 
 TIME_OFFSETS_NAME = "time_offsets.npy"
+AREA6V_FEATURES = 128
+FULL_RELEASE_FEATURES = 256
+AREA6V_SOURCE_NOTE = (
+    "Stanford speechBCI AnalysisExamples/makeTFRecordsFromSession.py states "
+    "'first 128 columns = area 6v only' for tx1 and spikePow."
+)
+
+
+def _timestamp_utc() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 @dataclass(frozen=True)
@@ -46,6 +57,8 @@ class DatasetRepackSummary:
     dst_shards: int
     examples: int
     target_mb: float
+    area6v_projection: bool
+    tx_storage_dtype: str | None
 
 
 def _normalize_names(values: list[str] | tuple[str, ...] | None) -> list[str]:
@@ -96,11 +109,52 @@ def _load_manifest(dataset_root: Path) -> list[dict[str, Any]]:
     return rows
 
 
-def _load_shard_arrays(shard_path: Path) -> dict[str, np.ndarray]:
+def _project_area6v_feature_array(*, name: str, array: np.ndarray) -> np.ndarray:
+    if name not in {"tx.npy", "sbp.npy"}:
+        return array
+    if array.ndim != 2:
+        raise ValueError(f"Expected 2D feature array at {name}, got shape {array.shape}")
+    width = int(array.shape[1])
+    if width == AREA6V_FEATURES:
+        return array
+    if width != FULL_RELEASE_FEATURES:
+        raise ValueError(
+            f"Cannot apply area-6v projection to {name} with width {width}; "
+            f"expected {AREA6V_FEATURES} or {FULL_RELEASE_FEATURES}"
+        )
+    return np.asarray(array[:, :AREA6V_FEATURES])
+
+
+def _load_shard_arrays(
+    shard_path: Path,
+    *,
+    project_area6v: bool = False,
+    tx_storage_dtype: np.dtype[Any] | None = None,
+) -> dict[str, np.ndarray]:
     arrays: dict[str, np.ndarray] = {}
     for path in sorted(shard_path.iterdir()):
         if path.is_file() and path.suffix == ".npy":
-            arrays[path.name] = np.load(path, allow_pickle=False)
+            array = np.load(path, allow_pickle=False)
+            transformed = (
+                _project_area6v_feature_array(name=path.name, array=array)
+                if project_area6v
+                else array
+            )
+            if path.name == "tx.npy" and tx_storage_dtype is not None:
+                if not bool(np.all(np.isfinite(transformed))):
+                    raise ValueError(
+                        f"Cannot convert non-finite TX values in {path} to "
+                        f"{np.dtype(tx_storage_dtype).name}"
+                    )
+                with np.errstate(over="ignore", invalid="ignore"):
+                    converted = np.asarray(transformed, dtype=tx_storage_dtype)
+                if not bool(np.all(np.isfinite(converted))):
+                    raise ValueError(
+                        f"TX conversion overflowed in {path} while converting to "
+                        f"{np.dtype(tx_storage_dtype).name}"
+                    )
+                transformed = converted
+            arrays[path.name] = transformed
     if TIME_OFFSETS_NAME not in arrays:
         raise FileNotFoundError(f"Missing {TIME_OFFSETS_NAME} in {shard_path}")
     return arrays
@@ -157,10 +211,16 @@ def _scan_time_aligned_specs(
     *,
     src_root: Path,
     shard_relpaths: list[str],
+    project_area6v: bool = False,
+    tx_storage_dtype: np.dtype[Any] | None = None,
 ) -> dict[str, tuple[tuple[int, ...], np.dtype]]:
     specs: dict[str, tuple[tuple[int, ...], np.dtype]] = {}
     for shard_relpath in shard_relpaths:
-        arrays = _load_shard_arrays(src_root / shard_relpath)
+        arrays = _load_shard_arrays(
+            src_root / shard_relpath,
+            project_area6v=bool(project_area6v),
+            tx_storage_dtype=tx_storage_dtype,
+        )
         time_aligned, _ = _classify_arrays(arrays)
         for name, arr in time_aligned.items():
             trailing = tuple(int(x) for x in arr.shape[1:])
@@ -290,6 +350,8 @@ def repack_dataset(
     dst_root: Path,
     dataset: str,
     target_mb: float,
+    project_area6v: bool = False,
+    tx_storage_dtype: np.dtype[Any] | None = None,
 ) -> DatasetRepackSummary:
     src_dataset_root = src_root / dataset
     dst_dataset_root = dst_root / dataset
@@ -311,6 +373,8 @@ def repack_dataset(
     time_aligned_specs = _scan_time_aligned_specs(
         src_root=src_root,
         shard_relpaths=sorted(rows_by_shard),
+        project_area6v=bool(project_area6v),
+        tx_storage_dtype=tx_storage_dtype,
     )
 
     target_bytes = int(float(target_mb) * 1024 * 1024)
@@ -349,7 +413,11 @@ def repack_dataset(
 
     for shard_relpath in sorted(rows_by_shard):
         shard_path = src_root / shard_relpath
-        arrays = _load_shard_arrays(shard_path)
+        arrays = _load_shard_arrays(
+            shard_path,
+            project_area6v=bool(project_area6v),
+            tx_storage_dtype=tx_storage_dtype,
+        )
         time_offsets = arrays[TIME_OFFSETS_NAME]
         time_aligned, offset_paired = _classify_arrays(arrays)
 
@@ -378,6 +446,16 @@ def repack_dataset(
                 label_offset_buffers = {offsets_name: [0] for offsets_name in offset_paired}
 
             row_copy = dict(record.row)
+            if project_area6v:
+                if bool(row_copy.get("has_tx", False)):
+                    row_copy["n_tx_features"] = AREA6V_FEATURES
+                if bool(row_copy.get("has_sbp", False)):
+                    row_copy["n_sbp_features"] = AREA6V_FEATURES
+                if "n_total_features" in row_copy:
+                    row_copy["n_total_features"] = (
+                        AREA6V_FEATURES
+                        + (AREA6V_FEATURES if bool(row_copy.get("has_sbp", False)) else 0)
+                    )
             row_copy["shard_id"] = f"fused_{shard_idx:05d}"
             row_copy["shard_relpath"] = f"{dataset}/shards/fused_{shard_idx:05d}"
             row_copy["example_index"] = len(current_rows)
@@ -399,6 +477,39 @@ def repack_dataset(
     flush_current()
 
     metadata = _load_json(src_dataset_root / "metadata.json")
+    if project_area6v:
+        feature_layout = metadata.setdefault("feature_layout", {})
+        if isinstance(feature_layout, dict):
+            if int(feature_layout.get("n_tx_features", 0) or 0) > 0:
+                feature_layout["n_tx_features"] = AREA6V_FEATURES
+                feature_layout["tx_slice"] = [0, AREA6V_FEATURES]
+            if int(feature_layout.get("n_sbp_features", 0) or 0) > 0:
+                feature_layout["n_sbp_features"] = AREA6V_FEATURES
+                feature_layout["sbp_slice"] = [
+                    AREA6V_FEATURES,
+                    2 * AREA6V_FEATURES,
+                ]
+            feature_layout["n_total_features"] = (
+                int(feature_layout.get("n_tx_features", 0) or 0)
+                + int(feature_layout.get("n_sbp_features", 0) or 0)
+            )
+        metadata["area6v_migration"] = {
+            "area6v_only": True,
+            "trimmed_feature_columns": [0, AREA6V_FEATURES],
+            "removed_feature_columns": [AREA6V_FEATURES, FULL_RELEASE_FEATURES],
+            "source_note": AREA6V_SOURCE_NOTE,
+            "applied_during_repack": True,
+            "migrated_utc": _timestamp_utc(),
+        }
+    if tx_storage_dtype is not None:
+        tx_dtype_name = np.dtype(tx_storage_dtype).name
+        metadata["tx_storage_conversion"] = {
+            "destination_dtype": tx_dtype_name,
+            "lossless_guarantee": False,
+            "scope": "tx.npy only",
+            "applied_during_repack": True,
+            "converted_utc": _timestamp_utc(),
+        }
     metadata["num_shards"] = len(new_shards_meta)
     metadata["shards"] = new_shards_meta
     notes = metadata.setdefault("build_notes", [])
@@ -412,6 +523,12 @@ def repack_dataset(
         "target_mb": float(target_mb),
         "dst_shards": len(new_shards_meta),
         "src_shards": len(rows_by_shard),
+        "area6v_projection": bool(project_area6v),
+        "tx_storage_dtype": (
+            np.dtype(tx_storage_dtype).name
+            if tx_storage_dtype is not None
+            else None
+        ),
     }
 
     _write_json(dst_dataset_root / "metadata.json", metadata)
@@ -423,6 +540,12 @@ def repack_dataset(
         dst_shards=len(new_shards_meta),
         examples=len(new_manifest_rows),
         target_mb=float(target_mb),
+        area6v_projection=bool(project_area6v),
+        tx_storage_dtype=(
+            np.dtype(tx_storage_dtype).name
+            if tx_storage_dtype is not None
+            else None
+        ),
     )
 
 
@@ -438,6 +561,8 @@ def repack_cache_root(
     copy_datasets: list[str],
     target_mb: float,
     overwrite: bool = False,
+    area6v_datasets: list[str] | None = None,
+    tx_float16_datasets: list[str] | None = None,
 ) -> dict[str, Any]:
     src_root = Path(src_root)
     dst_root = Path(dst_root)
@@ -449,16 +574,38 @@ def repack_cache_root(
         shutil.rmtree(dst_root)
     dst_root.mkdir(parents=True, exist_ok=True)
 
+    normalized_area6v = set(_normalize_names(area6v_datasets))
+    normalized_tx_float16 = set(_normalize_names(tx_float16_datasets))
+    normalized_repack = _normalize_names(repack_datasets)
+    unsupported_area6v = normalized_area6v.difference(normalized_repack)
+    if unsupported_area6v:
+        raise ValueError(
+            "Area-6v projection is only supported for repacked datasets; "
+            f"not selected for repack: {sorted(unsupported_area6v)}"
+        )
+    unsupported_tx_float16 = normalized_tx_float16.difference(normalized_repack)
+    if unsupported_tx_float16:
+        raise ValueError(
+            "TX float16 conversion is only supported for repacked datasets; "
+            f"not selected for repack: {sorted(unsupported_tx_float16)}"
+        )
+
     summaries: list[dict[str, Any]] = []
     for dataset in _normalize_names(copy_datasets):
         copy_dataset_tree(src_root=src_root, dst_root=dst_root, dataset=dataset)
         summaries.append({"dataset": dataset, "mode": "copied_unchanged"})
-    for dataset in _normalize_names(repack_datasets):
+    for dataset in normalized_repack:
         summary = repack_dataset(
             src_root=src_root,
             dst_root=dst_root,
             dataset=dataset,
             target_mb=float(target_mb),
+            project_area6v=dataset in normalized_area6v,
+            tx_storage_dtype=(
+                np.dtype(np.float16)
+                if dataset in normalized_tx_float16
+                else None
+            ),
         )
         summaries.append(
             {
@@ -468,12 +615,16 @@ def repack_cache_root(
                 "dst_shards": summary.dst_shards,
                 "examples": summary.examples,
                 "target_mb": summary.target_mb,
+                "area6v_projection": summary.area6v_projection,
+                "tx_storage_dtype": summary.tx_storage_dtype,
             }
         )
     return {
         "src_root": str(src_root),
         "dst_root": str(dst_root),
         "target_mb": float(target_mb),
+        "area6v_datasets": sorted(normalized_area6v),
+        "tx_float16_datasets": sorted(normalized_tx_float16),
         "datasets": summaries,
     }
 
@@ -485,6 +636,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-mb", type=float, default=65.0)
     parser.add_argument("--repack-dataset", action="append", default=[])
     parser.add_argument("--copy-dataset", action="append", default=[])
+    parser.add_argument(
+        "--area6v-dataset",
+        action="append",
+        default=[],
+        help="Project TX/SBP to columns [0, 128) while repacking this dataset. Repeat as needed.",
+    )
+    parser.add_argument(
+        "--float16-tx-dataset",
+        action="append",
+        default=[],
+        help="Store tx.npy as float16 while repacking this dataset. Repeat as needed.",
+    )
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
@@ -498,6 +661,8 @@ def main() -> None:
         copy_datasets=list(args.copy_dataset),
         target_mb=float(args.target_mb),
         overwrite=bool(args.overwrite),
+        area6v_datasets=list(args.area6v_dataset),
+        tx_float16_datasets=list(args.float16_tx_dataset),
     )
     print(json.dumps(summary, indent=2))
 

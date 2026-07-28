@@ -47,6 +47,7 @@ class CacheAccessConfig:
     local_cache_base: str = "/content/utah_ssl_cache"
     force_recopy_local_cache: bool = False
     excluded_datasets: tuple[str, ...] = ("brain2text25",)
+    included_datasets: tuple[str, ...] | None = None
     seed: int = 7
     segment_bins: int = 64
     use_normalization: bool = True
@@ -60,12 +61,26 @@ class CacheAccessConfig:
     precomputed_session_stats_path: str | Path | None = None
     pretrain_source_splits: tuple[str, ...] | None = None
     pretrain_source_splits_by_dataset: dict[str, tuple[str, ...]] | None = None
+    dataset_cache_roots: dict[str, str | Path] | None = None
 
     def __post_init__(self) -> None:
         normalized_excluded = tuple(
             sorted({str(item).strip() for item in self.excluded_datasets if str(item).strip()})
         )
         self.excluded_datasets = normalized_excluded
+        if self.included_datasets is not None:
+            normalized_included = tuple(
+                sorted(
+                    {
+                        str(item).strip()
+                        for item in self.included_datasets
+                        if str(item).strip()
+                    }
+                )
+            )
+            if not normalized_included:
+                raise ValueError("included_datasets must contain at least one dataset")
+            self.included_datasets = normalized_included
         if self.pretrain_source_splits is not None:
             normalized_splits = tuple(
                 sorted({str(item).strip().lower() for item in self.pretrain_source_splits if str(item).strip()})
@@ -87,6 +102,14 @@ class CacheAccessConfig:
                 if dataset_name and normalized_dataset_splits:
                     normalized_by_dataset[dataset_name] = normalized_dataset_splits
             self.pretrain_source_splits_by_dataset = normalized_by_dataset or None
+        if self.dataset_cache_roots is not None:
+            normalized_cache_roots: dict[str, Path] = {}
+            for dataset, cache_root in self.dataset_cache_roots.items():
+                dataset_name = str(dataset).strip()
+                if not dataset_name:
+                    raise ValueError("dataset_cache_roots contains an empty dataset name")
+                normalized_cache_roots[dataset_name] = Path(cache_root)
+            self.dataset_cache_roots = normalized_cache_roots or None
         if self.mode not in {"copy_to_local", "drive_direct"}:
             raise ValueError("mode must be either 'copy_to_local' or 'drive_direct'")
         if self.segment_bins <= 0:
@@ -162,6 +185,8 @@ class CacheContext:
     session_split_summary: dict[str, dict[str, Any]]
     shard_store: "ShardStore"
     has_val_datasets: bool
+    drive_dataset_cache_roots: dict[str, Path] = field(default_factory=dict)
+    dataset_cache_roots: dict[str, Path] = field(default_factory=dict)
     session_feature_stats: dict[str, tuple[torch.Tensor, torch.Tensor]] = field(default_factory=dict)
     sampling_plan_cache: dict[tuple[str, int, float], SamplingPlan] = field(default_factory=dict)
 
@@ -333,15 +358,28 @@ def resolve_precomputed_session_stats_path(
     feature_mode: str,
     boundary_key_mode: str,
     excluded_datasets: Sequence[str],
+    included_datasets: Sequence[str] | None = None,
 ) -> Path | None:
     stats_dir = _canonical_session_stats_dir(
         cache_root=cache_root,
         feature_mode=feature_mode,
         boundary_key_mode=boundary_key_mode,
     )
-    included_datasets = _discover_included_dataset_names_for_stats(
-        cache_root=cache_root,
-        excluded_datasets=excluded_datasets,
+    included_datasets = (
+        tuple(
+            sorted(
+                {
+                    str(item).strip()
+                    for item in included_datasets
+                    if str(item).strip()
+                }
+            )
+        )
+        if included_datasets is not None
+        else _discover_included_dataset_names_for_stats(
+            cache_root=cache_root,
+            excluded_datasets=excluded_datasets,
+        )
     )
     preferred_stem = canonical_stage1_stats_stem(
         included_datasets=included_datasets,
@@ -449,8 +487,10 @@ def build_recompute_session_feature_stats_command(
     segment_bins: int,
     examples_per_shard: int,
     excluded_datasets: Sequence[str],
+    included_datasets: Sequence[str] | None = None,
     pretrain_source_splits: Sequence[str] | None = None,
     pretrain_source_splits_by_dataset: Mapping[str, Sequence[str]] | None = None,
+    dataset_cache_roots: Mapping[str, str | Path] | None = None,
 ) -> str:
     cmd = [
         "python",
@@ -474,11 +514,23 @@ def build_recompute_session_feature_stats_command(
     ]
     for dataset in tuple(sorted({str(item).strip() for item in excluded_datasets if str(item).strip()})):
         cmd.extend(["--excluded-dataset", str(dataset)])
+    for dataset in tuple(
+        sorted(
+            {
+                str(item).strip()
+                for item in (included_datasets or ())
+                if str(item).strip()
+            }
+        )
+    ):
+        cmd.extend(["--dataset", str(dataset)])
     for source_split in tuple(sorted({str(item).strip().lower() for item in (pretrain_source_splits or ()) if str(item).strip()})):
         cmd.extend(["--source-split", str(source_split)])
     for dataset, source_splits in sorted((pretrain_source_splits_by_dataset or {}).items()):
         for source_split in tuple(sorted({str(item).strip().lower() for item in source_splits if str(item).strip()})):
             cmd.extend(["--dataset-source-split", f"{str(dataset)}={str(source_split)}"])
+    for dataset, dataset_cache_root in sorted((dataset_cache_roots or {}).items()):
+        cmd.extend(["--dataset-cache-root", f"{str(dataset)}={str(Path(dataset_cache_root))}"])
     cmd.append("--overwrite")
     return " ".join(cmd)
 
@@ -502,54 +554,106 @@ def _path_signature(path: Path) -> dict[str, int] | None:
     }
 
 
-def _compute_cache_source_signature(src_root: Path) -> str:
-    def list_dir_with_retries(path: Path, *, max_retries: int = 5) -> list[Path]:
-        last_error: OSError | None = None
-        for attempt in range(1, max_retries + 1):
-            try:
-                return sorted(path.iterdir(), key=lambda child: child.name)
-            except OSError as exc:  # pragma: no cover - exercised in Colab when Drive stalls
-                last_error = exc
-                if attempt == max_retries:
-                    break
-                print(f"directory scan retry {attempt}/{max_retries} failed for {path}: {exc}")
-                time.sleep(min(10.0, float(attempt)))
-        assert last_error is not None
-        raise last_error
+def _list_dir_with_retries(path: Path, *, max_retries: int = 5) -> list[Path]:
+    last_error: OSError | None = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            return sorted(path.iterdir(), key=lambda child: child.name)
+        except OSError as exc:  # pragma: no cover - exercised in Colab when Drive stalls
+            last_error = exc
+            if attempt == max_retries:
+                break
+            print(f"directory scan retry {attempt}/{max_retries} failed for {path}: {exc}")
+            time.sleep(min(10.0, float(attempt)))
+    assert last_error is not None
+    raise last_error
 
-    datasets = []
-    for dataset_root in (
-        path
-        for path in list_dir_with_retries(src_root)
-        if path.is_dir() and (path / "metadata.json").exists()
-    ):
-        shard_root = dataset_root / "shards"
-        shard_names: list[str] = []
-        shard_scan_error: str | None = None
-        if shard_root.exists():
-            try:
-                shard_names = [path.name for path in list_dir_with_retries(shard_root) if path.is_dir()]
-            except OSError as exc:  # pragma: no cover - exercised in Colab when Drive stalls
-                shard_scan_error = str(exc)
-                print(
-                    f"warning: failed to enumerate shards for signature under {shard_root}; "
-                    f"falling back to metadata-only signature fields: {exc}"
-                )
-        datasets.append(
-            {
-                "dataset": dataset_root.name,
-                "manifest": _path_signature(dataset_root / "manifest.jsonl"),
-                "metadata": _path_signature(dataset_root / "metadata.json"),
-                "shard_count": len(shard_names),
-                "first_shard": shard_names[0] if shard_names else None,
-                "last_shard": shard_names[-1] if shard_names else None,
-                "shard_scan_error": shard_scan_error,
-            }
+
+def _dataset_signature_payload(dataset_root: Path) -> dict[str, Any]:
+    shard_root = dataset_root / "shards"
+    shard_names: list[str] = []
+    shard_scan_error: str | None = None
+    if shard_root.exists():
+        try:
+            shard_names = [path.name for path in _list_dir_with_retries(shard_root) if path.is_dir()]
+        except OSError as exc:  # pragma: no cover - exercised in Colab when Drive stalls
+            shard_scan_error = str(exc)
+            print(
+                f"warning: failed to enumerate shards for signature under {shard_root}; "
+                f"falling back to metadata-only signature fields: {exc}"
+            )
+    return {
+        "dataset": dataset_root.name,
+        "manifest": _path_signature(dataset_root / "manifest.jsonl"),
+        "metadata": _path_signature(dataset_root / "metadata.json"),
+        "shard_count": len(shard_names),
+        "first_shard": shard_names[0] if shard_names else None,
+        "last_shard": shard_names[-1] if shard_names else None,
+        "shard_scan_error": shard_scan_error,
+    }
+
+
+def _compute_cache_source_signature(src_root: Path) -> str:
+    datasets = [
+        _dataset_signature_payload(dataset_root)
+        for dataset_root in (
+            path
+            for path in _list_dir_with_retries(src_root)
+            if path.is_dir() and (path / "metadata.json").exists()
         )
+    ]
     payload = {
         "root": str(src_root),
         "datasets": datasets,
         "repack_summary": _path_signature(src_root / "repack_summary.json"),
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _resolve_drive_dataset_cache_roots(
+    primary_root: Path,
+    overrides: Mapping[str, str | Path] | None,
+) -> dict[str, Path]:
+    resolved = {
+        path.name: primary_root
+        for path in _list_dir_with_retries(primary_root)
+        if path.is_dir() and (path / "metadata.json").exists()
+    }
+    for dataset, cache_root_value in sorted((overrides or {}).items()):
+        dataset_name = str(dataset).strip()
+        cache_root = Path(cache_root_value)
+        dataset_root = cache_root / dataset_name
+        if not (dataset_root / "metadata.json").exists():
+            raise FileNotFoundError(
+                f"Dataset override {dataset_name!r} is missing metadata: "
+                f"{dataset_root / 'metadata.json'}"
+            )
+        if not (dataset_root / "manifest.jsonl").exists():
+            raise FileNotFoundError(
+                f"Dataset override {dataset_name!r} is missing manifest: "
+                f"{dataset_root / 'manifest.jsonl'}"
+            )
+        resolved[dataset_name] = cache_root
+    return resolved
+
+
+def _compute_dataset_cache_source_signature(
+    dataset_cache_roots: Mapping[str, str | Path],
+) -> str:
+    normalized = {
+        str(dataset): Path(cache_root)
+        for dataset, cache_root in sorted(dataset_cache_roots.items())
+    }
+    payload = {
+        "kind": "dataset_cache_root_map_v1",
+        "dataset_roots": {
+            dataset: str(cache_root.resolve())
+            for dataset, cache_root in normalized.items()
+        },
+        "datasets": [
+            _dataset_signature_payload(cache_root / dataset)
+            for dataset, cache_root in normalized.items()
+        ],
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
 
@@ -716,21 +820,73 @@ def _choose_shard_cache_gb() -> float:
 
 
 class ShardStore:
-    def __init__(self, cache_root: Path, ram_cache_gb: float):
+    def __init__(
+        self,
+        cache_root: Path,
+        ram_cache_gb: float,
+        *,
+        modalities: Sequence[str] = ("tx", "sbp"),
+        dataset_cache_roots: Mapping[str, str | Path] | None = None,
+    ):
         self.cache_root = Path(cache_root)
+        self.dataset_cache_roots = {
+            str(dataset): Path(root)
+            for dataset, root in (dataset_cache_roots or {}).items()
+        }
         self.max_bytes = int(ram_cache_gb * (1024 ** 3))
+        requested_modalities = (
+            (str(modalities),)
+            if isinstance(modalities, str)
+            else tuple(str(item) for item in modalities)
+        )
+        requested_modality_names = {
+            item.strip().lower() for item in requested_modalities
+        }
+        normalized_modalities = tuple(
+            name
+            for name in ("tx", "sbp")
+            if name in requested_modality_names
+        )
+        if "tx" not in normalized_modalities:
+            raise ValueError("ShardStore modalities must include 'tx'")
+        unsupported = requested_modality_names.difference({"tx", "sbp"})
+        if unsupported:
+            raise ValueError(f"Unsupported ShardStore modalities: {sorted(unsupported)}")
+        self.modalities = normalized_modalities
         self._cache: OrderedDict[str, dict[str, np.ndarray | None | int]] = OrderedDict()
         self._cached_bytes = 0
+        self._cache_hits = 0
+        self._cache_misses = 0
+        self._evictions = 0
+        self._bytes_read = 0
 
     def clear(self) -> None:
         self._cache.clear()
         self._cached_bytes = 0
+        self._cache_hits = 0
+        self._cache_misses = 0
+        self._evictions = 0
+        self._bytes_read = 0
 
-    def summary(self) -> dict[str, float]:
+    def summary(self) -> dict[str, Any]:
+        total_requests = self._cache_hits + self._cache_misses
         return {
+            "modalities": list(self.modalities),
+            "dataset_cache_roots": {
+                dataset: str(root)
+                for dataset, root in sorted(self.dataset_cache_roots.items())
+            },
             "cached_shards": float(len(self._cache)),
             "cached_gb": self._cached_bytes / (1024 ** 3),
             "budget_gb": self.max_bytes / (1024 ** 3),
+            "cache_hits": int(self._cache_hits),
+            "cache_misses": int(self._cache_misses),
+            "cache_hit_rate": (
+                float(self._cache_hits / total_requests) if total_requests else 0.0
+            ),
+            "evictions": int(self._evictions),
+            "bytes_read": int(self._bytes_read),
+            "gb_read": self._bytes_read / (1024 ** 3),
         }
 
     def _load_array(self, path: Path) -> np.ndarray | None:
@@ -743,11 +899,17 @@ class ShardStore:
         return np.load(path, allow_pickle=False)
 
     def _load_shard(self, shard_relpath: str) -> dict[str, np.ndarray | None | int]:
-        shard_path = self.cache_root / shard_relpath
+        relative_path = Path(shard_relpath)
+        dataset = relative_path.parts[0] if relative_path.parts else ""
+        shard_path = self.dataset_cache_roots.get(dataset, self.cache_root) / relative_path
         shard = {
             "time_offsets": self._load_array(shard_path / "time_offsets.npy"),
             "tx": self._load_array(shard_path / "tx.npy"),
-            "sbp": self._load_array(shard_path / "sbp.npy"),
+            "sbp": (
+                self._load_array(shard_path / "sbp.npy")
+                if "sbp" in self.modalities
+                else None
+            ),
         }
         time_offsets = shard["time_offsets"]
         if time_offsets is None:
@@ -757,21 +919,25 @@ class ShardStore:
             + (0 if shard["tx"] is None else shard["tx"].nbytes)
             + (0 if shard["sbp"] is None else shard["sbp"].nbytes)
         )
+        self._bytes_read += int(shard["bytes"])
         return shard
 
     def get(self, shard_relpath: str) -> dict[str, np.ndarray | None | int]:
         key = str(shard_relpath)
         cached = self._cache.get(key)
         if cached is not None:
+            self._cache_hits += 1
             self._cache.move_to_end(key)
             return cached
 
+        self._cache_misses += 1
         shard = self._load_shard(key)
         shard_bytes = int(shard["bytes"])
         if shard_bytes <= self.max_bytes:
             while self._cache and self._cached_bytes + shard_bytes > self.max_bytes:
                 _, evicted = self._cache.popitem(last=False)
                 self._cached_bytes -= int(evicted["bytes"])
+                self._evictions += 1
             self._cache[key] = shard
             self._cached_bytes += shard_bytes
         return shard
@@ -987,13 +1153,23 @@ def load_precomputed_session_feature_stats_into_cache_context(
         expected_dim=int(cache_context.full_dim),
         feature_mode=str(cache_context.feature_mode),
         boundary_key_mode=str(cache_context.boundary_key_mode),
-        excluded_datasets=cache_context.config.excluded_datasets,
+        excluded_datasets=tuple(
+            dataset
+            for dataset in cache_context.available_datasets
+            if dataset not in set(cache_context.pretrain_datasets)
+        ),
+        included_datasets=cache_context.config.included_datasets,
         tx_dim=int(cache_context.tx_dim),
         sbp_dim=int(cache_context.sbp_dim),
         segment_bins=int(cache_context.config.segment_bins),
         examples_per_shard=int(cache_context.config.examples_per_shard),
         pretrain_source_splits=cache_context.config.pretrain_source_splits,
         pretrain_source_splits_by_dataset=cache_context.config.pretrain_source_splits_by_dataset,
+        dataset_cache_roots=(
+            cache_context.drive_dataset_cache_roots
+            if cache_context.config.dataset_cache_roots
+            else None
+        ),
     )
     cache_context.session_feature_stats = dict(session_feature_stats)
     return {
@@ -1013,12 +1189,14 @@ def _load_precomputed_session_feature_stats(
     feature_mode: str,
     boundary_key_mode: str,
     excluded_datasets: Sequence[str],
+    included_datasets: Sequence[str] | None = None,
     tx_dim: int,
     sbp_dim: int,
     segment_bins: int,
     examples_per_shard: int,
     pretrain_source_splits: Sequence[str] | None = None,
     pretrain_source_splits_by_dataset: Mapping[str, Sequence[str]] | None = None,
+    dataset_cache_roots: Mapping[str, str | Path] | None = None,
 ) -> tuple[dict[str, tuple[torch.Tensor, torch.Tensor]], dict[str, Any], Path]:
     path = Path(stats_path)
     canonical_path = resolve_precomputed_session_stats_path(
@@ -1026,6 +1204,7 @@ def _load_precomputed_session_feature_stats(
         feature_mode=str(feature_mode),
         boundary_key_mode=str(boundary_key_mode),
         excluded_datasets=excluded_datasets,
+        included_datasets=included_datasets,
     )
     recompute_cmd = build_recompute_session_feature_stats_command(
         cache_root=cache_root,
@@ -1037,8 +1216,10 @@ def _load_precomputed_session_feature_stats(
         segment_bins=int(segment_bins),
         examples_per_shard=int(examples_per_shard),
         excluded_datasets=excluded_datasets,
+        included_datasets=included_datasets,
         pretrain_source_splits=pretrain_source_splits,
         pretrain_source_splits_by_dataset=pretrain_source_splits_by_dataset,
+        dataset_cache_roots=dataset_cache_roots,
     )
     payload, metadata, path, _ = _load_artifact_payload_and_sidecar(
         path=path,
@@ -1072,7 +1253,15 @@ def _load_precomputed_session_feature_stats(
 
     expected_cache_root = str(Path(cache_root).resolve())
     expected_cache_variant = _cache_variant_name(cache_root)
-    expected_cache_signature = _compute_cache_source_signature(Path(cache_root))
+    normalized_dataset_cache_roots = {
+        str(dataset): Path(root)
+        for dataset, root in sorted((dataset_cache_roots or {}).items())
+    }
+    expected_cache_signature = (
+        _compute_dataset_cache_source_signature(normalized_dataset_cache_roots)
+        if normalized_dataset_cache_roots
+        else _compute_cache_source_signature(Path(cache_root))
+    )
     common_metadata = {
         "source_cache_root": expected_cache_root,
         "source_cache_variant": expected_cache_variant,
@@ -1080,6 +1269,11 @@ def _load_precomputed_session_feature_stats(
         "feature_mode": str(feature_mode),
         "feature_policy": FEATURE_POLICY,
     }
+    if normalized_dataset_cache_roots:
+        common_metadata["source_cache_roots"] = {
+            dataset: str(root.resolve())
+            for dataset, root in normalized_dataset_cache_roots.items()
+        }
     session_metadata = {
         "boundary_key_mode": str(boundary_key_mode),
         "tx_dim": int(tx_dim),
@@ -1089,6 +1283,17 @@ def _load_precomputed_session_feature_stats(
             sorted({str(item).strip() for item in excluded_datasets if str(item).strip()})
         ),
     }
+    normalized_included_datasets = list(
+        sorted(
+            {
+                str(item).strip()
+                for item in (included_datasets or ())
+                if str(item).strip()
+            }
+        )
+    )
+    if normalized_included_datasets:
+        session_metadata["dataset_names"] = normalized_included_datasets
     normalized_source_splits = tuple(
         sorted({str(item).strip().lower() for item in (pretrain_source_splits or ()) if str(item).strip()})
     )
@@ -1396,9 +1601,49 @@ def prepare_cache_context(
             "No cache root found. Candidates checked: " + ", ".join(str(path) for path in candidate_paths)
         )
 
-    local_cache_root = Path(config.local_cache_base) / drive_cache_root.name
+    all_drive_dataset_cache_roots = _resolve_drive_dataset_cache_roots(
+        drive_cache_root,
+        config.dataset_cache_roots,
+    )
+    available_datasets = sorted(all_drive_dataset_cache_roots)
+    if config.included_datasets is not None:
+        missing_included = sorted(
+            set(config.included_datasets).difference(available_datasets)
+        )
+        if missing_included:
+            raise FileNotFoundError(
+                "Explicitly included dataset(s) are unavailable: "
+                f"{missing_included}. Available datasets: {available_datasets}"
+            )
+        pretrain_datasets = list(config.included_datasets)
+    else:
+        pretrain_datasets = [
+            name
+            for name in available_datasets
+            if name not in set(config.excluded_datasets)
+        ]
+    effective_excluded_datasets = tuple(
+        dataset
+        for dataset in available_datasets
+        if dataset not in set(pretrain_datasets)
+    )
+    drive_dataset_cache_roots = {
+        dataset: all_drive_dataset_cache_roots[dataset]
+        for dataset in pretrain_datasets
+    }
+    if config.dataset_cache_roots:
+        source_signature = _compute_dataset_cache_source_signature(
+            drive_dataset_cache_roots
+        )
+        local_cache_name = f"{drive_cache_root.name}_mixed_{source_signature[:12]}"
+    else:
+        source_signature = _compute_cache_source_signature(drive_cache_root)
+        local_cache_name = drive_cache_root.name
+
+    local_cache_root = Path(config.local_cache_base) / local_cache_name
     local_cache_status_path = local_cache_root.parent / f"{drive_cache_root.name}_copy_status.json"
-    source_signature = _compute_cache_source_signature(drive_cache_root)
+    if config.dataset_cache_roots:
+        local_cache_status_path = local_cache_root.parent / f"{local_cache_name}_copy_status.json"
 
     if config.force_recopy_local_cache and config.mode == "copy_to_local" and local_cache_root.exists():
         print("removing existing local cache:", local_cache_root)
@@ -1408,14 +1653,23 @@ def prepare_cache_context(
 
     copy_status = _load_copy_status(local_cache_status_path)
     if config.mode == "copy_to_local":
-        if (not local_cache_root.exists()) or (
-            not _copy_complete_for_current_source(
+        copy_is_current = (
+            _copy_complete_for_current_source(
                 status=copy_status,
                 drive_cache_root=drive_cache_root,
                 local_cache_root=local_cache_root,
                 source_signature=source_signature,
             )
-        ):
+            and (
+                not config.dataset_cache_roots
+                or copy_status.get("source_cache_roots")
+                == {
+                    dataset: str(root)
+                    for dataset, root in sorted(drive_dataset_cache_roots.items())
+                }
+            )
+        )
+        if (not local_cache_root.exists()) or not copy_is_current:
             if local_cache_root.exists():
                 print("removing stale local cache:", local_cache_root)
                 shutil.rmtree(local_cache_root)
@@ -1427,7 +1681,22 @@ def prepare_cache_context(
             print("source signature:", source_signature[:12])
             print("dest  :", local_cache_root)
             t0 = time.time()
-            file_count, total_bytes = copy_tree_with_progress(drive_cache_root, local_cache_root)
+            if config.dataset_cache_roots:
+                file_count = 0
+                total_bytes = 0
+                local_cache_root.mkdir(parents=True, exist_ok=True)
+                for dataset, source_root in sorted(drive_dataset_cache_roots.items()):
+                    copied_files, copied_bytes = copy_tree_with_progress(
+                        source_root / dataset,
+                        local_cache_root / dataset,
+                    )
+                    file_count += copied_files
+                    total_bytes += copied_bytes
+            else:
+                file_count, total_bytes = copy_tree_with_progress(
+                    drive_cache_root,
+                    local_cache_root,
+                )
             _write_copy_status(
                 local_cache_status_path,
                 drive_cache_root=drive_cache_root,
@@ -1436,14 +1705,25 @@ def prepare_cache_context(
                 file_count=file_count,
                 total_bytes=total_bytes,
             )
+            if config.dataset_cache_roots:
+                status_payload = _load_copy_status(local_cache_status_path) or {}
+                status_payload["source_cache_roots"] = {
+                    dataset: str(root)
+                    for dataset, root in sorted(drive_dataset_cache_roots.items())
+                }
+                local_cache_status_path.write_text(json.dumps(status_payload, indent=2))
             print(f"copy complete in {time.time() - t0:.1f}s")
         else:
             print("using existing local cache:", local_cache_root)
             print("source signature:", source_signature[:12])
         cache_root = local_cache_root
+        dataset_cache_roots = {
+            dataset: local_cache_root for dataset in pretrain_datasets
+        }
         cache_copy_used = True
     else:
         cache_root = drive_cache_root
+        dataset_cache_roots = dict(drive_dataset_cache_roots)
         cache_copy_used = False
         print("using Drive-backed cache directly; skipping local copy")
         print("source:", drive_cache_root)
@@ -1451,16 +1731,12 @@ def prepare_cache_context(
 
     os.environ["SSL_AUTORESEARCH_CACHE_ROOT"] = str(cache_root)
 
-    dataset_roots = sorted(path for path in cache_root.iterdir() if path.is_dir())
-    available_datasets = [path.name for path in dataset_roots]
-    pretrain_datasets = [name for name in available_datasets if name not in set(config.excluded_datasets)]
-
     rows_by_dataset: dict[str, list[ExampleRow]] = {}
     split_rows_by_dataset: dict[str, dict[str, list[ExampleRow]]] = {"train": {}, "val": {}}
     session_split_summary: dict[str, dict[str, Any]] = {}
 
     for dataset in pretrain_datasets:
-        ds_root = cache_root / dataset
+        ds_root = dataset_cache_roots[dataset] / dataset
         manifest_path = ds_root / "manifest.jsonl"
         if not manifest_path.exists():
             raise FileNotFoundError(f"Manifest missing for dataset {dataset}: {manifest_path}")
@@ -1539,7 +1815,12 @@ def prepare_cache_context(
         if config.shard_cache_ram_gb is not None
         else float(round(_choose_shard_cache_gb(), 2))
     )
-    shard_store = ShardStore(cache_root, shard_cache_ram_gb)
+    shard_store = ShardStore(
+        cache_root,
+        shard_cache_ram_gb,
+        modalities=("tx",) if config.feature_mode == "tx_only" else ("tx", "sbp"),
+        dataset_cache_roots=dataset_cache_roots if config.dataset_cache_roots else None,
+    )
     has_val_datasets = any(
         session_split_summary[dataset]["val_examples"] > 0
         for dataset in pretrain_datasets
@@ -1553,7 +1834,7 @@ def prepare_cache_context(
                 cache_root=drive_cache_root,
                 feature_mode=str(config.feature_mode),
                 boundary_key_mode=str(config.boundary_key_mode),
-                excluded_datasets=config.excluded_datasets,
+                excluded_datasets=effective_excluded_datasets,
             )
         )
         session_feature_stats, _, stats_path = _load_precomputed_session_feature_stats(
@@ -1562,13 +1843,19 @@ def prepare_cache_context(
             expected_dim=int(config.full_dim),
             feature_mode=str(config.feature_mode),
             boundary_key_mode=str(config.boundary_key_mode),
-            excluded_datasets=config.excluded_datasets,
+            excluded_datasets=effective_excluded_datasets,
+            included_datasets=config.included_datasets,
             tx_dim=int(config.tx_dim),
             sbp_dim=int(config.sbp_dim),
             segment_bins=int(config.segment_bins),
             examples_per_shard=int(config.examples_per_shard),
             pretrain_source_splits=config.pretrain_source_splits,
             pretrain_source_splits_by_dataset=config.pretrain_source_splits_by_dataset,
+            dataset_cache_roots=(
+                drive_dataset_cache_roots
+                if config.dataset_cache_roots
+                else None
+            ),
         )
         print(f"loaded precomputed SSL session-level featurewise z-scoring stats: {stats_path}")
 
@@ -1578,6 +1865,8 @@ def prepare_cache_context(
         cache_root=cache_root,
         cache_copy_used=cache_copy_used,
         source_cache_signature=source_signature,
+        drive_dataset_cache_roots=drive_dataset_cache_roots,
+        dataset_cache_roots=dataset_cache_roots,
         available_datasets=available_datasets,
         pretrain_datasets=pretrain_datasets,
         rows_by_dataset=rows_by_dataset,

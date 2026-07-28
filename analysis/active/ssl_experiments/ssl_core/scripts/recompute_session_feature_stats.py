@@ -56,6 +56,24 @@ def _parse_dataset_source_split_args(
     return {dataset: tuple(sorted(source_splits)) for dataset, source_splits in sorted(parsed.items())}
 
 
+def _parse_dataset_cache_root_args(
+    values: Sequence[str] | None,
+) -> dict[str, Path] | None:
+    if not values:
+        return None
+    parsed: dict[str, Path] = {}
+    for value in values:
+        dataset, separator, cache_root = str(value).partition("=")
+        dataset = dataset.strip()
+        cache_root = cache_root.strip()
+        if not separator or not dataset or not cache_root:
+            raise ValueError(
+                "--dataset-cache-root values must have the form DATASET=CACHE_ROOT"
+            )
+        parsed[dataset] = Path(cache_root)
+    return dict(sorted(parsed.items()))
+
+
 def _timestamp_utc() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -98,6 +116,7 @@ def recompute_session_feature_stats(
     excluded_datasets: Sequence[str] = DEFAULT_EXCLUDED_DATASETS,
     source_splits: Sequence[str] | None = None,
     source_splits_by_dataset: dict[str, Sequence[str]] | None = None,
+    dataset_cache_roots: dict[str, str | Path] | None = None,
     overwrite: bool = False,
 ) -> dict[str, Any]:
     """Recompute and save session-featurewise stats for a cache root."""
@@ -118,9 +137,20 @@ def recompute_session_feature_stats(
 
     excluded_datasets = _normalize_excluded_dataset_args(excluded_datasets)
     requested_datasets = _normalize_dataset_args(datasets)
-    available_datasets = sorted(
+    available_dataset_set = {
         path.name for path in cache_root.iterdir() if path.is_dir() and (path / "metadata.json").exists()
-    )
+    }
+    normalized_dataset_cache_roots = {
+        str(dataset): Path(root)
+        for dataset, root in sorted((dataset_cache_roots or {}).items())
+    }
+    for dataset, override_root in normalized_dataset_cache_roots.items():
+        if not (override_root / dataset / "metadata.json").exists():
+            raise FileNotFoundError(
+                f"Dataset override {dataset!r} is missing under {override_root}"
+            )
+        available_dataset_set.add(dataset)
+    available_datasets = sorted(available_dataset_set)
     if requested_datasets is not None:
         missing = [name for name in requested_datasets if name not in available_datasets]
         if missing:
@@ -135,6 +165,7 @@ def recompute_session_feature_stats(
         local_cache_base="/content/utah_ssl_cache",
         force_recopy_local_cache=False,
         excluded_datasets=tuple(str(name) for name in excluded_datasets),
+        included_datasets=requested_datasets,
         seed=int(seed),
         segment_bins=int(segment_bins),
         use_normalization=False,
@@ -156,6 +187,7 @@ def recompute_session_feature_stats(
                 for dataset, source_split_values in source_splits_by_dataset.items()
             }
         ),
+        dataset_cache_roots=normalized_dataset_cache_roots or None,
     )
 
     context = prepare_cache_context(cache_candidates=[cache_root], config=config)
@@ -198,6 +230,11 @@ def recompute_session_feature_stats(
         "session_stats_bin_stride": 2,
         "cache_copy_used": bool(context.cache_copy_used),
     }
+    if normalized_dataset_cache_roots:
+        metadata["source_cache_roots"] = {
+            dataset: str(context.drive_dataset_cache_roots[dataset].resolve())
+            for dataset in context.pretrain_datasets
+        }
 
     payload = {
         "session_feature_stats": session_feature_stats,
@@ -262,6 +299,15 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Dataset-specific source split in DATASET=SOURCE_SPLIT form. May be repeated.",
     )
+    parser.add_argument(
+        "--dataset-cache-root",
+        action="append",
+        default=None,
+        help=(
+            "Read one dataset from another cache root, in DATASET=CACHE_ROOT form. "
+            "May be repeated."
+        ),
+    )
     parser.add_argument("--overwrite", action="store_true", help="Replace an existing output file.")
     return parser.parse_args()
 
@@ -283,6 +329,7 @@ def main() -> None:
         excluded_datasets=excluded_datasets,
         source_splits=tuple(args.source_split) if args.source_split else None,
         source_splits_by_dataset=_parse_dataset_source_split_args(args.dataset_source_split),
+        dataset_cache_roots=_parse_dataset_cache_root_args(args.dataset_cache_root),
         overwrite=bool(args.overwrite),
     )
     print(json.dumps({k: str(v) if isinstance(v, Path) else v for k, v in result.items()}, indent=2))

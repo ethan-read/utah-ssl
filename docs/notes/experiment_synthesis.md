@@ -68,6 +68,21 @@ Comparison against the earlier supervised ladder:
 - versus the visible GRU reproduction point (`PER=0.3749`) and current S4D runs (`PER=0.375-0.391`), the new `tx_sbp` S5 result is substantially stronger
 - versus the best archived POSSM stage-2 result (`PER` around `0.467`), the supervised `tx_sbp` S5 run remains far ahead
 
+### Brain2Text25 GRU Representation Probe
+
+A five-fold, trial-grouped linear probe compared raw neural input windows with
+the trained Brain2Text25 GRU hidden states, using the same trials and fold-local
+scaling/PCA for both. GRU hidden states made the model's output beliefs strongly
+linearly accessible (`macro-F1=0.803`, balanced accuracy `0.899`, probability
+`R²=0.846-0.920`). Raw inputs were much weaker (`macro-F1=0.188`, balanced
+accuracy `0.380`, probability `R²=0.088-0.190`; entropy `R²=0.294`). Fold-to-fold
+variation was small. This supports the PCA impression that the GRU substantially
+organizes or amplifies task-relevant geometry rather than merely exposing an
+already obvious linear structure in the raw windows. The targets are the GRU's
+own predicted categories and probabilities, not ground-truth phoneme labels, so
+this is evidence about representational accessibility rather than independent
+phoneme-decoding accuracy.
+
 ## Claim 2: POSSM Pretraining Helps, But Does Not Yet Close The Gap
 
 The POSSM path has moved from collapsed or near-collapsed decoding into a real,

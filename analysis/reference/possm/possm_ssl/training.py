@@ -565,6 +565,17 @@ def _serialize_config(
 ) -> dict[str, Any]:
     cache_root = getattr(cache_context, "cache_root", None)
     pretrain_datasets = tuple(getattr(cache_context, "pretrain_datasets", ()) or ())
+    cache_config = getattr(cache_context, "config", None)
+    pretrain_source_splits = getattr(
+        cache_config,
+        "pretrain_source_splits",
+        None,
+    )
+    pretrain_source_splits_by_dataset = getattr(
+        cache_config,
+        "pretrain_source_splits_by_dataset",
+        None,
+    )
     smoothing_provenance = (
         None
         if cache_root is None
@@ -577,11 +588,11 @@ def _serialize_config(
         **asdict(config),
         "input_dim": int(cache_context.full_dim),
         "cache_use_normalization": bool(cache_context.use_normalization),
-        "pretrain_source_splits": list(cache_context.config.pretrain_source_splits or ()),
+        "pretrain_source_splits": list(pretrain_source_splits or ()),
         "pretrain_source_splits_by_dataset": {
             str(dataset): list(source_splits)
             for dataset, source_splits in sorted(
-                (cache_context.config.pretrain_source_splits_by_dataset or {}).items()
+                (pretrain_source_splits_by_dataset or {}).items()
             )
         },
         "cache_source_signature": (
@@ -816,6 +827,16 @@ def _train_loop(
         loss.backward()
         optimizer.step()
         model_seconds = time.time() - model_start
+        should_log_step = step == 1 or step % log_every == 0
+        sampler_cache_context = getattr(train_sampler, "cache_context", None)
+        shard_cache_summary = (
+            sampler_cache_context.shard_store.summary()
+            if should_log_step
+            and sampler_cache_context is not None
+            and hasattr(sampler_cache_context, "shard_store")
+            and hasattr(sampler_cache_context.shard_store, "summary")
+            else None
+        )
 
         train_record = {
             "event": "train",
@@ -828,12 +849,22 @@ def _train_loop(
             "masked_fraction": float(metrics.get("masked_fraction", 0.0)),
             "dataset_mix": dict(Counter(batch["datasets"])),
         }
+        if shard_cache_summary is not None:
+            train_record["shard_cache"] = shard_cache_summary
         train_history.append(train_record)
-        if step == 1 or step % log_every == 0:
+        if should_log_step:
             _emit_progress(progress_path, train_record)
             print(
                 f"step={step:04d} train_loss={metrics['mse']:.6f} "
                 f"sample_s={sample_seconds:.2f} model_s={model_seconds:.2f}"
+                + (
+                    " "
+                    f"cache_hit={float(shard_cache_summary.get('cache_hit_rate', 0.0)):.2%} "
+                    f"cached_gb={float(shard_cache_summary.get('cached_gb', 0.0)):.2f} "
+                    f"read_gb={float(shard_cache_summary.get('gb_read', 0.0)):.2f}"
+                    if shard_cache_summary is not None
+                    else ""
+                )
             )
 
         if val_sampler is not None and (step == 1 or step % val_every == 0):
