@@ -578,6 +578,12 @@ def _serialize_config(
         "input_dim": int(cache_context.full_dim),
         "cache_use_normalization": bool(cache_context.use_normalization),
         "pretrain_source_splits": list(cache_context.config.pretrain_source_splits or ()),
+        "pretrain_source_splits_by_dataset": {
+            str(dataset): list(source_splits)
+            for dataset, source_splits in sorted(
+                (cache_context.config.pretrain_source_splits_by_dataset or {}).items()
+            )
+        },
         "cache_source_signature": (
             None
             if getattr(cache_context, "source_cache_signature", None) is None

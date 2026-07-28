@@ -12,7 +12,7 @@ import time
 from collections import Counter, OrderedDict, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 import torch
@@ -59,6 +59,7 @@ class CacheAccessConfig:
     shard_cache_ram_gb: float | None = None
     precomputed_session_stats_path: str | Path | None = None
     pretrain_source_splits: tuple[str, ...] | None = None
+    pretrain_source_splits_by_dataset: dict[str, tuple[str, ...]] | None = None
 
     def __post_init__(self) -> None:
         normalized_excluded = tuple(
@@ -70,6 +71,22 @@ class CacheAccessConfig:
                 sorted({str(item).strip().lower() for item in self.pretrain_source_splits if str(item).strip()})
             )
             self.pretrain_source_splits = normalized_splits or None
+        if self.pretrain_source_splits_by_dataset is not None:
+            normalized_by_dataset: dict[str, tuple[str, ...]] = {}
+            for dataset, source_splits in self.pretrain_source_splits_by_dataset.items():
+                dataset_name = str(dataset).strip()
+                normalized_dataset_splits = tuple(
+                    sorted(
+                        {
+                            str(item).strip().lower()
+                            for item in source_splits
+                            if str(item).strip()
+                        }
+                    )
+                )
+                if dataset_name and normalized_dataset_splits:
+                    normalized_by_dataset[dataset_name] = normalized_dataset_splits
+            self.pretrain_source_splits_by_dataset = normalized_by_dataset or None
         if self.mode not in {"copy_to_local", "drive_direct"}:
             raise ValueError("mode must be either 'copy_to_local' or 'drive_direct'")
         if self.segment_bins <= 0:
@@ -433,6 +450,7 @@ def build_recompute_session_feature_stats_command(
     examples_per_shard: int,
     excluded_datasets: Sequence[str],
     pretrain_source_splits: Sequence[str] | None = None,
+    pretrain_source_splits_by_dataset: Mapping[str, Sequence[str]] | None = None,
 ) -> str:
     cmd = [
         "python",
@@ -458,6 +476,9 @@ def build_recompute_session_feature_stats_command(
         cmd.extend(["--excluded-dataset", str(dataset)])
     for source_split in tuple(sorted({str(item).strip().lower() for item in (pretrain_source_splits or ()) if str(item).strip()})):
         cmd.extend(["--source-split", str(source_split)])
+    for dataset, source_splits in sorted((pretrain_source_splits_by_dataset or {}).items()):
+        for source_split in tuple(sorted({str(item).strip().lower() for item in source_splits if str(item).strip()})):
+            cmd.extend(["--dataset-source-split", f"{str(dataset)}={str(source_split)}"])
     cmd.append("--overwrite")
     return " ".join(cmd)
 
@@ -531,6 +552,26 @@ def _compute_cache_source_signature(src_root: Path) -> str:
         "repack_summary": _path_signature(src_root / "repack_summary.json"),
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _pretrain_source_splits_for_dataset(
+    config: CacheAccessConfig,
+    dataset: str,
+) -> tuple[str, ...] | None:
+    """Resolve the source-split filter for one dataset.
+
+    Dataset-specific filters take precedence over the legacy global filter.
+    This supports pooled experiments whose datasets expose different source
+    split names, such as Brain2Text24 ``competition_train`` versus Brain2Text25
+    ``train``/``val``.
+    """
+
+    by_dataset = config.pretrain_source_splits_by_dataset or {}
+    if str(dataset) in by_dataset:
+        return tuple(by_dataset[str(dataset)])
+    if config.pretrain_source_splits is None:
+        return None
+    return tuple(config.pretrain_source_splits)
 
 
 def _load_copy_status(path: Path) -> dict[str, Any] | None:
@@ -951,6 +992,8 @@ def load_precomputed_session_feature_stats_into_cache_context(
         sbp_dim=int(cache_context.sbp_dim),
         segment_bins=int(cache_context.config.segment_bins),
         examples_per_shard=int(cache_context.config.examples_per_shard),
+        pretrain_source_splits=cache_context.config.pretrain_source_splits,
+        pretrain_source_splits_by_dataset=cache_context.config.pretrain_source_splits_by_dataset,
     )
     cache_context.session_feature_stats = dict(session_feature_stats)
     return {
@@ -975,6 +1018,7 @@ def _load_precomputed_session_feature_stats(
     segment_bins: int,
     examples_per_shard: int,
     pretrain_source_splits: Sequence[str] | None = None,
+    pretrain_source_splits_by_dataset: Mapping[str, Sequence[str]] | None = None,
 ) -> tuple[dict[str, tuple[torch.Tensor, torch.Tensor]], dict[str, Any], Path]:
     path = Path(stats_path)
     canonical_path = resolve_precomputed_session_stats_path(
@@ -994,6 +1038,7 @@ def _load_precomputed_session_feature_stats(
         examples_per_shard=int(examples_per_shard),
         excluded_datasets=excluded_datasets,
         pretrain_source_splits=pretrain_source_splits,
+        pretrain_source_splits_by_dataset=pretrain_source_splits_by_dataset,
     )
     payload, metadata, path, _ = _load_artifact_payload_and_sidecar(
         path=path,
@@ -1049,6 +1094,15 @@ def _load_precomputed_session_feature_stats(
     )
     if normalized_source_splits:
         session_metadata["pretrain_source_splits"] = list(normalized_source_splits)
+    normalized_source_splits_by_dataset = {
+        str(dataset): list(
+            sorted({str(item).strip().lower() for item in source_splits if str(item).strip()})
+        )
+        for dataset, source_splits in sorted((pretrain_source_splits_by_dataset or {}).items())
+        if source_splits
+    }
+    if normalized_source_splits_by_dataset:
+        session_metadata["pretrain_source_splits_by_dataset"] = normalized_source_splits_by_dataset
     mismatches = _validate_common_artifact_metadata(
         metadata=metadata,
         expected_metadata=common_metadata,
@@ -1412,11 +1466,12 @@ def prepare_cache_context(
             raise FileNotFoundError(f"Manifest missing for dataset {dataset}: {manifest_path}")
 
         rows: list[ExampleRow] = []
+        source_split_filter = _pretrain_source_splits_for_dataset(config, dataset)
         with manifest_path.open() as handle:
             for line in handle:
                 payload = json.loads(line)
                 source_split = str(payload.get("source_split", "")).strip().lower()
-                if config.pretrain_source_splits and source_split not in set(config.pretrain_source_splits):
+                if source_split_filter and source_split not in set(source_split_filter):
                     continue
                 rows.append(
                     ExampleRow(
@@ -1513,6 +1568,7 @@ def prepare_cache_context(
             segment_bins=int(config.segment_bins),
             examples_per_shard=int(config.examples_per_shard),
             pretrain_source_splits=config.pretrain_source_splits,
+            pretrain_source_splits_by_dataset=config.pretrain_source_splits_by_dataset,
         )
         print(f"loaded precomputed SSL session-level featurewise z-scoring stats: {stats_path}")
 

@@ -38,6 +38,24 @@ DEFAULT_SBP_DIM = BIT_STAGE1_SBP_DIM
 DEFAULT_EXCLUDED_DATASETS = BIT_STAGE1_DEFAULT_EXCLUDED_DATASETS
 
 
+def _parse_dataset_source_split_args(
+    values: Sequence[str] | None,
+) -> dict[str, tuple[str, ...]] | None:
+    if not values:
+        return None
+    parsed: dict[str, set[str]] = {}
+    for value in values:
+        dataset, separator, source_split = str(value).partition("=")
+        dataset = dataset.strip()
+        source_split = source_split.strip().lower()
+        if not separator or not dataset or not source_split:
+            raise ValueError(
+                "--dataset-source-split values must have the form DATASET=SOURCE_SPLIT"
+            )
+        parsed.setdefault(dataset, set()).add(source_split)
+    return {dataset: tuple(sorted(source_splits)) for dataset, source_splits in sorted(parsed.items())}
+
+
 def _timestamp_utc() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -79,6 +97,7 @@ def recompute_session_feature_stats(
     examples_per_shard: int = 8,
     excluded_datasets: Sequence[str] = DEFAULT_EXCLUDED_DATASETS,
     source_splits: Sequence[str] | None = None,
+    source_splits_by_dataset: dict[str, Sequence[str]] | None = None,
     overwrite: bool = False,
 ) -> dict[str, Any]:
     """Recompute and save session-featurewise stats for a cache root."""
@@ -129,6 +148,14 @@ def recompute_session_feature_stats(
             if source_splits is not None
             else None
         ),
+        pretrain_source_splits_by_dataset=(
+            None
+            if source_splits_by_dataset is None
+            else {
+                str(dataset): tuple(str(item).strip().lower() for item in source_split_values)
+                for dataset, source_split_values in source_splits_by_dataset.items()
+            }
+        ),
     )
 
     context = prepare_cache_context(cache_candidates=[cache_root], config=config)
@@ -159,6 +186,12 @@ def recompute_session_feature_stats(
         "examples_per_shard": int(examples_per_shard),
         "excluded_datasets": list(excluded_datasets),
         "pretrain_source_splits": list(context.config.pretrain_source_splits or ()),
+        "pretrain_source_splits_by_dataset": {
+            str(dataset): list(source_splits)
+            for dataset, source_splits in sorted(
+                (context.config.pretrain_source_splits_by_dataset or {}).items()
+            )
+        },
         "dataset_names": list(context.pretrain_datasets),
         "dataset_count": int(len(context.pretrain_datasets)),
         "session_count": int(len(session_feature_stats)),
@@ -223,6 +256,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Source split(s) to include in session stats and SSL sampling. May be repeated.",
     )
+    parser.add_argument(
+        "--dataset-source-split",
+        action="append",
+        default=None,
+        help="Dataset-specific source split in DATASET=SOURCE_SPLIT form. May be repeated.",
+    )
     parser.add_argument("--overwrite", action="store_true", help="Replace an existing output file.")
     return parser.parse_args()
 
@@ -243,6 +282,7 @@ def main() -> None:
         examples_per_shard=int(args.examples_per_shard),
         excluded_datasets=excluded_datasets,
         source_splits=tuple(args.source_split) if args.source_split else None,
+        source_splits_by_dataset=_parse_dataset_source_split_args(args.dataset_source_split),
         overwrite=bool(args.overwrite),
     )
     print(json.dumps({k: str(v) if isinstance(v, Path) else v for k, v in result.items()}, indent=2))
