@@ -13,7 +13,7 @@ separate from the active generic SSL experiments.
 - `notebooks/s14_possm_pooled_pretraining.ipynb`: optimized pooled
   Brain2Text24/25 Stage-1 workflow and compute-matched Brain2Text24 transfer.
 - `notebooks/s15_possm_pooled_cache_preparation.ipynb`: one-time Colab build
-  and validation of Brain2Text25-only area-6v/TX-FP16 caches, plus mixed-root
+  and validation of lossless Brain2Text25-only area-6v caches, plus mixed-root
   pooled stats and sampling benchmarks.
 - `EXPERIMENT_NOTES.md`: current experiment question, Colab recovery guidance,
   cache workflow, pitfalls, and the planned Stage-2 speedup idea.

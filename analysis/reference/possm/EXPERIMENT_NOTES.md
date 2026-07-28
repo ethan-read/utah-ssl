@@ -105,30 +105,24 @@ already-wrapped function again; otherwise a recursive wrapper can produce a
 Future fresh pooled runs use these Brain2Text25-only versioned roots:
 
 - raw:
-  `utah_ssl/data/cache_v1_possm_b2t25_area6v_txfp16_v1`
+  `utah_ssl/data/cache_v1_possm_b2t25_area6v_v1`
 - smoothed:
-  `utah_ssl/data/cache_v1_possm_b2t25_area6v_sigma2p0_txfp16_v1`
+  `utah_ssl/data/cache_v1_possm_b2t25_area6v_sigma2p0_v1`
 
 They contain only Brain2Text25 and are built independently from the existing
 canonical raw and smoothed roots. Brain2Text24 is neither copied nor
 transformed. Brain2Text25 retains 128 area-6v TX and 128 area-6v SBP channels
 and targets approximately 65 MiB per fused shard, matching the median
-Brain2Text24 shard size. TX is stored as `float16`; SBP and all auxiliary
-arrays retain their source dtypes. Building the smoothed destination from the
+Brain2Text24 shard size. Retained TX, SBP, labels, and offsets preserve their
+source dtypes and values exactly. Building the smoothed destination from the
 existing smoothed source is deliberate: smoothing is not regenerated after
 examples have been assigned to new shard boundaries.
 
-The TX-FP16 decision is intentional. A complete scan of all 127 local
-Brain2Text25 TX shards (1,242,329,344 retained area-6v values) found continuous
-z-scored values rather than integer counts: range about `-2.90` to `10.0`,
-with representative session-channel means near zero and standard deviations
-near one. A sampled FP32 -> FP16 -> FP32 round trip had mean absolute error
-about `1.0e-4` and maximum error about `3.9e-3`. The cache preparation summary
-records exact-value fraction, mean absolute error, and maximum absolute error
-for Brain2Text25. Loading converts sampled windows to FP32 before normalization
-and model computation. The Brain2Text24 examples therefore have exactly the
-same storage values and shard topology as the completed baseline; only the
-newly added Brain2Text25 examples use FP16 storage.
+An earlier pooled run stored optimized Brain2Text25 TX as `float16`. The
+current preparation workflow no longer performs this conversion: its only
+feature transformation is selecting columns `[0, 128)` for TX and SBP.
+Preserving SBP exactly is particularly important for planned SBP-only
+cross-year comparisons.
 
 The cache loader is modality-aware. A `tx_only` Stage-1 context opens and
 caches `time_offsets.npy` and `tx.npy`, but not the unused `sbp.npy`. Stage-1
@@ -138,7 +132,7 @@ only if the s15 warm benchmark remains slow.
 
 The mixed-root view has a composite source signature and its own stats
 namespace:
-`stats/session_feature_stats/possm_b2t24_canonical_b2t25_area6v_sigma2p0_txfp16_v1/`.
+`stats/session_feature_stats/possm_b2t24_canonical_b2t25_area6v_sigma2p0_v1/`.
 Do not reuse the old pooled artifact by path. Do not resume a partially trained
 run across old and optimized shard topologies; optimized-cache runs start from
 step zero under their separate run/output names.
@@ -152,10 +146,10 @@ or A100, a reasonable expectation is roughly 0.18--0.24 seconds per step
 (about 1.3--1.7x); on a T4 the gain may be small because the packed 5-layer
 GRU remains a bottleneck.
 
-BF16 compute is separate from the TX-FP16 storage decision above. Stage 1
-loads TX-FP16 windows into FP32 tensors; this section concerns optional
-Stage-2 mixed-precision model computation. BF16 is numerically close to FP32
-but not bitwise identical. Therefore:
+BF16 model compute is separate from cache storage. The current optimized cache
+preserves source dtypes; this section concerns optional Stage-2 mixed-precision
+model computation. BF16 is numerically close to FP32 but not bitwise
+identical. Therefore:
 
 - keep the current FP32 workflow as the primary baseline-vs-pooled comparison;
 - use BF16 as a speed-optimized secondary run, or rerun both experiments with

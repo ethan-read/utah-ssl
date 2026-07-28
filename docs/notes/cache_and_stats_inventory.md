@@ -71,31 +71,27 @@ path. Run
 `analysis/reference/possm/notebooks/s15_possm_pooled_cache_preparation.ipynb`
 in Colab to create:
 
-- `utah_ssl/data/cache_v1_possm_b2t25_area6v_txfp16_v1`
-- `utah_ssl/data/cache_v1_possm_b2t25_area6v_sigma2p0_txfp16_v1`
+- `utah_ssl/data/cache_v1_possm_b2t25_area6v_v1`
+- `utah_ssl/data/cache_v1_possm_b2t25_area6v_sigma2p0_v1`
 
 These roots include only Brain2Text25, retain 128 area-6v TX and 128 area-6v
 SBP channels, and use approximately 65 MiB fused shards to match the median
-canonical Brain2Text24 shard size. TX arrays are stored as `float16` to halve
-Brain2Text25 Stage-1 TX transfer and RAM use; sampled windows are converted
-back to `float32` by the loader. SBP and auxiliary arrays retain their source
-dtypes. The raw and smoothed destinations are projected/repacked independently
-so smoothing is not regenerated across new example boundaries. Brain2Text24
-continues to come directly from the canonical roots and is not copied or
-modified.
+canonical Brain2Text24 shard size. Retained TX, SBP, labels, and offsets
+preserve their source dtypes and values exactly. The raw and smoothed
+destinations are projected/repacked independently so smoothing is not
+regenerated across new example boundaries. Brain2Text24 continues to come
+directly from the canonical roots and is not copied or modified.
 
 The matching pooled session stats live under:
 
-- `utah_ssl/data/stats/session_feature_stats/possm_b2t24_canonical_b2t25_area6v_sigma2p0_txfp16_v1/tx_only/session/`
+- `utah_ssl/data/stats/session_feature_stats/possm_b2t24_canonical_b2t25_area6v_sigma2p0_v1/tx_only/session/`
 
 The preparation notebook performs logical example-level validation before a
 partial cache is promoted to its final root.
 
-TX-FP16 is deliberately versioned because it is not bitwise identical to the
-canonical Brain2Text25 source. Validation requires destination TX to equal the
-source first-128 columns after an explicit FP16 cast, requires non-TX arrays to
-remain exact, and records TX quantization error. Brain2Text24 retains exactly
-the baseline cache representation and shard topology.
+Validation requires every destination array to preserve the corresponding
+projected source dtype and values exactly. Brain2Text24 retains exactly the
+baseline cache representation and shard topology.
 
 ## Precomputed Session Stats
 

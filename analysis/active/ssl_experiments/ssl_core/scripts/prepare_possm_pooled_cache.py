@@ -1,11 +1,10 @@
-"""Build and validate a versioned Brain2Text25 cache for POSSM pretraining.
+"""Build and validate a versioned area-6v Brain2Text25 cache.
 
 Brain2Text24 remains in its canonical cache. The raw and pre-smoothed
 Brain2Text25 sources are repacked independently, so this script never
-regenerates smoothing after examples have been fused into new shards. TX is
-projected to the first 128 columns and stored as float16; SBP is projected to
-the first 128 columns while retaining its source dtype. All auxiliary arrays
-retain their source dtypes and exact values.
+regenerates smoothing after examples have been fused into new shards. TX and
+SBP are projected to their first 128 columns. Every retained array preserves
+its source dtype and exact values.
 """
 
 from __future__ import annotations
@@ -42,7 +41,6 @@ from ssl_core.scripts.repack_cache_shards import (  # noqa: E402
 
 DATASETS = ("brain2text25",)
 SUMMARY_NAME = "possm_pooled_cache_prep_summary.json"
-TX_STORAGE_DTYPE = np.dtype(np.float16)
 
 
 def _timestamp_utc() -> str:
@@ -225,11 +223,6 @@ def validate_versioned_cache(
         destination_reader = _LogicalExampleReader(destination_root, project_area6v=False)
         dataset_source = hashlib.sha256()
         dataset_destination = hashlib.sha256()
-        tx_value_count = 0
-        tx_exact_count = 0
-        tx_absolute_error_sum = 0.0
-        tx_max_absolute_error = 0.0
-
         for source_row in source_rows:
             example_id = str(source_row["example_id"])
             destination_row = destination_by_id[example_id]
@@ -245,37 +238,16 @@ def validate_versioned_cache(
             for name in sorted(source_logical):
                 source_array = source_logical[name]
                 destination_array = destination_logical[name]
-                expected_array = (
-                    np.asarray(source_array, dtype=TX_STORAGE_DTYPE)
-                    if name == "tx.npy"
-                    else source_array
-                )
-                if name == "tx.npy":
-                    if destination_array.dtype != TX_STORAGE_DTYPE:
-                        raise ValueError(
-                            f"{dataset}:{example_id}:tx.npy has dtype "
-                            f"{destination_array.dtype}; expected {TX_STORAGE_DTYPE}"
-                        )
-                    source_float = np.asarray(source_array, dtype=np.float32)
-                    destination_float = np.asarray(
-                        destination_array,
-                        dtype=np.float32,
+                expected_array = source_array
+                if destination_array.dtype != expected_array.dtype:
+                    raise ValueError(
+                        f"{dataset}:{example_id}:{name} changed dtype from "
+                        f"{expected_array.dtype} to {destination_array.dtype}"
                     )
-                    absolute_error = np.abs(source_float - destination_float)
-                    tx_value_count += int(absolute_error.size)
-                    tx_exact_count += int(np.count_nonzero(absolute_error == 0))
-                    tx_absolute_error_sum += float(
-                        absolute_error.sum(dtype=np.float64)
-                    )
-                    if absolute_error.size:
-                        tx_max_absolute_error = max(
-                            tx_max_absolute_error,
-                            float(absolute_error.max()),
-                        )
                 if not np.array_equal(expected_array, destination_array):
                     raise ValueError(
                         f"{dataset}:{example_id}:{name} differs from the expected "
-                        "area-6v/TX-FP16 representation"
+                        "lossless area-6v representation"
                     )
                 _update_logical_hash(
                     dataset_source,
@@ -317,10 +289,9 @@ def validate_versioned_cache(
             raise ValueError(f"{dataset} destination metadata has the wrong SBP slice")
         if not bool(metadata.get("area6v_migration", {}).get("area6v_only", False)):
             raise ValueError(f"{dataset} destination metadata lacks area-6v provenance")
-        tx_conversion = metadata.get("tx_storage_conversion", {})
-        if str(tx_conversion.get("destination_dtype", "")) != TX_STORAGE_DTYPE.name:
+        if "tx_storage_conversion" in metadata:
             raise ValueError(
-                f"{dataset} destination metadata lacks TX-FP16 provenance"
+                f"{dataset} destination metadata unexpectedly declares TX conversion"
             )
 
         shard_sizes = _shard_size_summary(destination_root, dataset)
@@ -333,23 +304,7 @@ def validate_versioned_cache(
             "examples": len(source_rows),
             "source_split_counts": dict(sorted(source_splits.items())),
             "logical_sha256": source_hash,
-            "tx_quantization": {
-                "source_projection": "columns_[0,128)",
-                "destination_dtype": TX_STORAGE_DTYPE.name,
-                "values": tx_value_count,
-                "exact_values": tx_exact_count,
-                "exact_fraction": (
-                    float(tx_exact_count / tx_value_count)
-                    if tx_value_count
-                    else 1.0
-                ),
-                "mean_absolute_error": (
-                    float(tx_absolute_error_sum / tx_value_count)
-                    if tx_value_count
-                    else 0.0
-                ),
-                "max_absolute_error": float(tx_max_absolute_error),
-            },
+            "storage_policy": "preserve_projected_source_dtypes_and_values",
             "shards": shard_sizes,
         }
 
@@ -413,7 +368,7 @@ def _prepare_one_root(
         copy_datasets=[],
         target_mb=float(target_mb),
         area6v_datasets=list(DATASETS),
-        tx_float16_datasets=list(DATASETS),
+        tx_float16_datasets=[],
     )
     validation = validate_versioned_cache(
         source_root=source_root,
@@ -427,13 +382,13 @@ def _prepare_one_root(
     repack_summary["dst_root"] = str(destination_root)
     validation["destination_root"] = str(destination_root)
     completed_summary = {
-        "kind": "possm_brain2text25_area6v_tx_float16_cache",
+        "kind": "possm_brain2text25_area6v_cache",
         "created_utc": _timestamp_utc(),
         "source_root": str(source_root),
         "destination_root": str(destination_root),
         "datasets": list(DATASETS),
         "area6v_columns": [0, AREA6V_FEATURES],
-        "tx_storage_dtype": TX_STORAGE_DTYPE.name,
+        "tx_storage_policy": "preserve_source_dtype_exactly",
         "sbp_storage_policy": "preserve_source_dtype_exactly",
         "target_mb": float(target_mb),
         "source_inventory": source_before,
@@ -470,12 +425,12 @@ def prepare_possm_pooled_caches(
         raise ValueError("Raw and smoothed destination roots must be different")
 
     dry_run_payload = {
-        "kind": "possm_brain2text25_area6v_tx_float16_cache_plan",
+        "kind": "possm_brain2text25_area6v_cache_plan",
         "created_utc": _timestamp_utc(),
         "target_mb": float(target_mb),
         "datasets": list(DATASETS),
         "area6v_columns": [0, AREA6V_FEATURES],
-        "tx_storage_dtype": TX_STORAGE_DTYPE.name,
+        "tx_storage_policy": "preserve_source_dtype_exactly",
         "sbp_storage_policy": "preserve_source_dtype_exactly",
         "raw": {
             "source": str(raw_source_root),

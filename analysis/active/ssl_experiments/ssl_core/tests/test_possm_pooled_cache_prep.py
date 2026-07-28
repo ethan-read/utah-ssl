@@ -182,9 +182,9 @@ class POSSMCachePreparationTests(unittest.TestCase):
                 raw_destination / destination_rows[0]["shard_relpath"] / "tx.npy"
             )
             self.assertEqual(destination_tx.shape[1], 128)
-            self.assertEqual(destination_tx.dtype, np.dtype(np.float16))
+            self.assertEqual(destination_tx.dtype, source_tx_before.dtype)
             np.testing.assert_array_equal(
-                source_tx_before[:4, :128].astype(np.float16),
+                source_tx_before[:4, :128],
                 destination_tx[:4],
             )
             destination_sbp = np.load(
@@ -211,7 +211,10 @@ class POSSMCachePreparationTests(unittest.TestCase):
             completion = json.loads(
                 (raw_destination / SUMMARY_NAME).read_text()
             )
-            self.assertEqual(completion["tx_storage_dtype"], "float16")
+            self.assertEqual(
+                completion["tx_storage_policy"],
+                "preserve_source_dtype_exactly",
+            )
             self.assertEqual(
                 completion["repack"]["dst_root"],
                 str(raw_destination),
@@ -220,11 +223,12 @@ class POSSMCachePreparationTests(unittest.TestCase):
                 completion["validation"]["destination_root"],
                 str(raw_destination),
             )
-            tx_quantization = completion["validation"]["datasets"][
-                "brain2text25"
-            ]["tx_quantization"]
-            self.assertGreater(tx_quantization["max_absolute_error"], 0.0)
-            self.assertLess(tx_quantization["max_absolute_error"], 0.01)
+            self.assertEqual(
+                completion["validation"]["datasets"]["brain2text25"][
+                    "storage_policy"
+                ],
+                "preserve_projected_source_dtypes_and_values",
+            )
 
             with self.assertRaises(FileExistsError):
                 prepare_possm_pooled_caches(
