@@ -20,6 +20,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
+from ssl_core.experiment_contract import SignalSpec
 from .cache import resolve_boundary_key
 from .model import ContrastiveSSLModel, S5ContrastiveEncoder, SessionLinearBank
 from .model_mae import MAX_PATCH_COUNT as MAE_MAX_PATCH_COUNT
@@ -143,7 +144,8 @@ class NotebookProbeEncoderAdapter(nn.Module):
         self.input_dim = int(getattr(encoder, "input_dim"))
         self.hidden_size = int(getattr(encoder, "hidden_size"))
         self.token_dim = int(getattr(encoder, "token_dim"))
-        self.feature_mode = str(getattr(encoder, "feature_mode", "tx_only"))
+        self.signal_spec = SignalSpec.from_value(getattr(encoder, "signal_spec"))
+        self.feature_mode = self.signal_spec.mode
         self.source_session_keys = tuple(getattr(encoder, "source_session_keys", ()))
 
     def encode(
@@ -341,32 +343,43 @@ class CanonicalShardAccessor:
         self.cache_root = Path(cache_root)
         self._shards: dict[str, dict[str, np.ndarray | None]] = {}
 
-    def _get_shard(self, row: CanonicalProbeManifestRow) -> dict[str, np.ndarray | None]:
+    def _get_shard(
+        self,
+        row: CanonicalProbeManifestRow,
+        *,
+        modalities: tuple[str, ...] = (),
+    ) -> dict[str, np.ndarray | None]:
         shard_path = self.cache_root / row.shard_relpath
         key = str(shard_path)
         cached = self._shards.get(key)
         if cached is None:
-            tx_path = shard_path / "tx.npy"
-            sbp_path = shard_path / "sbp.npy"
             phoneme_ids_path = shard_path / "phoneme_ids.npy"
             cached = {
                 "time_offsets": np.load(shard_path / "time_offsets.npy", mmap_mode="r"),
-                "tx": np.load(tx_path, mmap_mode="r") if tx_path.exists() else None,
-                "sbp": np.load(sbp_path, mmap_mode="r") if sbp_path.exists() else None,
+                "tx": None,
+                "sbp": None,
                 "phoneme_offsets": np.load(shard_path / "phoneme_offsets.npy", mmap_mode="r"),
                 "phoneme_ids": np.load(phoneme_ids_path, mmap_mode="r") if phoneme_ids_path.exists() else None,
             }
             self._shards[key] = cached
+        for modality in modalities:
+            if modality not in {"tx", "sbp"}:
+                raise ValueError(f"Unsupported shard modality: {modality!r}")
+            if cached[modality] is None:
+                feature_path = shard_path / f"{modality}.npy"
+                if feature_path.exists():
+                    cached[modality] = np.load(feature_path, mmap_mode="r")
         return cached
 
     def load_features(
         self,
         row: CanonicalProbeManifestRow,
         *,
-        feature_mode: str,
-        area6v_feature_dim: int | None = None,
+        signal_spec: SignalSpec | dict[str, Any],
     ) -> np.ndarray:
-        shard = self._get_shard(row)
+        resolved_signal_spec = SignalSpec.from_value(signal_spec)
+        feature_contract = resolved_signal_spec.contract
+        shard = self._get_shard(row, modalities=feature_contract.modalities)
         time_offsets = shard["time_offsets"]
         assert time_offsets is not None
         start = int(time_offsets[row.example_index])
@@ -375,30 +388,62 @@ class CanonicalShardAccessor:
         parts: list[np.ndarray] = []
         tx = shard["tx"]
         sbp = shard["sbp"]
-        if tx is not None:
-            tx_part = np.asarray(tx[start:stop], dtype=np.float32)
-            if area6v_feature_dim is not None:
-                if int(tx_part.shape[1]) < int(area6v_feature_dim):
-                    raise ValueError(
-                        f"Row {row.example_id} requested area6v_feature_dim={int(area6v_feature_dim)} "
-                        f"but tx width is only {int(tx_part.shape[1])}."
-                    )
-                tx_part = tx_part[:, : int(area6v_feature_dim)]
-            parts.append(tx_part)
-        if feature_mode == "tx_sbp" and sbp is not None:
-            sbp_part = np.asarray(sbp[start:stop], dtype=np.float32)
-            if area6v_feature_dim is not None:
-                if int(sbp_part.shape[1]) < int(area6v_feature_dim):
-                    raise ValueError(
-                        f"Row {row.example_id} requested area6v_feature_dim={int(area6v_feature_dim)} "
-                        f"but sbp width is only {int(sbp_part.shape[1])}."
-                    )
-                sbp_part = sbp_part[:, : int(area6v_feature_dim)]
-            parts.append(sbp_part)
-        if not parts:
-            raise ValueError(
-                f"Shard {row.shard_relpath} does not contain features for feature_mode={feature_mode!r}"
+        if feature_contract.uses_tx:
+            if tx is None:
+                raise ValueError(
+                    f"Shard {row.shard_relpath} is missing tx.npy for "
+                    f"signal mode={resolved_signal_spec.mode!r}"
+                )
+            tx_start, tx_stop = resolved_signal_spec.selected_columns("tx")
+            tx_part = np.asarray(
+                tx[start:stop, tx_start:min(tx_stop, tx.shape[1])],
+                dtype=np.float32,
             )
+            if (
+                tx_part.shape[1] < int(resolved_signal_spec.tx_dim)
+                and resolved_signal_spec.missing_channel_policy == "error"
+            ):
+                raise ValueError(
+                    f"Row {row.example_id} provides {tx_part.shape[1]} selected TX "
+                    f"channels but signal_spec requires {resolved_signal_spec.tx_dim}."
+                )
+            if (
+                tx_part.shape[1] < int(resolved_signal_spec.tx_dim)
+                and resolved_signal_spec.missing_channel_policy == "zero_pad"
+            ):
+                tx_part = np.pad(
+                    tx_part,
+                    ((0, 0), (0, int(resolved_signal_spec.tx_dim) - tx_part.shape[1])),
+                )
+            parts.append(tx_part)
+        if feature_contract.uses_sbp:
+            if sbp is None:
+                raise ValueError(
+                    f"Shard {row.shard_relpath} is missing sbp.npy for "
+                    f"signal mode={resolved_signal_spec.mode!r}"
+                )
+            sbp_start, sbp_stop = resolved_signal_spec.selected_columns("sbp")
+            sbp_part = np.asarray(
+                sbp[start:stop, sbp_start:min(sbp_stop, sbp.shape[1])],
+                dtype=np.float32,
+            )
+            if (
+                sbp_part.shape[1] < int(resolved_signal_spec.sbp_dim)
+                and resolved_signal_spec.missing_channel_policy == "error"
+            ):
+                raise ValueError(
+                    f"Row {row.example_id} provides {sbp_part.shape[1]} selected SBP "
+                    f"channels but signal_spec requires {resolved_signal_spec.sbp_dim}."
+                )
+            if (
+                sbp_part.shape[1] < int(resolved_signal_spec.sbp_dim)
+                and resolved_signal_spec.missing_channel_policy == "zero_pad"
+            ):
+                sbp_part = np.pad(
+                    sbp_part,
+                    ((0, 0), (0, int(resolved_signal_spec.sbp_dim) - sbp_part.shape[1])),
+                )
+            parts.append(sbp_part)
         if len(parts) == 1:
             return parts[0]
         return np.concatenate(parts, axis=1)
@@ -414,7 +459,7 @@ class CanonicalShardAccessor:
             return np.zeros((0,), dtype=np.int64)
         start = int(phoneme_offsets[row.example_index])
         stop = int(phoneme_offsets[row.example_index + 1])
-        return np.asarray(phoneme_ids[start:stop], dtype=np.int64)
+        return np.array(phoneme_ids[start:stop], dtype=np.int64, copy=True)
 
     def close(self) -> None:
         self._shards.clear()
@@ -518,6 +563,15 @@ class LengthAwareBatchSampler(torch.utils.data.Sampler[list[int]]):
         self.seed = int(seed)
         self._iteration_count = 0
 
+    def state_dict(self) -> dict[str, int]:
+        return {"iteration_count": int(self._iteration_count)}
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        iteration_count = int(state.get("iteration_count", 0))
+        if iteration_count < 0:
+            raise ValueError("iteration_count must be non-negative")
+        self._iteration_count = iteration_count
+
     def _ordered_indices(self) -> list[int]:
         indices = list(range(len(self.rows)))
         if not self.shuffle:
@@ -617,8 +671,8 @@ def _group_rows_by_session(
 def build_competition_split_problem(
     *,
     cache_root: Path,
+    signal_spec: SignalSpec | dict[str, Any],
     dataset: str = "brain2text24",
-    feature_mode: str = "tx_only",
     boundary_key_mode: str = "session",
 ) -> dict[str, Any]:
     canonical_root, manifest_path, metadata_path = _validate_canonical_probe_assets(
@@ -627,29 +681,15 @@ def build_competition_split_problem(
     )
     manifest_rows = _load_canonical_probe_manifest(manifest_path)
     metadata = _load_probe_metadata_json(metadata_path)
-    if str(dataset) == "brain2text24":
-        full_width_rows = [
-            row
-            for row in manifest_rows
-            if int(row.n_tx_features) > AREA6V_FEATURE_DIM
-            or int(row.n_sbp_features) > AREA6V_FEATURE_DIM
-        ]
-        if full_width_rows:
-            row = full_width_rows[0]
-            raise ValueError(
-                "brain2text24 cache is still full-array width. Run "
-                "analysis/active/ssl_experiments/ssl_core/scripts/trim_area6v_cache.py before building "
-                f"competition splits. Example {row.shard_relpath}:{row.example_index} "
-                f"reports n_tx_features={row.n_tx_features}, n_sbp_features={row.n_sbp_features}."
-            )
-
-    if feature_mode not in {"tx_only", "tx_sbp"}:
-        raise ValueError("feature_mode must be one of {'tx_only', 'tx_sbp'}")
+    resolved_signal_spec = SignalSpec.from_value(signal_spec)
 
     def _row_matches_feature_mode(row: CanonicalProbeManifestRow) -> bool:
-        if feature_mode == "tx_only":
-            return int(row.n_tx_features) > 0
-        return int(row.n_tx_features) > 0 and int(row.n_sbp_features) > 0
+        return resolved_signal_spec.row_is_compatible(
+            has_tx=row.n_tx_features > 0,
+            has_sbp=row.n_sbp_features > 0,
+            n_tx_features=row.n_tx_features,
+            n_sbp_features=row.n_sbp_features,
+        )
 
     split_counts: Counter[str] = Counter()
     train_candidates: list[CanonicalProbeManifestRow] = []
@@ -688,7 +728,8 @@ def build_competition_split_problem(
         "vocab": _resolve_phoneme_vocabulary(metadata),
         "cache_root": Path(cache_root),
         "dataset": str(dataset),
-        "feature_mode": str(feature_mode),
+        "feature_mode": resolved_signal_spec.mode,
+        "signal_spec": resolved_signal_spec,
         "boundary_key_mode": str(boundary_key_mode),
         "split_policy": "competition_train_test",
         "train_split_name": "competition_train",
@@ -706,7 +747,7 @@ def build_source_split_problem(
     *,
     cache_root: Path,
     dataset: str,
-    feature_mode: str,
+    signal_spec: SignalSpec | dict[str, Any],
     boundary_key_mode: str = "session",
     train_split_name: str = "train",
     val_split_name: str = "val",
@@ -718,13 +759,15 @@ def build_source_split_problem(
     manifest_rows = _load_canonical_probe_manifest(manifest_path)
     metadata = _load_probe_metadata_json(metadata_path)
 
-    if feature_mode not in {"tx_only", "tx_sbp"}:
-        raise ValueError("feature_mode must be one of {'tx_only', 'tx_sbp'}")
+    resolved_signal_spec = SignalSpec.from_value(signal_spec)
 
     def _row_matches_feature_mode(row: CanonicalProbeManifestRow) -> bool:
-        if feature_mode == "tx_only":
-            return int(row.n_tx_features) > 0
-        return int(row.n_tx_features) > 0 and int(row.n_sbp_features) > 0
+        return resolved_signal_spec.row_is_compatible(
+            has_tx=row.n_tx_features > 0,
+            has_sbp=row.n_sbp_features > 0,
+            n_tx_features=row.n_tx_features,
+            n_sbp_features=row.n_sbp_features,
+        )
 
     train_key = str(train_split_name).strip().lower()
     val_key = str(val_split_name).strip().lower()
@@ -765,7 +808,8 @@ def build_source_split_problem(
         "vocab": _resolve_phoneme_vocabulary(metadata),
         "cache_root": Path(cache_root),
         "dataset": str(dataset),
-        "feature_mode": str(feature_mode),
+        "feature_mode": resolved_signal_spec.mode,
+        "signal_spec": resolved_signal_spec,
         "boundary_key_mode": str(boundary_key_mode),
         "split_policy": "source_split",
         "train_split_name": str(train_split_name),
@@ -784,9 +828,9 @@ def compute_feature_stats(
     *,
     cache_root: Path,
     mode: str,
-    feature_mode: str,
-    area6v_feature_dim: int | None = None,
+    signal_spec: SignalSpec | dict[str, Any],
 ) -> dict[str, tuple[np.ndarray, np.ndarray]] | tuple[np.ndarray, np.ndarray]:
+    resolved_signal_spec = SignalSpec.from_value(signal_spec)
     accessor = CanonicalShardAccessor(cache_root)
     try:
         if mode == "global":
@@ -796,8 +840,7 @@ def compute_feature_stats(
             for row in rows:
                 x = accessor.load_features(
                     row,
-                    feature_mode=feature_mode,
-                    area6v_feature_dim=area6v_feature_dim,
+                    signal_spec=resolved_signal_spec,
                 )
                 x64 = x.astype(np.float64, copy=False)
                 if sum_x is None:
@@ -823,8 +866,7 @@ def compute_feature_stats(
                     tuple(session_rows),
                     cache_root=cache_root,
                     mode="global",
-                    feature_mode=feature_mode,
-                    area6v_feature_dim=area6v_feature_dim,
+                    signal_spec=resolved_signal_spec,
                 )  # type: ignore[arg-type]
                 for session_id, session_rows in grouped.items()
             }
@@ -868,22 +910,21 @@ class CanonicalSequenceDataset(torch.utils.data.Dataset):
         rows: tuple[CanonicalProbeManifestRow, ...] | list[CanonicalProbeManifestRow],
         *,
         cache_root: Path,
+        signal_spec: SignalSpec | dict[str, Any],
         stats: dict[str, tuple[np.ndarray, np.ndarray]] | tuple[np.ndarray, np.ndarray] | None = None,
-        feature_mode: str = "tx_only",
         boundary_key_mode: str = "session",
         dataset: str = "brain2text25",
         input_tail_bins: int | None = None,
         pad_feature_dim_to: int | None = None,
-        area6v_feature_dim: int | None = None,
     ) -> None:
         self.rows = list(rows)
         self.stats = stats
-        self.feature_mode = str(feature_mode)
+        self.signal_spec = SignalSpec.from_value(signal_spec)
+        self.feature_mode = self.signal_spec.mode
         self.boundary_key_mode = str(boundary_key_mode)
         self.dataset = str(dataset)
         self.input_tail_bins = int(input_tail_bins) if input_tail_bins is not None else None
         self.pad_feature_dim_to = int(pad_feature_dim_to) if pad_feature_dim_to is not None else None
-        self.area6v_feature_dim = int(area6v_feature_dim) if area6v_feature_dim is not None else None
         self._accessor = CanonicalShardAccessor(cache_root)
 
     def __len__(self) -> int:
@@ -893,8 +934,7 @@ class CanonicalSequenceDataset(torch.utils.data.Dataset):
         row = self.rows[idx]
         x = self._accessor.load_features(
             row,
-            feature_mode=self.feature_mode,
-            area6v_feature_dim=self.area6v_feature_dim,
+            signal_spec=self.signal_spec,
         )
         if self.stats is not None:
             x = apply_feature_stats(x, row=row, stats=self.stats)
@@ -931,7 +971,9 @@ class CanonicalSequenceDataset(torch.utils.data.Dataset):
         }
 
     def __del__(self) -> None:
-        self._accessor.close()
+        accessor = getattr(self, "_accessor", None)
+        if accessor is not None:
+            accessor.close()
 
 
 def collate_sequence_batch(batch: list[dict[str, Any]]) -> dict[str, Any]:
@@ -974,18 +1016,33 @@ def collate_sequence_batch(batch: list[dict[str, Any]]) -> dict[str, Any]:
 def _default_checkpoint_config(default_checkpoint_config: dict[str, Any] | None) -> dict[str, Any]:
     if default_checkpoint_config is None:
         raise ValueError("default_checkpoint_config is required for downstream probe recovery.")
+    required_keys = (
+        "signal_spec",
+        "patch_size",
+        "patch_stride",
+        "hidden_size",
+        "s5_state_size",
+        "num_layers",
+        "dropout",
+        "post_proj_norm",
+        "backbone_direction",
+    )
+    missing = [key for key in required_keys if key not in default_checkpoint_config]
+    if missing:
+        raise KeyError(f"default_checkpoint_config is missing required keys: {missing}")
     resolved = {
+        "signal_spec": SignalSpec.from_value(
+            default_checkpoint_config["signal_spec"]
+        ).to_dict(),
         "patch_size": int(default_checkpoint_config["patch_size"]),
         "patch_stride": int(default_checkpoint_config["patch_stride"]),
         "hidden_size": int(default_checkpoint_config["hidden_size"]),
         "s5_state_size": int(default_checkpoint_config["s5_state_size"]),
         "num_layers": int(default_checkpoint_config["num_layers"]),
         "dropout": float(default_checkpoint_config["dropout"]),
-        "post_proj_norm": str(default_checkpoint_config.get("post_proj_norm", "rms")),
-        "backbone_direction": str(default_checkpoint_config.get("backbone_direction", "causal")),
+        "post_proj_norm": str(default_checkpoint_config["post_proj_norm"]),
+        "backbone_direction": str(default_checkpoint_config["backbone_direction"]),
     }
-    if "feature_mode" in default_checkpoint_config:
-        resolved["feature_mode"] = str(default_checkpoint_config["feature_mode"])
     if "boundary_key_mode" in default_checkpoint_config:
         resolved["boundary_key_mode"] = str(default_checkpoint_config["boundary_key_mode"])
     if "input_dim" in default_checkpoint_config:
@@ -1033,12 +1090,16 @@ def _recover_encoder_from_notebook_checkpoint(
     payload = torch.load(path, map_location="cpu")
     checkpoint_cfg = dict(payload.get("config", {}))
     required_keys = [
+        "signal_spec",
+        "input_dim",
         "patch_size",
         "patch_stride",
         "hidden_size",
         "s5_state_size",
         "num_layers",
         "dropout",
+        "post_proj_norm",
+        "backbone_direction",
     ]
     missing_keys = [key for key in required_keys if key not in checkpoint_cfg]
     if missing_keys:
@@ -1092,32 +1153,32 @@ def _recover_encoder_from_notebook_checkpoint(
                 "MAE checkpoint is missing max_patches and could not infer it from config/state."
             )
         recovered_encoder = MAES5ContrastiveEncoder(
-            input_dim=int(checkpoint_cfg.get("input_dim", input_dim)),
+            input_dim=int(checkpoint_cfg["input_dim"]),
             hidden_size=int(checkpoint_cfg["hidden_size"]),
             s5_state_size=int(checkpoint_cfg["s5_state_size"]),
             num_layers=int(checkpoint_cfg["num_layers"]),
             dropout=float(checkpoint_cfg["dropout"]),
             patch_size=int(checkpoint_cfg["patch_size"]),
             patch_stride=int(checkpoint_cfg["patch_stride"]),
-            post_proj_norm=str(checkpoint_cfg.get("post_proj_norm", "rms")),
+            post_proj_norm=str(checkpoint_cfg["post_proj_norm"]),
             max_patches=int(max_patches),
             source_session_keys=inferred_source_session_keys,
-            feature_mode=str(checkpoint_cfg.get("feature_mode", "tx_only")),
-            backbone_direction=str(checkpoint_cfg.get("backbone_direction", "bidirectional")),
+            signal_spec=SignalSpec.from_value(checkpoint_cfg["signal_spec"]),
+            backbone_direction=str(checkpoint_cfg["backbone_direction"]),
         )
     else:
         recovered_encoder = S5ContrastiveEncoder(
-            input_dim=int(checkpoint_cfg.get("input_dim", input_dim)),
+            input_dim=int(checkpoint_cfg["input_dim"]),
             hidden_size=int(checkpoint_cfg["hidden_size"]),
             s5_state_size=int(checkpoint_cfg["s5_state_size"]),
             num_layers=int(checkpoint_cfg["num_layers"]),
             dropout=float(checkpoint_cfg["dropout"]),
             patch_size=int(checkpoint_cfg["patch_size"]),
             patch_stride=int(checkpoint_cfg["patch_stride"]),
-            post_proj_norm=str(checkpoint_cfg.get("post_proj_norm", "rms")),
+            post_proj_norm=str(checkpoint_cfg["post_proj_norm"]),
             source_session_keys=inferred_source_session_keys,
-            feature_mode=str(checkpoint_cfg.get("feature_mode", "tx_only")),
-            backbone_direction=str(checkpoint_cfg.get("backbone_direction", "causal")),
+            signal_spec=SignalSpec.from_value(checkpoint_cfg["signal_spec"]),
+            backbone_direction=str(checkpoint_cfg["backbone_direction"]),
         )
     recovered_encoder.load_state_dict(encoder_state)
     return recovered_encoder, checkpoint_cfg
@@ -1155,6 +1216,7 @@ def _build_probe_state(
     base_run_dir: Path,
 ) -> dict[str, Any]:
     base_encoder = base_encoder.cpu()
+    signal_spec = SignalSpec.from_value(getattr(base_encoder, "signal_spec"))
     return {
         "base_encoder": base_encoder,
         "encoder": NotebookProbeEncoderAdapter(base_encoder),
@@ -1162,7 +1224,8 @@ def _build_probe_state(
         "checkpoint_config": dict(checkpoint_config),
         "checkpoint_path": checkpoint_path,
         "base_run_dir": Path(base_run_dir),
-        "feature_mode": str(getattr(base_encoder, "feature_mode", checkpoint_config.get("feature_mode", "tx_only"))),
+        "signal_spec": signal_spec,
+        "feature_mode": signal_spec.mode,
         "boundary_key_mode": str(checkpoint_config.get("boundary_key_mode", "session")),
         "input_dim": int(getattr(base_encoder, "input_dim")),
         "source_session_keys": list(getattr(base_encoder, "source_session_keys", checkpoint_config.get("source_session_keys", ()))),
@@ -1262,9 +1325,10 @@ def build_random_init_probe_state(
             dropout=float(checkpoint_cfg["dropout"]),
             patch_size=int(checkpoint_cfg["patch_size"]),
             patch_stride=int(checkpoint_cfg["patch_stride"]),
-            post_proj_norm=str(checkpoint_cfg.get("post_proj_norm", "rms")),
+            post_proj_norm=str(checkpoint_cfg["post_proj_norm"]),
             source_session_keys=tuple(checkpoint_cfg.get("source_session_keys", ())),
-            feature_mode=str(checkpoint_cfg.get("feature_mode", "tx_only")),
+            signal_spec=SignalSpec.from_value(checkpoint_cfg["signal_spec"]),
+            backbone_direction=str(checkpoint_cfg["backbone_direction"]),
         )
 
     return _build_probe_state(
@@ -1280,12 +1344,13 @@ def build_downstream_probe_problem(
     *,
     cache_root: Path,
     probe_config: DownstreamProbeConfig,
-    feature_mode: str = "tx_only",
+    signal_spec: SignalSpec | dict[str, Any],
     boundary_key_mode: str = "session",
     dataset: str = "brain2text25",
     source_session_ids: Sequence[str] | None = None,
     target_session_ids: Sequence[str] | None = None,
 ) -> dict[str, Any]:
+    resolved_signal_spec = SignalSpec.from_value(signal_spec)
     _, data_module = _load_benchmark_modules()
     canonical_root, manifest_path, metadata_path = _validate_canonical_probe_assets(
         cache_root,
@@ -1304,12 +1369,24 @@ def build_downstream_probe_problem(
             canonical_root=canonical_root,
             cache_root=Path(cache_root),
         )
-        if feature_mode == "tx_only":
-            eligible_entries = [entry for entry in inventory if entry.has_tx]
-        elif feature_mode == "tx_sbp":
-            eligible_entries = [entry for entry in inventory if entry.has_tx and entry.has_sbp]
-        else:
-            raise ValueError("feature_mode must be one of {'tx_only', 'tx_sbp'}")
+        eligible_entries = [
+            entry
+            for entry in inventory
+            if resolved_signal_spec.row_is_compatible(
+                has_tx=entry.has_tx,
+                has_sbp=entry.has_sbp,
+                n_tx_features=(
+                    resolved_signal_spec.column_start + resolved_signal_spec.tx_dim
+                    if entry.has_tx
+                    else 0
+                ),
+                n_sbp_features=(
+                    resolved_signal_spec.column_start + resolved_signal_spec.sbp_dim
+                    if entry.has_sbp
+                    else 0
+                ),
+            )
+        ]
         split = data_module.split_latest_sessions(
             eligible_entries,
             session_limit=int(probe_config.session_limit),
@@ -1424,7 +1501,8 @@ def build_downstream_probe_problem(
         "vocab": _resolve_phoneme_vocabulary(metadata),
         "cache_root": Path(cache_root),
         "dataset": str(dataset),
-        "feature_mode": str(feature_mode),
+        "feature_mode": resolved_signal_spec.mode,
+        "signal_spec": resolved_signal_spec,
         "boundary_key_mode": str(boundary_key_mode),
     }
 
@@ -1793,14 +1871,14 @@ def train_probe_with_metrics(
         problem["target_train_rows"],
         cache_root=Path(problem["cache_root"]),
         mode=target_stats_mode,
-        feature_mode=str(problem["feature_mode"]),
+        signal_spec=problem["signal_spec"],
     )
     train_loader = DataLoader(
         CanonicalSequenceDataset(
             problem["target_train_rows"],
             cache_root=Path(problem["cache_root"]),
             stats=target_stats,
-            feature_mode=str(problem["feature_mode"]),
+            signal_spec=problem["signal_spec"],
             boundary_key_mode=str(problem.get("boundary_key_mode", "session")),
             dataset=dataset_name,
             input_tail_bins=input_tail_bins,
@@ -1818,7 +1896,7 @@ def train_probe_with_metrics(
             problem["target_val_rows"],
             cache_root=Path(problem["cache_root"]),
             stats=target_stats,
-            feature_mode=str(problem["feature_mode"]),
+            signal_spec=problem["signal_spec"],
             boundary_key_mode=str(problem.get("boundary_key_mode", "session")),
             dataset=dataset_name,
             input_tail_bins=input_tail_bins,
@@ -2023,7 +2101,7 @@ def run_downstream_probe(
     problem = build_downstream_probe_problem(
         cache_root=cache_root,
         probe_config=effective_probe_config,
-        feature_mode=str(probe_state.get("feature_mode", "tx_only")),
+        signal_spec=probe_state["signal_spec"],
         boundary_key_mode=str(probe_state.get("boundary_key_mode", "session")),
         dataset=str(probe_dataset),
         source_session_ids=source_session_ids,

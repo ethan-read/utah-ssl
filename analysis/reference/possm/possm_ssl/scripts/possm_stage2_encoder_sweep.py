@@ -25,7 +25,11 @@ if str(POSSM_DIR) not in sys.path:
 
 import torch
 
-from possm_ssl import POSSMFinetuneConfig, resolve_possm_checkpoint_path, run_possm_phoneme_finetuning
+from possm_ssl import (
+    POSSMFinetuneConfig,
+    resolve_possm_checkpoint_path,
+    run_possm_phoneme_finetuning,
+)
 from possm_ssl.scripts.possm_stage2_hyperparam_sweep import (
     DEFAULT_OUTPUT_ROOT,
     DEFAULT_STAGE2_CACHE_ROOT,
@@ -48,7 +52,6 @@ def base_config(args: argparse.Namespace) -> POSSMFinetuneConfig:
         seed=int(args.seed),
         mode=str(args.mode),
         dataset=str(args.dataset),
-        feature_mode=str(args.feature_mode),
         data_mode=str(args.data_mode),
         boundary_key_mode=str(args.boundary_key_mode),
         batch_size=int(args.batch_size),
@@ -75,8 +78,8 @@ def base_config(args: argparse.Namespace) -> POSSMFinetuneConfig:
         s5_dropout=float(args.s5_dropout),
         s5_direction=str(args.s5_direction),
         s5_ffn_multiplier=float(args.s5_ffn_multiplier),
-        temporal_patch_kernel_size=int(args.temporal_patch_kernel_size),
-        temporal_patch_stride=int(args.temporal_patch_stride),
+        conv_kernel_size=int(args.conv_kernel_size),
+        conv_stride=int(args.conv_stride),
         conv_dropout=float(args.conv_dropout),
     )
 
@@ -163,7 +166,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--mode", choices=("probe_frozen", "finetune_full"), default="probe_frozen")
     parser.add_argument("--dataset", default="brain2text24")
-    parser.add_argument("--feature-mode", choices=("tx_only", "tx_sbp"), default="tx_only")
     parser.add_argument("--data-mode", choices=("raw", "normalized"), default="normalized")
     parser.add_argument("--boundary-key-mode", choices=("session", "subject_if_available"), default="session")
     parser.add_argument("--batch-size", type=int, default=32)
@@ -190,8 +192,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--s5-dropout", type=float, default=0.2)
     parser.add_argument("--s5-direction", choices=("causal", "bidirectional"), default="causal")
     parser.add_argument("--s5-ffn-multiplier", type=float, default=2.0)
-    parser.add_argument("--temporal-patch-kernel-size", type=int, default=14)
-    parser.add_argument("--temporal-patch-stride", type=int, default=4)
+    parser.add_argument("--conv-kernel-size", type=int, default=14)
+    parser.add_argument("--conv-stride", type=int, default=4)
     parser.add_argument("--conv-dropout", type=float, default=0.1)
     return parser.parse_args()
 

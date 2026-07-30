@@ -28,6 +28,12 @@ from pathlib import Path
 
 import modal
 
+from analysis.active.ssl_experiments.ssl_core.bit_cache_contract import (
+    BIT_STAGE1_DATASET_SPLITS,
+    BIT_STAGE1_TX_DIM,
+)
+from analysis.active.ssl_experiments.ssl_core.experiment_contract import SignalSpec
+
 
 APP_NAME = "utah-ssl-bit-s5-stage1"
 DEFAULT_CACHE_VOLUME_NAME = "utah-ssl-cache"
@@ -109,18 +115,22 @@ def _build_config(
         "input_mode": "temporal_patch",
         "objective": "masked_time_channel_reconstruction",
         "dataset": "brain2text24",
-        "feature_mode": "tx_only",
+        "dataset_plan": {
+            dataset: list(source_splits)
+            for dataset, source_splits in BIT_STAGE1_DATASET_SPLITS.items()
+        },
+        "signal_spec": SignalSpec.tx_only(
+            tx_dim=BIT_STAGE1_TX_DIM,
+            missing_channel_policy="zero_pad",
+        ).to_dict(),
         "boundary_key_mode": "session",
         "cache_root": str(cache_root),
         "cache_mode": "drive_direct",
         "local_cache_base": "/tmp/utah_ssl_cache",
-        "excluded_datasets": ["brain2text25"],
         "use_normalization": True,
         "precomputed_session_stats_path": None,
         "precomputed_split_stats_path": None,
         "normalization_mode": "global",
-        "tx_dim": 256,
-        "sbp_dim": 0,
         "segment_bins": 256,
         "batch_size": int(batch_size),
         "ssl_steps": int(ssl_steps),

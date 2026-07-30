@@ -9,6 +9,17 @@ from pathlib import Path
 
 import modal
 
+from analysis.active.ssl_experiments.ssl_core.bit_cache_contract import (
+    BIT_STAGE1_DATASET_SPLITS,
+    BIT_STAGE1_TX_DIM,
+)
+from analysis.active.ssl_experiments.ssl_core.experiment_contract import (
+    DatasetPlan,
+    SignalSpec,
+)
+from analysis.active.ssl_experiments.ssl_core.cache import (
+    resolve_precomputed_session_stats_path,
+)
 
 APP_NAME = "utah-ssl-recompute-bit-stage1-stats"
 CACHE_VOLUME_NAME = "utah-ssl-cache"
@@ -17,9 +28,16 @@ CACHE_MOUNT = Path("/vol/cache")
 REMOTE_REPO_ROOT = Path("/root/utah-ssl")
 
 CACHE_SUBDIR = "cache_v1_smoothed_sigma2p0"
-STATS_OUTPUT = (
-    "stats/session_feature_stats/smoothed_sigma2p0/tx_only/session/"
-    "ssl_pretrain_including_brain2text24_excluding_brain2text25_v1.pt"
+DATASET_PLAN = DatasetPlan.from_mapping(BIT_STAGE1_DATASET_SPLITS)
+SIGNAL_SPEC = SignalSpec.tx_only(
+    tx_dim=BIT_STAGE1_TX_DIM,
+    missing_channel_policy="zero_pad",
+)
+STATS_OUTPUT = resolve_precomputed_session_stats_path(
+    cache_root=CACHE_MOUNT / CACHE_SUBDIR,
+    signal_spec=SIGNAL_SPEC,
+    dataset_plan=DATASET_PLAN,
+    boundary_key_mode="session",
 )
 
 
@@ -55,7 +73,7 @@ app = modal.App(APP_NAME, image=image)
 )
 def recompute_stats() -> dict[str, str]:
     cache_root = CACHE_MOUNT / CACHE_SUBDIR
-    output_path = CACHE_MOUNT / STATS_OUTPUT
+    output_path = STATS_OUTPUT
 
     command = [
         sys.executable,
@@ -65,21 +83,25 @@ def recompute_stats() -> dict[str, str]:
         "--output-path",
         str(output_path),
         "--feature-mode",
-        "tx_only",
+        SIGNAL_SPEC.mode,
         "--boundary-key-mode",
         "session",
         "--tx-dim",
-        "256",
+        str(SIGNAL_SPEC.tx_dim),
         "--sbp-dim",
-        "0",
-        "--segment-bins",
-        "256",
-        "--examples-per-shard",
-        "8",
-        "--excluded-dataset",
-        "brain2text25",
+        str(SIGNAL_SPEC.sbp_dim),
+        "--column-start",
+        str(SIGNAL_SPEC.column_start),
+        "--missing-channel-policy",
+        SIGNAL_SPEC.missing_channel_policy,
         "--overwrite",
     ]
+    for selection in DATASET_PLAN.datasets:
+        command.extend(["--dataset", selection.name])
+        for source_split in selection.source_splits:
+            command.extend(
+                ["--dataset-source-split", f"{selection.name}={source_split}"]
+            )
 
     print("Running:", " ".join(command), flush=True)
     subprocess.run(

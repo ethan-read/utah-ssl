@@ -27,6 +27,7 @@ from masked_ssl.cache import (
     _compute_cache_source_signature,
     load_precomputed_session_feature_stats_into_cache_context,
     prepare_cache_context,
+    resolve_precomputed_session_stats_path,
     sample_base_segment,
 )
 from masked_ssl.model import MaskedSSLModel, SessionLinearBank
@@ -52,10 +53,11 @@ from masked_ssl.probe import (
     recover_downstream_probe_state,
 )
 from masked_ssl.sweeps import resolve_cache_candidates_for_sigma
-from masked_ssl.training import recover_ssl_run_state_from_checkpoint
+from masked_ssl.training import SSLTrainingConfig, recover_ssl_run_state_from_checkpoint
 from s5 import BidirectionalS5SequenceBackbone, S5SequenceBackbone, reverse_padded_sequence
 from ssl_core.scripts.build_smoothed_cache import build_smoothed_cache
 from ssl_core.scripts.recompute_session_feature_stats import recompute_session_feature_stats
+from ssl_core.experiment_contract import DatasetPlan, SignalSpec
 from analysis.active.ssl_experiments.ssl_core.stats_artifact_test_utils import (
     write_valid_session_stats_artifact as _write_valid_session_stats_artifact,
 )
@@ -82,7 +84,7 @@ def _make_model(
         patch_stride=patch_stride,
         post_proj_norm="rms",
         source_session_keys=source_session_keys,
-        feature_mode=feature_mode,
+        signal_spec=SignalSpec.tx_only(tx_dim=input_dim),
         reconstruction_head_type=reconstruction_head_type,
         backbone_direction=backbone_direction,
     )
@@ -110,8 +112,14 @@ def _make_batch(*, batch_size: int = 2, time_bins: int = 6, input_dim: int = 4) 
 
 
 def _checkpoint_config(model: MaskedSSLModel) -> dict[str, object]:
+    signal_spec = SignalSpec.from_mode(
+        model.feature_mode,
+        tx_dim=model.encoder.input_dim,
+        sbp_dim=model.encoder.input_dim,
+    )
     return {
-        "feature_mode": model.feature_mode,
+        "signal_spec": signal_spec.to_dict(),
+        "dataset_plan": {"toyset": []},
         "boundary_key_mode": "session",
         "input_dim": model.encoder.input_dim,
         "source_session_keys": list(model.source_session_keys),
@@ -136,6 +144,7 @@ def _checkpoint_config(model: MaskedSSLModel) -> dict[str, object]:
         "num_spans_mode": "one",
         "allow_bin_fractional_overlap": True,
         "post_proj_norm": "rms",
+        "reconstruction_head_mode": model.reconstruction_head_mode,
         "reconstruction_head_type": model.reconstruction_head_type,
         "backbone_direction": model.encoder.backbone_direction,
     }
@@ -528,6 +537,13 @@ def _write_tiny_pretrain_cache(
 
 
 class MaskedSSLTests(unittest.TestCase):
+    def test_signal_selection_is_explicit(self) -> None:
+        with self.assertRaises(TypeError):
+            CacheAccessConfig()
+        with self.assertRaises(TypeError):
+            SSLTrainingConfig()
+        self.assertIsNone(PhonemeFinetuneConfig().signal_spec)
+
     def test_reverse_padded_sequence_reverses_only_valid_prefix(self) -> None:
         x = torch.tensor(
             [
@@ -575,6 +591,7 @@ class MaskedSSLTests(unittest.TestCase):
                 }
 
         cache_context = SimpleNamespace(
+            config=SimpleNamespace(signal_spec=SignalSpec.tx_only(tx_dim=4)),
             full_dim=4,
             tx_dim=4,
             sbp_dim=2,
@@ -609,6 +626,48 @@ class MaskedSSLTests(unittest.TestCase):
         ) / 2.0
         self.assertTrue(torch.allclose(sample["x"], expected))
 
+    def test_sbp_only_sampling_returns_only_sbp_channels(self) -> None:
+        class _DummyShardStore:
+            def get(self, _shard_relpath):
+                return {
+                    "time_offsets": np.array([0, 6], dtype=np.int64),
+                    "tx": None,
+                    "sbp": (100.0 + np.arange(12, dtype=np.float32)).reshape(6, 2),
+                }
+
+        cache_context = SimpleNamespace(
+            config=SimpleNamespace(signal_spec=SignalSpec.sbp_only(sbp_dim=2)),
+            full_dim=2,
+            tx_dim=4,
+            sbp_dim=2,
+            feature_mode="sbp_only",
+            boundary_key_mode="session",
+            shard_store=_DummyShardStore(),
+            use_normalization=False,
+            session_feature_stats={},
+        )
+        example = SimpleNamespace(
+            dataset="toy",
+            session_id="sess0",
+            subject_id=None,
+            shard_relpath="unused",
+            example_index=0,
+            has_tx=True,
+            has_sbp=True,
+        )
+        sample = sample_base_segment(
+            cache_context,
+            example,
+            segment_bins=6,
+            py_rng=random.Random(0),
+        )
+        expected = torch.tensor(
+            (100.0 + np.arange(12, dtype=np.float32)).reshape(6, 2)
+        )
+        self.assertEqual(tuple(sample["x"].shape), (6, 2))
+        self.assertTrue(torch.equal(sample["x"], expected))
+        self.assertTrue(torch.equal(sample["feature_mask"], torch.ones(2)))
+
     def test_sampling_can_bypass_normalization_when_disabled(self) -> None:
         session_key = "toy:sess0"
 
@@ -622,6 +681,7 @@ class MaskedSSLTests(unittest.TestCase):
                 }
 
         cache_context = SimpleNamespace(
+            config=SimpleNamespace(signal_spec=SignalSpec.tx_only(tx_dim=2)),
             full_dim=2,
             tx_dim=2,
             sbp_dim=0,
@@ -663,6 +723,7 @@ class MaskedSSLTests(unittest.TestCase):
                 }
 
         cache_context = SimpleNamespace(
+            config=SimpleNamespace(signal_spec=SignalSpec.tx_only(tx_dim=1)),
             full_dim=1,
             tx_dim=1,
             sbp_dim=1,
@@ -724,6 +785,7 @@ class MaskedSSLTests(unittest.TestCase):
             n_sbp_features=0,
         )
         config = SimpleNamespace(
+            signal_spec=SignalSpec.tx_only(tx_dim=1),
             full_dim=1,
             tx_dim=1,
             sbp_dim=1,
@@ -750,9 +812,9 @@ class MaskedSSLTests(unittest.TestCase):
                 prepare_cache_context(
                     cache_candidates=[cache_root],
                     config=CacheAccessConfig(
+                        dataset_plan={"toyset": ()},
+                        signal_spec=SignalSpec.tx_sbp(tx_dim=2, sbp_dim=2),
                         mode="drive_direct",
-                        excluded_datasets=(),
-                        feature_mode="tx_sbp",
                         gaussian_smoothing_sigma_bins=2.0,
                     ),
                 )
@@ -770,11 +832,9 @@ class MaskedSSLTests(unittest.TestCase):
                     "toyset:toy.2025.01.01": (torch.zeros(4), torch.ones(4)),
                     "toyset:toy.2025.01.02": (torch.full((4,), 2.0), torch.ones(4)),
                 },
-                feature_mode="tx_sbp",
+                signal_spec=SignalSpec.tx_sbp(tx_dim=2, sbp_dim=2),
+                dataset_plan=DatasetPlan.from_mapping({"toyset": ()}),
                 boundary_key_mode="session",
-                tx_dim=2,
-                sbp_dim=2,
-                excluded_datasets=(),
             )
 
             with mock.patch(
@@ -784,11 +844,9 @@ class MaskedSSLTests(unittest.TestCase):
                 context = prepare_cache_context(
                     cache_candidates=[cache_root],
                     config=CacheAccessConfig(
+                        dataset_plan={"toyset": ()},
+                        signal_spec=SignalSpec.tx_sbp(tx_dim=2, sbp_dim=2),
                         mode="drive_direct",
-                        excluded_datasets=(),
-                        feature_mode="tx_sbp",
-                        tx_dim=2,
-                        sbp_dim=2,
                         use_normalization=True,
                         precomputed_session_stats_path=stats_path,
                     ),
@@ -806,14 +864,13 @@ class MaskedSSLTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = Path(tmpdir)
             cache_root = tmp_path / "cache_v1"
-            stats_path = (
-                tmp_path
-                / "stats"
-                / "session_feature_stats"
-                / "raw"
-                / "tx_sbp"
-                / "session"
-                / "ssl_pretrain_all_datasets_v1.pt"
+            signal_spec = SignalSpec.tx_sbp(tx_dim=2, sbp_dim=2)
+            dataset_plan = DatasetPlan.from_mapping({"toyset": ()})
+            stats_path = resolve_precomputed_session_stats_path(
+                cache_root=cache_root,
+                signal_spec=signal_spec,
+                dataset_plan=dataset_plan,
+                boundary_key_mode="session",
             )
             _write_tiny_pretrain_cache(cache_root, dataset="toyset")
             _write_valid_session_stats_artifact(
@@ -823,11 +880,9 @@ class MaskedSSLTests(unittest.TestCase):
                     "toyset:toy.2025.01.01": (torch.zeros(4), torch.ones(4)),
                     "toyset:toy.2025.01.02": (torch.full((4,), 3.0), torch.ones(4)),
                 },
-                feature_mode="tx_sbp",
+                signal_spec=signal_spec,
+                dataset_plan=dataset_plan,
                 boundary_key_mode="session",
-                tx_dim=2,
-                sbp_dim=2,
-                excluded_datasets=(),
             )
 
             with mock.patch(
@@ -837,11 +892,9 @@ class MaskedSSLTests(unittest.TestCase):
                 context = prepare_cache_context(
                     cache_candidates=[cache_root],
                     config=CacheAccessConfig(
+                        dataset_plan=dataset_plan,
+                        signal_spec=signal_spec,
                         mode="drive_direct",
-                        excluded_datasets=(),
-                        feature_mode="tx_sbp",
-                        tx_dim=2,
-                        sbp_dim=2,
                         use_normalization=True,
                     ),
                 )
@@ -860,11 +913,9 @@ class MaskedSSLTests(unittest.TestCase):
                 prepare_cache_context(
                     cache_candidates=[cache_root],
                     config=CacheAccessConfig(
+                        dataset_plan={"toyset": ()},
+                        signal_spec=SignalSpec.tx_sbp(tx_dim=2, sbp_dim=2),
                         mode="drive_direct",
-                        excluded_datasets=(),
-                        feature_mode="tx_sbp",
-                        tx_dim=2,
-                        sbp_dim=2,
                         use_normalization=True,
                     ),
                 )
@@ -890,11 +941,9 @@ class MaskedSSLTests(unittest.TestCase):
                     "toyset:toy.2025.01.01": (torch.zeros(4), torch.ones(4)),
                     "toyset:toy.2025.01.02": (torch.full((4,), 3.0), torch.ones(4)),
                 },
-                feature_mode="tx_sbp",
+                signal_spec=SignalSpec.tx_sbp(tx_dim=2, sbp_dim=2),
+                dataset_plan=DatasetPlan.from_mapping({"toyset": ()}),
                 boundary_key_mode="session",
-                tx_dim=2,
-                sbp_dim=2,
-                excluded_datasets=(),
             )
             stats_path.with_suffix(".json").unlink()
 
@@ -902,12 +951,11 @@ class MaskedSSLTests(unittest.TestCase):
                 prepare_cache_context(
                     cache_candidates=[cache_root],
                     config=CacheAccessConfig(
+                        dataset_plan={"toyset": ()},
+                        signal_spec=SignalSpec.tx_sbp(tx_dim=2, sbp_dim=2),
                         mode="drive_direct",
-                        excluded_datasets=(),
-                        feature_mode="tx_sbp",
-                        tx_dim=2,
-                        sbp_dim=2,
                         use_normalization=True,
+                        precomputed_session_stats_path=stats_path,
                     ),
                 )
 
@@ -932,11 +980,9 @@ class MaskedSSLTests(unittest.TestCase):
                     "toyset:toy.2025.01.01": (torch.zeros(4), torch.ones(4)),
                     "toyset:toy.2025.01.02": (torch.full((4,), 3.0), torch.ones(4)),
                 },
-                feature_mode="tx_sbp",
+                signal_spec=SignalSpec.tx_sbp(tx_dim=2, sbp_dim=2),
+                dataset_plan=DatasetPlan.from_mapping({"toyset": ()}),
                 boundary_key_mode="session",
-                tx_dim=2,
-                sbp_dim=2,
-                excluded_datasets=(),
             )
             payload = torch.load(stats_path, map_location="cpu")
             payload["metadata"]["source_cache_signature"] = "stale"
@@ -947,12 +993,11 @@ class MaskedSSLTests(unittest.TestCase):
                 prepare_cache_context(
                     cache_candidates=[cache_root],
                     config=CacheAccessConfig(
+                        dataset_plan={"toyset": ()},
+                        signal_spec=SignalSpec.tx_sbp(tx_dim=2, sbp_dim=2),
                         mode="drive_direct",
-                        excluded_datasets=(),
-                        feature_mode="tx_sbp",
-                        tx_dim=2,
-                        sbp_dim=2,
                         use_normalization=True,
+                        precomputed_session_stats_path=stats_path,
                     ),
                 )
 
@@ -1035,15 +1080,10 @@ class MaskedSSLTests(unittest.TestCase):
             result = recompute_session_feature_stats(
                 cache_root=cache_root,
                 output_path=output_path,
-                feature_mode="tx_sbp",
+                signal_spec=SignalSpec.tx_sbp(tx_dim=2, sbp_dim=2),
+                dataset_plan=DatasetPlan.from_mapping({"toyset": ()}),
                 boundary_key_mode="session",
-                datasets=("toyset",),
-                tx_dim=2,
-                sbp_dim=2,
-                segment_bins=3,
                 seed=7,
-                examples_per_shard=1,
-                excluded_datasets=(),
                 overwrite=False,
             )
 
@@ -1052,16 +1092,19 @@ class MaskedSSLTests(unittest.TestCase):
             payload = torch.load(output_path, map_location="cpu")
             self.assertIn("session_feature_stats", payload)
             self.assertIn("metadata", payload)
-            self.assertEqual(payload["metadata"]["feature_mode"], "tx_sbp")
-            self.assertEqual(payload["metadata"]["full_dim"], 4)
-            self.assertEqual(payload["metadata"]["requested_datasets"], ["toyset"])
+            self.assertEqual(
+                payload["metadata"]["signal_spec"],
+                SignalSpec.tx_sbp(tx_dim=2, sbp_dim=2).to_dict(),
+            )
+            self.assertEqual(
+                payload["metadata"]["dataset_plan"],
+                {"toyset": []},
+            )
 
             cache_context = CacheAccessConfig(
+                dataset_plan={"toyset": ()},
+                signal_spec=SignalSpec.tx_sbp(tx_dim=2, sbp_dim=2),
                 mode="drive_direct",
-                excluded_datasets=(),
-                feature_mode="tx_sbp",
-                tx_dim=2,
-                sbp_dim=2,
                 segment_bins=3,
                 use_normalization=True,
                 precomputed_session_stats_path=output_path,
@@ -1087,30 +1130,20 @@ class MaskedSSLTests(unittest.TestCase):
                 recompute_session_feature_stats(
                     cache_root=cache_root,
                     output_path=output_path,
-                    feature_mode="tx_sbp",
+                    signal_spec=SignalSpec.tx_sbp(tx_dim=2, sbp_dim=2),
+                    dataset_plan=DatasetPlan.from_mapping({"toyset": ()}),
                     boundary_key_mode="session",
-                    datasets=("toyset",),
-                    tx_dim=2,
-                    sbp_dim=2,
-                    segment_bins=3,
                     seed=7,
-                    examples_per_shard=1,
-                    excluded_datasets=(),
                     overwrite=False,
                 )
 
             result = recompute_session_feature_stats(
                 cache_root=cache_root,
                 output_path=output_path,
-                feature_mode="tx_sbp",
+                signal_spec=SignalSpec.tx_sbp(tx_dim=2, sbp_dim=2),
+                dataset_plan=DatasetPlan.from_mapping({"toyset": ()}),
                 boundary_key_mode="session",
-                datasets=("toyset",),
-                tx_dim=2,
-                sbp_dim=2,
-                segment_bins=3,
                 seed=7,
-                examples_per_shard=1,
-                excluded_datasets=(),
                 overwrite=True,
             )
             self.assertTrue(output_path.exists())
@@ -1530,7 +1563,7 @@ class MaskedSSLTests(unittest.TestCase):
             [row],
             cache_root=tmp_dir,
             stats=None,
-            feature_mode="tx_only",
+            signal_spec=SignalSpec.tx_only(tx_dim=3),
             boundary_key_mode="subject_if_available",
         )
         item = dataset[0]
@@ -1595,6 +1628,11 @@ class MaskedSSLTests(unittest.TestCase):
                 cache_context=SimpleNamespace(
                     full_dim=model.encoder.input_dim,
                     feature_mode=model.feature_mode,
+                    signal_spec=model.signal_spec,
+                    boundary_key_mode="session",
+                    config=SimpleNamespace(
+                        dataset_plan=DatasetPlan.from_mapping({"toyset": ()})
+                    ),
                 ),
                 device=torch.device("cpu"),
             )
@@ -1632,6 +1670,11 @@ class MaskedSSLTests(unittest.TestCase):
                 cache_context=SimpleNamespace(
                     full_dim=model.encoder.input_dim,
                     feature_mode=model.feature_mode,
+                    signal_spec=model.signal_spec,
+                    boundary_key_mode="session",
+                    config=SimpleNamespace(
+                        dataset_plan=DatasetPlan.from_mapping({"toyset": ()})
+                    ),
                 ),
                 device=torch.device("cpu"),
             )
@@ -1644,7 +1687,7 @@ class MaskedSSLTests(unittest.TestCase):
         problem = build_competition_split_problem(
             cache_root=cache_root,
             dataset="brain2text24",
-            feature_mode="tx_only",
+            signal_spec=SignalSpec.tx_only(tx_dim=3),
             boundary_key_mode="session",
         )
 
@@ -1674,7 +1717,7 @@ class MaskedSSLTests(unittest.TestCase):
             build_competition_split_problem(
                 cache_root=cache_root,
                 dataset="brain2text24",
-                feature_mode="tx_only",
+                signal_spec=SignalSpec.tx_only(tx_dim=3),
                 boundary_key_mode="session",
             )
 
@@ -1690,7 +1733,7 @@ class MaskedSSLTests(unittest.TestCase):
             build_competition_split_problem(
                 cache_root=cache_root,
                 dataset="brain2text24",
-                feature_mode="tx_only",
+                signal_spec=SignalSpec.tx_only(tx_dim=3),
                 boundary_key_mode="session",
             )
 
@@ -1701,7 +1744,7 @@ class MaskedSSLTests(unittest.TestCase):
         problem = build_competition_split_problem(
             cache_root=cache_root,
             dataset="brain2text24",
-            feature_mode="tx_only",
+            signal_spec=SignalSpec.tx_only(tx_dim=3),
             boundary_key_mode="session",
         )
 
@@ -1779,6 +1822,10 @@ class MaskedSSLTests(unittest.TestCase):
             seed=11,
         )
         self.assertEqual(list(iter(sampler_a)), list(iter(sampler_b)))
+        saved_state = sampler_a.state_dict()
+        expected_next = list(iter(sampler_a))
+        sampler_b.load_state_dict(saved_state)
+        self.assertEqual(list(iter(sampler_b)), expected_next)
 
     def test_length_aware_batch_sampler_validation_order_is_stable(self) -> None:
         rows = [
@@ -1842,7 +1889,7 @@ class MaskedSSLTests(unittest.TestCase):
         y = adapter(x)
         self.assertTrue(torch.allclose(y, torch.tensor([[[1.0, 2.0, 3.0]]])))
 
-    def test_run_phoneme_finetuning_with_tx_sbp_adapter_writes_checkpoint(self) -> None:
+    def test_phoneme_finetuning_rejects_cross_signal_transfer(self) -> None:
         model = _make_model(input_dim=3, patch_size=1, patch_stride=1, hidden_size=4)
         config = _checkpoint_config(model)
         tmp_path = Path(self._tmp_dir())
@@ -1850,38 +1897,25 @@ class MaskedSSLTests(unittest.TestCase):
         torch.save({"model_state": model.state_dict(), "config": config}, checkpoint_path)
         _write_tiny_canonical_probe_cache(tmp_path)
 
-        summary = run_phoneme_finetuning(
-            checkpoint_path=checkpoint_path,
-            cache_root=tmp_path,
-            config=PhonemeFinetuneConfig(
-                seed=7,
-                mode="probe_frozen",
-                feature_mode="tx_sbp",
-                session_limit=2,
-                target_session_count=1,
-                batch_size=1,
-                num_steps=2,
-                budget_seconds=30,
-                learning_rate=1e-3,
-                encoder_learning_rate=3e-4,
-                checkpoint_every_steps=1,
-            ),
-            device=torch.device("cpu"),
-        )
-        self.assertEqual(summary["feature_mode"], "tx_sbp")
-        self.assertEqual(summary["adapter_type"], "RawFeatureAdapter")
-        self.assertEqual(summary["external_input_dim"], 5)
-        self.assertEqual(summary["encoder_input_dim"], 3)
-        self.assertTrue(Path(summary["checkpoint_final_path"]).exists())
-        self.assertTrue((Path(summary["checkpoints_dir"]) / "step_000001.pt").exists())
-        self.assertTrue((Path(summary["checkpoints_dir"]) / "step_000002.pt").exists())
-        self.assertEqual(summary["checkpoint_every_steps"], 1)
-
-        payload = torch.load(summary["checkpoint_final_path"], map_location="cpu")
-        self.assertEqual(payload["feature_mode"], "tx_sbp")
-        self.assertEqual(payload["external_input_dim"], 5)
-        self.assertEqual(payload["encoder_input_dim"], 3)
-
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            run_phoneme_finetuning(
+                checkpoint_path=checkpoint_path,
+                cache_root=tmp_path,
+                config=PhonemeFinetuneConfig(
+                    seed=7,
+                    mode="probe_frozen",
+                    signal_spec=SignalSpec.tx_sbp(tx_dim=3, sbp_dim=2),
+                    session_limit=2,
+                    target_session_count=1,
+                    batch_size=1,
+                    num_steps=2,
+                    budget_seconds=30,
+                    learning_rate=1e-3,
+                    encoder_learning_rate=3e-4,
+                    checkpoint_every_steps=1,
+                ),
+                device=torch.device("cpu"),
+            )
     def test_run_phoneme_finetuning_full_mode_writes_summary(self) -> None:
         model = _make_model(input_dim=3, patch_size=1, patch_stride=1, hidden_size=4)
         config = _checkpoint_config(model)
@@ -1896,7 +1930,7 @@ class MaskedSSLTests(unittest.TestCase):
             config=PhonemeFinetuneConfig(
                 seed=7,
                 mode="finetune_full",
-                feature_mode="tx_only",
+                signal_spec=SignalSpec.tx_only(tx_dim=3),
                 session_limit=2,
                 target_session_count=1,
                 batch_size=1,

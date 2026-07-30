@@ -29,6 +29,9 @@ from possm_ssl import (
     CacheAccessConfig,
     POSSMFinetuneConfig,
     POSSMTrainingConfig,
+    SUPPORTED_FEATURE_MODES,
+    SignalSpec,
+    possm_single_dataset_plan,
     prepare_cache_context,
     recover_possm_run_state_from_checkpoint,
     resume_possm_training,
@@ -59,9 +62,13 @@ def timestamp_utc() -> str:
 
 def make_stage1_base_config(args: argparse.Namespace) -> POSSMTrainingConfig:
     return POSSMTrainingConfig(
+        signal_spec=SignalSpec.from_mode(
+            args.feature_mode,
+            tx_dim=int(args.tx_dim),
+            sbp_dim=int(args.sbp_dim),
+        ),
         seed=int(args.seed),
         data_mode=str(args.stage1_data_mode),
-        feature_mode=str(args.feature_mode),
         boundary_key_mode=str(args.boundary_key_mode),
         segment_bins=int(args.segment_bins),
         model_dim=int(args.model_dim),
@@ -89,7 +96,6 @@ def make_stage2_config(args: argparse.Namespace) -> POSSMFinetuneConfig:
         seed=int(args.seed),
         mode="probe_frozen",
         dataset=str(args.dataset),
-        feature_mode=str(args.feature_mode),
         data_mode=str(args.stage2_data_mode),
         boundary_key_mode=str(args.boundary_key_mode),
         batch_size=int(args.stage2_batch_size),
@@ -109,8 +115,8 @@ def make_stage2_config(args: argparse.Namespace) -> POSSMFinetuneConfig:
         gru_hidden_size=int(args.gru_hidden_size),
         gru_num_layers=int(args.gru_num_layers),
         gru_dropout=float(args.gru_dropout),
-        temporal_patch_kernel_size=int(args.temporal_patch_kernel_size),
-        temporal_patch_stride=int(args.temporal_patch_stride),
+        conv_kernel_size=int(args.conv_kernel_size),
+        conv_stride=int(args.conv_stride),
         conv_dropout=float(args.conv_dropout),
     )
 
@@ -299,17 +305,19 @@ def validate_stage2_final(
 
 def make_stage1_cache_context(args: argparse.Namespace):
     config = CacheAccessConfig(
+        dataset_plan=possm_single_dataset_plan(str(args.dataset)),
+        signal_spec=SignalSpec.from_mode(
+            args.feature_mode,
+            tx_dim=int(args.tx_dim),
+            sbp_dim=int(args.sbp_dim),
+        ),
         mode=str(args.stage1_cache_mode),
         local_cache_base=str(args.stage1_local_cache_base),
         force_recopy_local_cache=bool(args.force_recopy_local_cache),
-        excluded_datasets=tuple(args.excluded_dataset),
         seed=int(args.seed),
         segment_bins=int(args.segment_bins),
         use_normalization=str(args.stage1_data_mode) == "normalized",
         examples_per_shard=int(args.examples_per_shard),
-        tx_dim=int(args.tx_dim),
-        sbp_dim=int(args.sbp_dim),
-        feature_mode=str(args.feature_mode),
         boundary_key_mode=str(args.boundary_key_mode),
         gaussian_smoothing_sigma_bins=0.0,
         precomputed_session_stats_path=args.stage1_session_stats_path,
@@ -369,7 +377,11 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--dataset", default="brain2text24")
-    parser.add_argument("--feature-mode", choices=("tx_only", "tx_sbp"), default="tx_only")
+    parser.add_argument(
+        "--feature-mode",
+        choices=SUPPORTED_FEATURE_MODES,
+        required=True,
+    )
     parser.add_argument("--boundary-key-mode", choices=("session", "subject_if_available"), default="session")
     parser.add_argument("--segment-bins", type=int, default=40)
     parser.add_argument("--model-dim", type=int, default=64)
@@ -380,8 +392,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--use-token-norm", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--tx-dim", type=int, default=128)
     parser.add_argument("--sbp-dim", type=int, default=128)
-    parser.add_argument("--excluded-dataset", action="append", default=["brain2text25"])
-
     parser.add_argument("--stage1-data-mode", choices=("raw", "normalized"), default="normalized")
     parser.add_argument("--stage1-cache-mode", choices=("copy_to_local", "drive_direct"), default="drive_direct")
     parser.add_argument("--stage1-local-cache-base", default=DEFAULT_STAGE1_LOCAL_CACHE_BASE)
@@ -415,8 +425,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gru-hidden-size", type=int, default=768)
     parser.add_argument("--gru-num-layers", type=int, default=5)
     parser.add_argument("--gru-dropout", type=float, default=0.2)
-    parser.add_argument("--temporal-patch-kernel-size", type=int, default=14)
-    parser.add_argument("--temporal-patch-stride", type=int, default=4)
+    parser.add_argument("--conv-kernel-size", type=int, default=14)
+    parser.add_argument("--conv-stride", type=int, default=4)
     parser.add_argument("--conv-dropout", type=float, default=0.1)
     return parser.parse_args()
 

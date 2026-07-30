@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -18,6 +19,7 @@ try:
     )
     from ssl_core.cache import resolve_boundary_key
     from ssl_core.ctc import LengthAwareBatchSampler
+    from ssl_core.experiment_contract import SignalSpec
 except ModuleNotFoundError:  # pragma: no cover - repo-root unittest fallback
     from analysis.active.ssl_experiments.masked_ssl.probe import (
         CanonicalSequenceDataset,
@@ -26,6 +28,7 @@ except ModuleNotFoundError:  # pragma: no cover - repo-root unittest fallback
     )
     from analysis.active.ssl_experiments.ssl_core.cache import resolve_boundary_key
     from analysis.active.ssl_experiments.ssl_core.ctc import LengthAwareBatchSampler
+    from analysis.active.ssl_experiments.ssl_core.experiment_contract import SignalSpec
 
 from analysis.active.ssl_experiments.willett_reconstruction.data import (
     adapter_keys_from_rows,
@@ -37,6 +40,40 @@ from analysis.active.ssl_experiments.willett_reconstruction.data import (
 
 
 CANONICAL_BIN_SIZE_MS = 20
+
+
+def signal_spec_for_rows(
+    rows: tuple[Any, ...] | list[Any],
+    *,
+    feature_mode: str,
+) -> SignalSpec:
+    if not rows:
+        raise ValueError("Cannot infer a signal contract from an empty row set")
+    first_row = rows[0]
+    return SignalSpec.from_mode(
+        str(feature_mode),
+        tx_dim=int(first_row.n_tx_features),
+        sbp_dim=int(first_row.n_sbp_features),
+    )
+
+
+def signal_spec_for_cache(
+    cache_root: Path,
+    *,
+    dataset: str,
+    feature_mode: str,
+) -> SignalSpec:
+    manifest_path = Path(cache_root) / str(dataset) / "manifest.jsonl"
+    first_row = next(
+        json.loads(line)
+        for line in manifest_path.read_text().splitlines()
+        if line.strip()
+    )
+    return SignalSpec.from_mode(
+        str(feature_mode),
+        tx_dim=int(first_row.get("n_tx_features", 0)),
+        sbp_dim=int(first_row.get("n_sbp_features", 0)),
+    )
 
 
 @dataclass(frozen=True)
@@ -218,12 +255,21 @@ class RebinnedSequenceDataset(torch.utils.data.Dataset):
         self.feature_mode = str(feature_mode)
         self.boundary_key_mode = str(boundary_key_mode)
         self.dataset = str(dataset)
+        self.signal_spec = (
+            signal_spec_for_rows(self.rows, feature_mode=self.feature_mode)
+            if self.rows
+            else signal_spec_for_cache(
+                cache_root,
+                dataset=self.dataset,
+                feature_mode=self.feature_mode,
+            )
+        )
         self.active_bin_size_ms = int(active_bin_size_ms)
         self._base = CanonicalSequenceDataset(
             self.rows,
             cache_root=cache_root,
+            signal_spec=self.signal_spec,
             stats=None,
-            feature_mode=str(feature_mode),
             boundary_key_mode=str(boundary_key_mode),
             dataset=str(dataset),
         )
@@ -234,7 +280,7 @@ class RebinnedSequenceDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
         row = self.rows[idx]
-        x = self._accessor.load_features(row, feature_mode=self.feature_mode)
+        x = self._accessor.load_features(row, signal_spec=self.signal_spec)
         x = rebin_features(x, bin_size_ms=self.active_bin_size_ms)
         if self.stats is not None:
             x = apply_feature_stats(x, row=row, stats=self.stats)
@@ -259,7 +305,9 @@ class RebinnedSequenceDataset(torch.utils.data.Dataset):
         }
 
     def __del__(self) -> None:
-        self._accessor.close()
+        accessor = getattr(self, "_accessor", None)
+        if accessor is not None:
+            accessor.close()
 
 
 def compute_rebinned_normalization_stats(
@@ -273,11 +321,12 @@ def compute_rebinned_normalization_stats(
     resolved_mode = str(mode)
     if resolved_mode == "none":
         return None
+    signal_spec = signal_spec_for_rows(rows, feature_mode=str(feature_mode))
     accessor = CanonicalSequenceDataset(
         rows,
         cache_root=cache_root,
+        signal_spec=signal_spec,
         stats=None,
-        feature_mode=feature_mode,
     )._accessor
     try:
         if resolved_mode == "global":
@@ -285,7 +334,10 @@ def compute_rebinned_normalization_stats(
             sum_x = None
             sum_x2 = None
             for row in rows:
-                x = rebin_features(accessor.load_features(row, feature_mode=feature_mode), bin_size_ms=bin_size_ms)
+                x = rebin_features(
+                    accessor.load_features(row, signal_spec=signal_spec),
+                    bin_size_ms=bin_size_ms,
+                )
                 if int(x.shape[0]) <= 0:
                     continue
                 x64 = x.astype(np.float64, copy=False)
@@ -316,7 +368,7 @@ def compute_rebinned_normalization_stats(
                 sum_x2 = None
                 for row in group_rows:
                     x = rebin_features(
-                        accessor.load_features(row, feature_mode=feature_mode),
+                        accessor.load_features(row, signal_spec=signal_spec),
                         bin_size_ms=bin_size_ms,
                     )
                     if int(x.shape[0]) <= 0:

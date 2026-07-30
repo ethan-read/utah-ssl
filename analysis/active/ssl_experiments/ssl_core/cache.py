@@ -1,16 +1,10 @@
-"""Shared cache access compatibility layer.
-
-The implementation still lives in ``masked_ssl.cache`` during this first
-refactor pass. New code should import from ``ssl_core.cache`` so the backing
-module can be split without touching every experiment again.
-"""
+"""Stable public cache API shared by SSL and downstream experiment packages."""
 
 from __future__ import annotations
 
 try:
     from masked_ssl.cache import (
         AREA6V_FEATURE_DIM,
-        FEATURE_POLICY,
         SESSION_STATS_BIN_STRIDE,
         CacheAccessConfig,
         CacheContext,
@@ -20,6 +14,7 @@ try:
         build_recompute_session_feature_stats_command,
         build_segment_sampler,
         ensure_runtime_smoothing_disabled,
+        get_sampling_plan,
         load_cache_smoothing_provenance,
         load_dataset_metadata,
         load_precomputed_session_feature_stats_into_cache_context,
@@ -33,7 +28,6 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - repo-root unittest fallback
     from analysis.active.ssl_experiments.masked_ssl.cache import (
         AREA6V_FEATURE_DIM,
-        FEATURE_POLICY,
         SESSION_STATS_BIN_STRIDE,
         CacheAccessConfig,
         CacheContext,
@@ -43,6 +37,7 @@ except ModuleNotFoundError:  # pragma: no cover - repo-root unittest fallback
         build_recompute_session_feature_stats_command,
         build_segment_sampler,
         ensure_runtime_smoothing_disabled,
+        get_sampling_plan,
         load_cache_smoothing_provenance,
         load_dataset_metadata,
         load_precomputed_session_feature_stats_into_cache_context,
@@ -57,7 +52,6 @@ except ModuleNotFoundError:  # pragma: no cover - repo-root unittest fallback
 
 __all__ = [
     "AREA6V_FEATURE_DIM",
-    "FEATURE_POLICY",
     "SESSION_STATS_BIN_STRIDE",
     "CacheAccessConfig",
     "CacheContext",
@@ -67,6 +61,7 @@ __all__ = [
     "build_recompute_session_feature_stats_command",
     "build_segment_sampler",
     "ensure_runtime_smoothing_disabled",
+    "get_sampling_plan",
     "load_cache_smoothing_provenance",
     "load_dataset_metadata",
     "load_precomputed_session_feature_stats_into_cache_context",

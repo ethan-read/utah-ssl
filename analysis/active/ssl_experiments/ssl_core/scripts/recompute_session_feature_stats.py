@@ -18,24 +18,15 @@ from typing import Any, Sequence
 
 import torch
 
-from ssl_core.bit_cache_contract import (
-    BIT_STAGE1_DEFAULT_EXCLUDED_DATASETS,
-    BIT_STAGE1_FEATURE_MODE,
-    BIT_STAGE1_SBP_DIM,
-    BIT_STAGE1_TX_DIM,
-)
+from ssl_core.feature_contract import SUPPORTED_FEATURE_MODES
+from ssl_core.experiment_contract import DatasetPlan, SignalSpec
 from masked_ssl.cache import (
-    FEATURE_POLICY,
     CacheAccessConfig,
+    SESSION_STATS_BIN_STRIDE,
     _cache_variant_name,
     _compute_session_feature_stats,
     prepare_cache_context,
 )
-
-
-DEFAULT_TX_DIM = BIT_STAGE1_TX_DIM
-DEFAULT_SBP_DIM = BIT_STAGE1_SBP_DIM
-DEFAULT_EXCLUDED_DATASETS = BIT_STAGE1_DEFAULT_EXCLUDED_DATASETS
 
 
 def _parse_dataset_source_split_args(
@@ -78,44 +69,14 @@ def _timestamp_utc() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _normalize_dataset_args(datasets: Sequence[str] | None) -> tuple[str, ...] | None:
-    if datasets is None:
-        return None
-    normalized = tuple(str(item) for item in datasets if str(item).strip())
-    return normalized if normalized else None
-
-
-def _normalize_excluded_dataset_args(datasets: Sequence[str] | None) -> tuple[str, ...]:
-    if datasets is None:
-        return tuple(DEFAULT_EXCLUDED_DATASETS)
-    deduped: list[str] = []
-    seen: set[str] = set()
-    for item in datasets:
-        value = str(item).strip()
-        if not value or value in seen:
-            continue
-        seen.add(value)
-        deduped.append(value)
-    if not deduped:
-        return tuple(DEFAULT_EXCLUDED_DATASETS)
-    return tuple(sorted(deduped))
-
-
 def recompute_session_feature_stats(
     *,
     cache_root: str | Path,
     output_path: str | Path,
-    feature_mode: str = BIT_STAGE1_FEATURE_MODE,
+    signal_spec: SignalSpec,
+    dataset_plan: DatasetPlan,
     boundary_key_mode: str = "session",
-    datasets: Sequence[str] | None = None,
-    tx_dim: int = DEFAULT_TX_DIM,
-    sbp_dim: int = DEFAULT_SBP_DIM,
-    segment_bins: int = 80,
     seed: int = 7,
-    examples_per_shard: int = 8,
-    excluded_datasets: Sequence[str] = DEFAULT_EXCLUDED_DATASETS,
-    source_splits: Sequence[str] | None = None,
-    source_splits_by_dataset: dict[str, Sequence[str]] | None = None,
     dataset_cache_roots: dict[str, str | Path] | None = None,
     overwrite: bool = False,
 ) -> dict[str, Any]:
@@ -135,58 +96,22 @@ def recompute_session_feature_stats(
         output_path.unlink(missing_ok=True)
         metadata_path.unlink(missing_ok=True)
 
-    excluded_datasets = _normalize_excluded_dataset_args(excluded_datasets)
-    requested_datasets = _normalize_dataset_args(datasets)
-    available_dataset_set = {
-        path.name for path in cache_root.iterdir() if path.is_dir() and (path / "metadata.json").exists()
-    }
+    signal_spec = SignalSpec.from_value(signal_spec)
+    dataset_plan = DatasetPlan.from_value(dataset_plan)
     normalized_dataset_cache_roots = {
         str(dataset): Path(root)
         for dataset, root in sorted((dataset_cache_roots or {}).items())
     }
-    for dataset, override_root in normalized_dataset_cache_roots.items():
-        if not (override_root / dataset / "metadata.json").exists():
-            raise FileNotFoundError(
-                f"Dataset override {dataset!r} is missing under {override_root}"
-            )
-        available_dataset_set.add(dataset)
-    available_datasets = sorted(available_dataset_set)
-    if requested_datasets is not None:
-        missing = [name for name in requested_datasets if name not in available_datasets]
-        if missing:
-            raise FileNotFoundError(
-                f"Requested dataset(s) not found under {cache_root}: {missing}. "
-                f"Available datasets: {available_datasets}"
-            )
-        excluded_datasets = tuple(name for name in available_datasets if name not in set(requested_datasets))
-
     config = CacheAccessConfig(
+        dataset_plan=dataset_plan,
+        signal_spec=signal_spec,
         mode="drive_direct",
         local_cache_base="/content/utah_ssl_cache",
         force_recopy_local_cache=False,
-        excluded_datasets=tuple(str(name) for name in excluded_datasets),
-        included_datasets=requested_datasets,
         seed=int(seed),
-        segment_bins=int(segment_bins),
+        segment_bins=1,
         use_normalization=False,
-        examples_per_shard=int(examples_per_shard),
-        tx_dim=int(tx_dim),
-        sbp_dim=int(sbp_dim),
-        feature_mode=str(feature_mode),
         boundary_key_mode=str(boundary_key_mode),
-        pretrain_source_splits=(
-            tuple(str(item).strip().lower() for item in source_splits if str(item).strip())
-            if source_splits is not None
-            else None
-        ),
-        pretrain_source_splits_by_dataset=(
-            None
-            if source_splits_by_dataset is None
-            else {
-                str(dataset): tuple(str(item).strip().lower() for item in source_split_values)
-                for dataset, source_split_values in source_splits_by_dataset.items()
-            }
-        ),
         dataset_cache_roots=normalized_dataset_cache_roots or None,
     )
 
@@ -207,34 +132,19 @@ def recompute_session_feature_stats(
         "source_cache_name": cache_root.name,
         "source_cache_variant": _cache_variant_name(cache_root),
         "source_cache_signature": context.source_cache_signature,
-        "feature_mode": str(context.feature_mode),
+        "signal_spec": signal_spec.to_dict(),
+        "dataset_plan": dataset_plan.to_dict(),
         "boundary_key_mode": str(boundary_key_mode),
-        "requested_datasets": list(requested_datasets) if requested_datasets is not None else None,
-        "tx_dim": int(tx_dim),
-        "sbp_dim": int(sbp_dim),
-        "full_dim": int(config.full_dim),
-        "feature_policy": FEATURE_POLICY,
-        "segment_bins": int(segment_bins),
-        "examples_per_shard": int(examples_per_shard),
-        "excluded_datasets": list(excluded_datasets),
-        "pretrain_source_splits": list(context.config.pretrain_source_splits or ()),
-        "pretrain_source_splits_by_dataset": {
-            str(dataset): list(source_splits)
-            for dataset, source_splits in sorted(
-                (context.config.pretrain_source_splits_by_dataset or {}).items()
-            )
-        },
         "dataset_names": list(context.pretrain_datasets),
         "dataset_count": int(len(context.pretrain_datasets)),
         "session_count": int(len(session_feature_stats)),
-        "session_stats_bin_stride": 2,
+        "session_stats_bin_stride": SESSION_STATS_BIN_STRIDE,
         "cache_copy_used": bool(context.cache_copy_used),
     }
-    if normalized_dataset_cache_roots:
-        metadata["source_cache_roots"] = {
-            dataset: str(context.drive_dataset_cache_roots[dataset].resolve())
-            for dataset in context.pretrain_datasets
-        }
+    metadata["source_cache_roots"] = {
+        dataset: str(context.drive_dataset_cache_roots[dataset].resolve())
+        for dataset in context.pretrain_datasets
+    }
 
     payload = {
         "session_feature_stats": session_feature_stats,
@@ -260,8 +170,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-path", type=Path, required=True, help="Destination .pt file for the stats.")
     parser.add_argument(
         "--feature-mode",
-        choices=("tx_only", "tx_sbp"),
-        default=BIT_STAGE1_FEATURE_MODE,
+        choices=SUPPORTED_FEATURE_MODES,
+        required=True,
         help="Feature layout to match when computing stats.",
     )
     parser.add_argument(
@@ -273,26 +183,34 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dataset",
         action="append",
-        default=None,
-        help="Dataset name to include. May be repeated. If omitted, all datasets except excluded ones are used.",
+        required=True,
+        help="Dataset name to include. May be repeated; the complete set must be explicit.",
     )
-    parser.add_argument("--tx-dim", type=int, default=DEFAULT_TX_DIM)
-    parser.add_argument("--sbp-dim", type=int, default=DEFAULT_SBP_DIM)
-    parser.add_argument("--segment-bins", type=int, default=80)
+    parser.add_argument(
+        "--tx-dim",
+        type=int,
+        default=None,
+        help="Selected TX width. Defaults to the maximum declared width in the dataset plan.",
+    )
+    parser.add_argument(
+        "--sbp-dim",
+        type=int,
+        default=None,
+        help="Selected SBP width. Defaults to the maximum declared width in the dataset plan.",
+    )
+    parser.add_argument(
+        "--column-start",
+        type=int,
+        default=0,
+        help="First cache column selected for each requested modality.",
+    )
+    parser.add_argument(
+        "--missing-channel-policy",
+        choices=("error", "zero_pad"),
+        default="error",
+        help="How to handle datasets narrower than the requested signal width.",
+    )
     parser.add_argument("--seed", type=int, default=7)
-    parser.add_argument("--examples-per-shard", type=int, default=8)
-    parser.add_argument(
-        "--excluded-dataset",
-        action="append",
-        default=None,
-        help="Dataset names to exclude. May be repeated.",
-    )
-    parser.add_argument(
-        "--source-split",
-        action="append",
-        default=None,
-        help="Source split(s) to include in session stats and SSL sampling. May be repeated.",
-    )
     parser.add_argument(
         "--dataset-source-split",
         action="append",
@@ -314,22 +232,51 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    excluded_datasets = _normalize_excluded_dataset_args(args.excluded_dataset)
+    splits_by_dataset = _parse_dataset_source_split_args(args.dataset_source_split) or {}
+    dataset_cache_roots = _parse_dataset_cache_root_args(args.dataset_cache_root) or {}
+    dataset_plan = DatasetPlan.from_mapping(
+        {
+            dataset: splits_by_dataset.get(dataset, ())
+            for dataset in args.dataset
+        }
+    )
+    declared_widths: list[tuple[int, int]] = []
+    for dataset in dataset_plan.dataset_names:
+        dataset_root = dataset_cache_roots.get(dataset, Path(args.cache_root))
+        metadata = json.loads(
+            (dataset_root / dataset / "metadata.json").read_text()
+        )
+        feature_layout = dict(metadata.get("feature_layout") or {})
+        declared_widths.append(
+            (
+                int(metadata.get("n_tx_features", feature_layout.get("n_tx_features", 0)) or 0),
+                int(metadata.get("n_sbp_features", feature_layout.get("n_sbp_features", 0)) or 0),
+            )
+        )
+    tx_dim = (
+        int(args.tx_dim)
+        if args.tx_dim is not None
+        else max(width[0] for width in declared_widths)
+    )
+    sbp_dim = (
+        int(args.sbp_dim)
+        if args.sbp_dim is not None
+        else max(width[1] for width in declared_widths)
+    )
     result = recompute_session_feature_stats(
         cache_root=args.cache_root,
         output_path=args.output_path,
-        feature_mode=args.feature_mode,
+        signal_spec=SignalSpec.from_mode(
+            args.feature_mode,
+            tx_dim=tx_dim,
+            sbp_dim=sbp_dim,
+            column_start=int(args.column_start),
+            missing_channel_policy=str(args.missing_channel_policy),
+        ),
+        dataset_plan=dataset_plan,
         boundary_key_mode=args.boundary_key_mode,
-        datasets=tuple(args.dataset) if args.dataset else None,
-        tx_dim=int(args.tx_dim),
-        sbp_dim=int(args.sbp_dim),
-        segment_bins=int(args.segment_bins),
         seed=int(args.seed),
-        examples_per_shard=int(args.examples_per_shard),
-        excluded_datasets=excluded_datasets,
-        source_splits=tuple(args.source_split) if args.source_split else None,
-        source_splits_by_dataset=_parse_dataset_source_split_args(args.dataset_source_split),
-        dataset_cache_roots=_parse_dataset_cache_root_args(args.dataset_cache_root),
+        dataset_cache_roots=dataset_cache_roots or None,
         overwrite=bool(args.overwrite),
     )
     print(json.dumps({k: str(v) if isinstance(v, Path) else v for k, v in result.items()}, indent=2))

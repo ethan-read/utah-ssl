@@ -217,6 +217,53 @@ This is a strong explanation for s6 reaching MSE near 0.1-0.2 while the pooled
 run remains much higher. The low s6 reconstruction loss may partly measure an
 easy quantized target rather than a better representation.
 
+## SBP comparison
+
+SBP has a different profile from TX and does not show the same B2T24 integer
+quantization problem. The local raw SBP arrays inspected for both datasets are
+continuous `float32` values. B2T24 SBP is stored in a large positive power
+scale, while B2T25 SBP already resembles session-normalized data:
+
+| Property | B2T24 SBP | B2T25 SBP |
+|---|---:|---:|
+| Representative raw range | 59 to 69,596 | -2.84 to 10.0 |
+| Raw mean across channels | 985 | -0.0035 |
+| Raw mean channel standard deviation | 790 | 0.998 |
+| Raw storage dtype | `float32` | `float32` |
+
+These raw scales are not directly comparable, but session-wise feature
+normalization is intended to remove that difference. Both SBP signals are
+essentially dense and continuous: after sigma-2 smoothing, the exact-zero
+fraction was effectively zero for both datasets, and exact adjacent-value
+repetition was negligible.
+
+A representative local audit of three shards per dataset gave the following
+post-smoothing temporal comparison:
+
+| Property after sigma-2 smoothing | B2T24 SBP | B2T25 SBP |
+|---|---:|---:|
+| Exact-zero fraction | 0% | approximately 0% |
+| Adjacent values exactly equal | `1.1e-6` | `1.8e-7` |
+| Mean absolute adjacent change after channel standardization | 0.113 | 0.145 |
+
+B2T25 SBP therefore changes somewhat faster between adjacent bins, about
+`1.28x` the standardized adjacent variation of B2T24, but the difference is
+modest compared with the TX temporal/quantization mismatch. SBP appears much
+more compatible across the two datasets after normalization.
+
+This audit used the local canonical raw cache at
+`/Users/home/thesis/data/cache_v1` and the local pre-smoothed B2T24 cache at
+`/Users/home/thesis/data/cache_v1_smoothed_sigma2p0`. The local versioned
+Brain2Text25 smoothed POSSM cache was not present, so B2T25 sigma-2 values were
+computed in memory with the same smoothing implementation rather than read
+from a stored smoothed artifact. The measurements are representative, not a
+full-corpus SBP audit.
+
+The completed s6 run and the earlier pooled s14 run audited in this document
+used `tx_only`; the plotted loss mismatch therefore reflects TX. The current
+s14 recipe instead uses 128-channel area-6v SBP for both years. Treat that as
+a fresh experiment rather than as a resume of the earlier TX run.
+
 ## Validation construction and noise
 
 The Stage-1 train/validation division is an internal deterministic

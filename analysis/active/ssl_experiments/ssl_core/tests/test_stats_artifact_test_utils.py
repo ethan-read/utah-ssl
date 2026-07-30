@@ -9,10 +9,16 @@ import torch
 
 from analysis.active.ssl_experiments.masked_ssl.cache import (
     CacheAccessConfig,
+    build_recompute_session_feature_stats_command,
     resolve_precomputed_session_stats_path,
+)
+from analysis.active.ssl_experiments.ssl_core.experiment_contract import (
+    DatasetPlan,
+    SignalSpec,
 )
 from analysis.active.ssl_experiments.ssm_ssl.config import GenericSSMSSLConfig
 from analysis.active.ssl_experiments.ssl_core.scripts.recompute_split_feature_stats import (
+    build_recompute_split_feature_stats_command,
     load_precomputed_split_feature_stats,
     resolve_precomputed_split_stats_path,
 )
@@ -26,6 +32,33 @@ class StatsArtifactTestUtilsTests(unittest.TestCase):
     def _tmp_dir(self) -> str:
         return tempfile.mkdtemp(prefix="stats_artifact_test_utils_")
 
+    def test_recompute_commands_preserve_the_full_signal_contract(self) -> None:
+        signal_spec = SignalSpec.tx_only(
+            tx_dim=256,
+            column_start=4,
+            missing_channel_policy="zero_pad",
+        )
+        session_command = build_recompute_session_feature_stats_command(
+            cache_root="/cache",
+            output_path="/stats/session.pt",
+            signal_spec=signal_spec,
+            dataset_plan=DatasetPlan.from_mapping(
+                {"brain2text24": ("competition_train",)}
+            ),
+            boundary_key_mode="session",
+        )
+        split_command = build_recompute_split_feature_stats_command(
+            cache_root="/cache",
+            dataset="brain2text24",
+            signal_spec=signal_spec,
+            boundary_key_mode="session",
+            split_policy="competition_train_test",
+            output_path="/stats/split.pt",
+        )
+        for command in (session_command, split_command):
+            self.assertIn("--column-start 4", command)
+            self.assertIn("--missing-channel-policy zero_pad", command)
+
     def test_write_valid_split_stats_artifact_writes_matching_sidecar(self) -> None:
         cache_root = Path(self._tmp_dir())
         dataset_root = cache_root / "brain2text24"
@@ -36,25 +69,25 @@ class StatsArtifactTestUtilsTests(unittest.TestCase):
             cache_root=cache_root,
             dataset="brain2text24",
             train_split_name="competition_train",
-            feature_mode="tx_only",
+            signal_spec=SignalSpec.tx_only(tx_dim=3),
             preferred_path=None,
         )
         write_valid_split_stats_artifact(
             cache_root=cache_root,
             stats_path=stats_path,
             dataset="brain2text24",
-            feature_mode="tx_only",
+            signal_spec=SignalSpec.tx_only(tx_dim=3),
             boundary_key_mode="session",
+            split_policy="competition_train_test",
             train_split_name="competition_train",
             val_split_name="competition_test",
-            dim=3,
         )
         payload = torch.load(stats_path, map_location="cpu", weights_only=False)
         metadata = json.loads(stats_path.with_suffix(".json").read_text())
         self.assertEqual(payload["metadata"], metadata)
         self.assertEqual(int(payload["mean"].numel()), 3)
 
-    def test_split_stats_load_across_boundary_key_modes(self) -> None:
+    def test_split_stats_reject_different_boundary_contract(self) -> None:
         cache_root = Path(self._tmp_dir())
         dataset_root = cache_root / "brain2text24"
         dataset_root.mkdir(parents=True, exist_ok=True)
@@ -64,33 +97,31 @@ class StatsArtifactTestUtilsTests(unittest.TestCase):
             cache_root=cache_root,
             dataset="brain2text24",
             train_split_name="competition_train",
-            feature_mode="tx_only",
+            signal_spec=SignalSpec.tx_only(tx_dim=3),
             preferred_path=None,
         )
         write_valid_split_stats_artifact(
             cache_root=cache_root,
             stats_path=stats_path,
             dataset="brain2text24",
-            feature_mode="tx_only",
+            signal_spec=SignalSpec.tx_only(tx_dim=3),
             boundary_key_mode="session",
+            split_policy="competition_train_test",
             train_split_name="competition_train",
             val_split_name="competition_test",
-            dim=3,
         )
 
-        (_, _), metadata, loaded_path = load_precomputed_split_feature_stats(
-            stats_path=stats_path,
-            cache_root=cache_root,
-            dataset="brain2text24",
-            feature_mode="tx_only",
-            boundary_key_mode="subject_if_available",
-            train_split_name="competition_train",
-            val_split_name="competition_test",
-            expected_dim=3,
-        )
-
-        self.assertEqual(loaded_path, stats_path)
-        self.assertEqual(metadata["boundary_key_mode"], "session")
+        with self.assertRaisesRegex(ValueError, "boundary_key_mode"):
+            load_precomputed_split_feature_stats(
+                stats_path=stats_path,
+                cache_root=cache_root,
+                dataset="brain2text24",
+                signal_spec=SignalSpec.tx_only(tx_dim=3),
+                boundary_key_mode="subject_if_available",
+                train_split_name="competition_train",
+                val_split_name="competition_test",
+                split_policy="competition_train_test",
+            )
 
     def test_write_valid_session_stats_artifact_writes_matching_sidecar(self) -> None:
         cache_root = Path(self._tmp_dir())
@@ -100,46 +131,62 @@ class StatsArtifactTestUtilsTests(unittest.TestCase):
         (dataset_root / "metadata.json").write_text("{}")
         stats_path = resolve_precomputed_session_stats_path(
             cache_root=cache_root,
-            feature_mode="tx_sbp",
+            signal_spec=SignalSpec.tx_sbp(tx_dim=3, sbp_dim=2),
+            dataset_plan=DatasetPlan.from_mapping({"brain2text25": ()}),
             boundary_key_mode="session",
-            excluded_datasets=("brain2text25",),
         )
         write_valid_session_stats_artifact(
             cache_root=cache_root,
             stats_path=stats_path,
             stats_entries={"brain2text25:t00.2025.01.01": (torch.zeros(5), torch.ones(5))},
-            feature_mode="tx_sbp",
+            signal_spec=SignalSpec.tx_sbp(tx_dim=3, sbp_dim=2),
+            dataset_plan=DatasetPlan.from_mapping({"brain2text25": ()}),
             boundary_key_mode="session",
-            tx_dim=3,
-            sbp_dim=2,
-            excluded_datasets=("brain2text25",),
         )
         payload = torch.load(stats_path, map_location="cpu", weights_only=False)
         metadata = json.loads(stats_path.with_suffix(".json").read_text())
         self.assertEqual(payload["metadata"], metadata)
         self.assertEqual(sorted(payload["session_feature_stats"]), ["brain2text25:t00.2025.01.01"])
 
-    def test_cache_config_deduplicates_excluded_datasets_for_canonical_paths(self) -> None:
-        config = CacheAccessConfig(excluded_datasets=("zeta", "brain2text25", "zeta", ""))
-        self.assertEqual(config.excluded_datasets, ("brain2text25", "zeta"))
+    def test_cache_config_requires_an_explicit_dataset_plan(self) -> None:
+        with self.assertRaises(TypeError):
+            CacheAccessConfig(signal_spec=SignalSpec.tx_only(tx_dim=128))
 
     def test_cache_config_allows_zero_sbp_dim_for_tx_only(self) -> None:
-        config = CacheAccessConfig(feature_mode="tx_only", tx_dim=256, sbp_dim=0)
+        config = CacheAccessConfig(
+            dataset_plan={"toy": ()},
+            signal_spec=SignalSpec.tx_only(tx_dim=256),
+        )
         self.assertEqual(config.sbp_dim, 0)
         self.assertEqual(config.full_dim, 256)
 
     def test_cache_config_requires_positive_sbp_dim_for_tx_sbp(self) -> None:
         with self.assertRaisesRegex(ValueError, "sbp_dim must be positive"):
-            CacheAccessConfig(feature_mode="tx_sbp", tx_dim=256, sbp_dim=0)
+            CacheAccessConfig(
+                dataset_plan={"toy": ()},
+                signal_spec={
+                    "mode": "tx_sbp",
+                    "tx_dim": 256,
+                    "sbp_dim": 0,
+                },
+            )
 
     def test_generic_ssl_config_allows_zero_sbp_dim_for_tx_only(self) -> None:
-        config = GenericSSMSSLConfig(feature_mode="tx_only", tx_dim=256, sbp_dim=0)
+        config = GenericSSMSSLConfig(
+            signal_spec=SignalSpec.tx_only(tx_dim=256),
+        )
         self.assertEqual(config.sbp_dim, 0)
         self.assertEqual(config.input_dim, 256)
 
     def test_generic_ssl_config_requires_positive_sbp_dim_for_tx_sbp(self) -> None:
         with self.assertRaisesRegex(ValueError, "sbp_dim must be positive"):
-            GenericSSMSSLConfig(feature_mode="tx_sbp", tx_dim=256, sbp_dim=0)
+            GenericSSMSSLConfig(
+                signal_spec={
+                    "mode": "tx_sbp",
+                    "tx_dim": 256,
+                    "sbp_dim": 0,
+                }
+            )
 
 
 if __name__ == "__main__":

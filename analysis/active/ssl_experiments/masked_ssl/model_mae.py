@@ -5,6 +5,8 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
+from ssl_core.experiment_contract import SignalSpec
+
 from s5 import BidirectionalS5SequenceBackbone, S5SequenceBackbone
 
 
@@ -80,6 +82,7 @@ class S5MaskedEncoder(nn.Module):
         self,
         *,
         input_dim: int,
+        signal_spec: SignalSpec | dict,
         hidden_size: int,
         s5_state_size: int,
         num_layers: int,
@@ -89,7 +92,6 @@ class S5MaskedEncoder(nn.Module):
         post_proj_norm: str,
         max_patches: int,
         source_session_keys: tuple[str, ...] = (),
-        feature_mode: str = "tx_only",
         backbone_direction: str = "bidirectional",
     ):
         del post_proj_norm  # kept for checkpoint compatibility
@@ -107,7 +109,8 @@ class S5MaskedEncoder(nn.Module):
         self.patch_stride = int(patch_stride)
         self.token_dim = self.input_dim * self.patch_size
         self.max_patches = int(max_patches)
-        self.feature_mode = str(feature_mode)
+        self.signal_spec = SignalSpec.from_value(signal_spec)
+        self.feature_mode = self.signal_spec.mode
         self.backbone_direction = str(backbone_direction)
         self.source_session_keys = tuple(str(key) for key in source_session_keys)
 
@@ -285,6 +288,7 @@ class MaskedSSLModel(nn.Module):
         self,
         *,
         input_dim: int,
+        signal_spec: SignalSpec | dict,
         hidden_size: int,
         s5_state_size: int,
         num_layers: int,
@@ -293,7 +297,6 @@ class MaskedSSLModel(nn.Module):
         patch_stride: int,
         post_proj_norm: str,
         source_session_keys: tuple[str, ...] = (),
-        feature_mode: str = "tx_only",
         reconstruction_head_mode: str = "with_output_norm",
         reconstruction_head_type: str = "linear",
         backbone_direction: str = "bidirectional",
@@ -314,7 +317,8 @@ class MaskedSSLModel(nn.Module):
         if decoder_backbone_direction not in {"causal", "bidirectional"}:
             raise ValueError("decoder_backbone_direction must be one of {'causal', 'bidirectional'}")
 
-        self.feature_mode = str(feature_mode)
+        self.signal_spec = SignalSpec.from_value(signal_spec)
+        self.feature_mode = self.signal_spec.mode
         self.source_session_keys = tuple(str(key) for key in source_session_keys)
         self.reconstruction_head_mode = str(reconstruction_head_mode)
         self.reconstruction_head_type = str(reconstruction_head_type)
@@ -330,7 +334,7 @@ class MaskedSSLModel(nn.Module):
             post_proj_norm=post_proj_norm,
             max_patches=max_patches,
             source_session_keys=self.source_session_keys,
-            feature_mode=self.feature_mode,
+            signal_spec=self.signal_spec,
             backbone_direction=backbone_direction,
         )
 

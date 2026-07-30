@@ -22,6 +22,10 @@ from analysis.active.ssl_experiments.ssm_ssl.model import (
 )
 from analysis.active.ssl_experiments.ssm_ssl.objectives import masked_reconstruction_loss
 from analysis.active.ssl_experiments.ssm_ssl.training import load_encoder_checkpoint
+from analysis.active.ssl_experiments.ssl_core.experiment_contract import (
+    DatasetPlan,
+    SignalSpec,
+)
 
 
 class GenericSSMSSLTest(unittest.TestCase):
@@ -32,12 +36,19 @@ class GenericSSMSSLTest(unittest.TestCase):
             hidden_size=8,
             state_size=4,
             num_layers=1,
-            excluded_datasets=("brain2text25", "toy"),
+            dataset_plan=DatasetPlan.from_mapping(
+                {
+                    "brain2text24": ("competition_train",),
+                    "toy": ("train", "val"),
+                }
+            ),
+            signal_spec=SignalSpec.tx_only(tx_dim=256),
         )
         recovered = GenericSSMSSLConfig.from_dict(config.to_dict())
         self.assertEqual(recovered.backbone_type, "s5")
         self.assertEqual(recovered.input_mode, "temporal_patch")
-        self.assertEqual(recovered.excluded_datasets, ("brain2text25", "toy"))
+        self.assertEqual(recovered.dataset_plan, config.dataset_plan)
+        self.assertEqual(recovered.signal_spec, config.signal_spec)
 
     def test_s5_encoder_forward(self) -> None:
         encoder = GenericSSMEncoder(

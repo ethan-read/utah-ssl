@@ -10,6 +10,8 @@ from typing import Any, Sequence
 
 import pandas as pd
 
+from ssl_core.experiment_contract import SignalSpec
+
 from .cache import (
     CacheAccessConfig,
     SESSION_STATS_BIN_STRIDE,
@@ -215,11 +217,12 @@ def load_single_session_probe_problem(
     *,
     cache_root: str | Path,
     dataset: str,
-    feature_mode: str,
+    signal_spec: SignalSpec | dict[str, Any],
     boundary_key_mode: str,
     session_id: str | None,
     allow_none_as_train: bool = False,
 ) -> dict[str, Any]:
+    resolved_signal_spec = SignalSpec.from_value(signal_spec)
     dataset_root = Path(cache_root) / dataset
     manifest_path = dataset_root / "manifest.jsonl"
     metadata_path = dataset_root / "metadata.json"
@@ -306,7 +309,8 @@ def load_single_session_probe_problem(
         "target_val_rows": tuple(by_session[session_id]["val"]),
         "vocab": vocab,
         "cache_root": Path(cache_root),
-        "feature_mode": str(feature_mode),
+        "signal_spec": resolved_signal_spec,
+        "feature_mode": resolved_signal_spec.mode,
         "boundary_key_mode": str(boundary_key_mode),
         "source_session_ids": tuple(),
     }
@@ -446,7 +450,7 @@ def run_sigma_mask_probe_sweep(
         probe_problem = load_single_session_probe_problem(
             cache_root=Path(context.cache_root),
             dataset=probe_dataset,
-            feature_mode=str(run_config.feature_mode),
+            signal_spec=run_config.signal_spec,
             boundary_key_mode=boundary_key_mode,
             session_id=probe_session_id,
             allow_none_as_train=probe_allow_none_as_train,

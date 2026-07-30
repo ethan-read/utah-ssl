@@ -16,7 +16,9 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from masked_ssl.cache import (
+from ssl_core.experiment_contract import SignalSpec
+
+from ssl_core.cache import (
     load_cache_smoothing_provenance,
     resolve_boundary_key,
 )
@@ -50,7 +52,7 @@ class POSSMFinetuneConfig:
     init_source: str = "stage1"
     dataset: str = "brain2text24"
     split_policy: str = "competition_train_test"
-    feature_mode: str | None = None
+    signal_spec: SignalSpec | dict[str, Any] | None = None
     data_mode: str | None = None
     boundary_key_mode: str | None = None
     batch_size: int = 8
@@ -82,35 +84,15 @@ class POSSMFinetuneConfig:
     emission_mode: str = "post_decoder_conv"
     pre_decoder_patch_size: int = 14
     pre_decoder_patch_stride: int = 4
-    # Backward-compatible aliases for old notebooks/checkpoints that briefly used
-    # Willett-style pre-GRU temporal patching names for the POSSM output conv.
-    temporal_patch_kernel_size: int | None = None
-    temporal_patch_stride: int | None = None
     conv_hidden_size: int | None = None
-    conv_kernel_size: int | None = None
-    conv_stride: int | None = None
+    conv_kernel_size: int = 14
+    conv_stride: int = 4
     conv_dropout: float = 0.1
     precomputed_split_stats_path: str | Path | None = None
 
     def __post_init__(self) -> None:
-        if self.conv_kernel_size is None:
-            self.conv_kernel_size = (
-                int(self.temporal_patch_kernel_size)
-                if self.temporal_patch_kernel_size is not None
-                else 14
-            )
-        else:
-            self.conv_kernel_size = int(self.conv_kernel_size)
-        if self.conv_stride is None:
-            self.conv_stride = (
-                int(self.temporal_patch_stride)
-                if self.temporal_patch_stride is not None
-                else 4
-            )
-        else:
-            self.conv_stride = int(self.conv_stride)
-        self.temporal_patch_kernel_size = int(self.conv_kernel_size)
-        self.temporal_patch_stride = int(self.conv_stride)
+        self.conv_kernel_size = int(self.conv_kernel_size)
+        self.conv_stride = int(self.conv_stride)
         if self.mode not in {"probe_frozen", "finetune_full"}:
             raise ValueError("mode must be one of {'probe_frozen', 'finetune_full'}")
         if self.init_source not in {"stage1", "random"}:
@@ -119,8 +101,8 @@ class POSSMFinetuneConfig:
             raise ValueError(
                 "split_policy must be one of {'competition_train_test', 'source_train_val'}"
             )
-        if self.feature_mode is not None and self.feature_mode not in {"tx_only", "tx_sbp"}:
-            raise ValueError("feature_mode must be one of {'tx_only', 'tx_sbp'} when provided")
+        if self.signal_spec is not None:
+            self.signal_spec = SignalSpec.from_value(self.signal_spec)
         if self.data_mode is not None and self.data_mode not in {"raw", "normalized"}:
             raise ValueError("data_mode must be one of {'raw', 'normalized'} when provided")
         if self.boundary_key_mode is not None and self.boundary_key_mode not in {
@@ -177,10 +159,30 @@ class POSSMFinetuneConfig:
         if not (0.0 <= float(self.conv_dropout) < 1.0):
             raise ValueError("conv_dropout must be in [0, 1)")
 
+    @property
+    def feature_mode(self) -> str | None:
+        return None if self.signal_spec is None else self.signal_spec.mode
+
 def _seed_all(seed: int) -> None:
     torch.manual_seed(int(seed))
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(int(seed))
+
+
+def _capture_torch_rng_state() -> dict[str, Any]:
+    state: dict[str, Any] = {"cpu": torch.get_rng_state()}
+    if torch.cuda.is_available():
+        state["cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def _restore_torch_rng_state(state: dict[str, Any] | None) -> None:
+    if not state:
+        return
+    if state.get("cpu") is not None:
+        torch.set_rng_state(state["cpu"])
+    if torch.cuda.is_available() and state.get("cuda") is not None:
+        torch.cuda.set_rng_state_all(state["cuda"])
 
 
 def _loader_kwargs(device: torch.device) -> dict[str, Any]:
@@ -485,6 +487,34 @@ def _load_stage1_checkpoint(
     checkpoint_cfg = dict(payload.get("config", {}))
     if str(payload.get("model_family", checkpoint_cfg.get("model_family", ""))) != "possm":
         raise ValueError("Checkpoint is not a POSSM checkpoint.")
+    if str(payload.get("stage", checkpoint_cfg.get("stage", ""))) != "stage1_reconstruction":
+        raise ValueError("Checkpoint is not a POSSM Stage-1 reconstruction checkpoint.")
+    required_config_fields = {
+        "data_mode",
+        "boundary_key_mode",
+        "dataset_plan",
+        "input_dim",
+        "model_dim",
+        "latent_count",
+        "value_encoder_type",
+        "value_mlp_hidden_size",
+        "ffn_hidden_size",
+        "dropout",
+        "use_token_norm",
+        "signal_spec",
+        "temporal_backbone_type",
+        "temporal_gru_hidden_size",
+        "temporal_gru_num_layers",
+        "temporal_gru_dropout",
+        "temporal_gru_bidirectional",
+        "temporal_backbone_kwargs",
+    }
+    missing_fields = sorted(required_config_fields - set(checkpoint_cfg))
+    if missing_fields:
+        raise ValueError(
+            "POSSM Stage-1 checkpoint config is incomplete; missing required fields: "
+            + ", ".join(missing_fields)
+        )
     model_state = payload.get("model_state")
     if model_state is None:
         raise KeyError("Stage-1 POSSM checkpoint is missing 'model_state'.")
@@ -527,8 +557,8 @@ def _build_stage1_encoder_from_checkpoint_config(
         ),
         ffn_hidden_size=int(checkpoint_cfg["ffn_hidden_size"]),
         dropout=float(checkpoint_cfg["dropout"]),
-        use_token_norm=bool(checkpoint_cfg.get("use_token_norm", True)),
-        feature_mode=str(checkpoint_cfg.get("feature_mode", "tx_sbp")),
+        use_token_norm=bool(checkpoint_cfg["use_token_norm"]),
+        signal_spec=SignalSpec.from_value(checkpoint_cfg["signal_spec"]),
     )
 
 
@@ -538,17 +568,17 @@ def _build_stage1_temporal_backbone_from_checkpoint_config(
     input_size: int,
 ) -> torch.nn.Module:
     return build_temporal_backbone(
-        backbone_type=str(checkpoint_cfg.get("temporal_backbone_type", "gru")),
+        backbone_type=str(checkpoint_cfg["temporal_backbone_type"]),
         input_size=int(input_size),
         gru_hidden_size=(
             None
             if checkpoint_cfg.get("temporal_gru_hidden_size") is None
             else int(checkpoint_cfg["temporal_gru_hidden_size"])
         ),
-        gru_num_layers=int(checkpoint_cfg.get("temporal_gru_num_layers", 1)),
-        gru_dropout=float(checkpoint_cfg.get("temporal_gru_dropout", 0.0)),
-        gru_bidirectional=bool(checkpoint_cfg.get("temporal_gru_bidirectional", False)),
-        backbone_kwargs=dict(checkpoint_cfg.get("temporal_backbone_kwargs", {})),
+        gru_num_layers=int(checkpoint_cfg["temporal_gru_num_layers"]),
+        gru_dropout=float(checkpoint_cfg["temporal_gru_dropout"]),
+        gru_bidirectional=bool(checkpoint_cfg["temporal_gru_bidirectional"]),
+        backbone_kwargs=dict(checkpoint_cfg["temporal_backbone_kwargs"]),
     )
 
 
@@ -591,7 +621,7 @@ def recover_possm_stage1_sequence_components(
         if key.startswith("temporal_backbone.")
     }
     if not temporal_state:
-        temporal_backbone_type = str(checkpoint_cfg.get("temporal_backbone_type", "identity"))
+        temporal_backbone_type = str(checkpoint_cfg["temporal_backbone_type"])
         if temporal_backbone_type != "identity":
             raise KeyError(
                 "Stage-1 POSSM checkpoint declares a temporal backbone but contains no "
@@ -632,14 +662,14 @@ def _build_problem(
     *,
     cache_root: Path,
     config: POSSMFinetuneConfig,
-    feature_mode: str,
+    signal_spec: SignalSpec,
     boundary_key_mode: str,
 ) -> dict[str, Any]:
     if config.split_policy == "source_train_val":
         return build_source_split_problem(
             cache_root=cache_root,
             dataset=str(config.dataset),
-            feature_mode=str(feature_mode),
+            signal_spec=signal_spec,
             boundary_key_mode=str(boundary_key_mode),
             train_split_name="train",
             val_split_name="val",
@@ -647,7 +677,7 @@ def _build_problem(
     return build_competition_split_problem(
         cache_root=cache_root,
         dataset=str(config.dataset),
-        feature_mode=str(feature_mode),
+        signal_spec=signal_spec,
         boundary_key_mode=str(boundary_key_mode),
     )
 
@@ -686,6 +716,8 @@ def _checkpoint_payload(
     metrics: dict[str, Any],
     checkpoint_kind: str,
     elapsed_seconds: float,
+    train_iteration_index: int,
+    train_batches_consumed: int,
     batching_diagnostics: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     resolved_batching_diagnostics = dict(batching_diagnostics or {})
@@ -724,6 +756,11 @@ def _checkpoint_payload(
         "elapsed_seconds": float(elapsed_seconds),
         "metrics": dict(metrics),
         "checkpoint_kind": str(checkpoint_kind),
+        "rng_state": _capture_torch_rng_state(),
+        "train_batch_position": {
+            "iteration_index": int(train_iteration_index),
+            "batches_consumed": int(train_batches_consumed),
+        },
         "dynamic_batching_enabled": bool(resolved_batching_diagnostics.get("dynamic_batching_enabled", False)),
         "p95_train_input_length": resolved_batching_diagnostics.get("p95_train_input_length"),
         "max_padded_time_per_microbatch": resolved_batching_diagnostics.get("max_padded_time_per_microbatch"),
@@ -883,29 +920,38 @@ def run_possm_phoneme_finetuning(
         init_source=str(resolved_config.init_source),
         map_location="cpu",
     )
-    effective_feature_mode = (
-        str(resolved_config.feature_mode)
-        if resolved_config.feature_mode is not None
-        else str(checkpoint_cfg.get("feature_mode", "tx_sbp"))
-    )
-    if effective_feature_mode != str(checkpoint_cfg.get("feature_mode", effective_feature_mode)):
+    if "signal_spec" not in checkpoint_cfg:
         raise ValueError(
-            "POSSM stage-2 does not currently support changing feature_mode from the stage-1 checkpoint."
+            "Stage-1 checkpoint does not contain signal_spec; rerun Stage 1 with "
+            "the explicit signal contract before fine-tuning"
         )
+    checkpoint_signal_spec = SignalSpec.from_value(checkpoint_cfg["signal_spec"])
+    effective_signal_spec = (
+        SignalSpec.from_value(resolved_config.signal_spec)
+        if resolved_config.signal_spec is not None
+        else checkpoint_signal_spec
+    )
+    if effective_signal_spec != checkpoint_signal_spec:
+        raise ValueError(
+            "POSSM Stage 2 signal_spec does not match the Stage-1 checkpoint. "
+            f"checkpoint={checkpoint_signal_spec.to_dict()}, "
+            f"requested={effective_signal_spec.to_dict()}"
+        )
+    effective_feature_mode = effective_signal_spec.mode
     effective_data_mode = (
         str(resolved_config.data_mode)
         if resolved_config.data_mode is not None
-        else str(checkpoint_cfg.get("data_mode", "normalized"))
+        else str(checkpoint_cfg["data_mode"])
     )
     effective_boundary_key_mode = (
         str(resolved_config.boundary_key_mode)
         if resolved_config.boundary_key_mode is not None
-        else str(checkpoint_cfg.get("boundary_key_mode", "session"))
+        else str(checkpoint_cfg["boundary_key_mode"])
     )
     effective_config = POSSMFinetuneConfig(
         **{
             **asdict(resolved_config),
-            "feature_mode": effective_feature_mode,
+            "signal_spec": effective_signal_spec,
             "data_mode": effective_data_mode,
             "boundary_key_mode": effective_boundary_key_mode,
         }
@@ -914,7 +960,7 @@ def run_possm_phoneme_finetuning(
     problem = _build_problem(
         cache_root=resolved_cache_root,
         config=effective_config,
-        feature_mode=effective_feature_mode,
+        signal_spec=effective_signal_spec,
         boundary_key_mode=effective_boundary_key_mode,
     )
     cache_smoothing_provenance = load_cache_smoothing_provenance(
@@ -934,18 +980,17 @@ def run_possm_phoneme_finetuning(
             cache_root=problem["cache_root"],
             dataset=str(problem["dataset"]),
             train_split_name=str(problem.get("train_split_name", "competition_train")),
-            feature_mode=str(problem["feature_mode"]),
+            signal_spec=effective_signal_spec,
             preferred_path=effective_config.precomputed_split_stats_path,
         )
         (mean_t, std_t), target_stats_metadata, loaded_stats_path = load_precomputed_split_feature_stats(
             stats_path=resolved_split_stats_path,
             cache_root=problem["cache_root"],
             dataset=str(problem["dataset"]),
-            feature_mode=str(problem["feature_mode"]),
+            signal_spec=effective_signal_spec,
             boundary_key_mode=str(problem.get("boundary_key_mode", effective_boundary_key_mode)),
             train_split_name=str(problem.get("train_split_name", "competition_train")),
             val_split_name=str(problem.get("val_split_name", "competition_test")),
-            expected_dim=int(base_encoder.input_dim),
             split_policy=str(problem.get("split_policy", resolved_config.split_policy)),
         )
         target_stats = (
@@ -969,7 +1014,7 @@ def run_possm_phoneme_finetuning(
         problem["train_rows"],
         cache_root=Path(problem["cache_root"]),
         stats=target_stats,
-        feature_mode=str(problem["feature_mode"]),
+        signal_spec=problem["signal_spec"],
         boundary_key_mode=str(problem.get("boundary_key_mode", "session")),
         dataset=str(problem.get("dataset", effective_config.dataset)),
     )
@@ -977,19 +1022,20 @@ def run_possm_phoneme_finetuning(
         problem["val_rows"],
         cache_root=Path(problem["cache_root"]),
         stats=target_stats,
-        feature_mode=str(problem["feature_mode"]),
+        signal_spec=problem["signal_spec"],
         boundary_key_mode=str(problem.get("boundary_key_mode", "session")),
         dataset=str(problem.get("dataset", effective_config.dataset)),
     )
+    train_batch_sampler = LengthAwareBatchSampler(
+        problem["train_rows"],
+        max_examples_per_microbatch=max_examples_per_microbatch,
+        max_padded_time_per_microbatch=max_padded_time_per_microbatch,
+        shuffle=True,
+        seed=int(effective_config.seed),
+    )
     train_loader = DataLoader(
         train_dataset,
-        batch_sampler=LengthAwareBatchSampler(
-            problem["train_rows"],
-            max_examples_per_microbatch=max_examples_per_microbatch,
-            max_padded_time_per_microbatch=max_padded_time_per_microbatch,
-            shuffle=True,
-            seed=int(effective_config.seed),
-        ),
+        batch_sampler=train_batch_sampler,
         **_loader_kwargs(resolved_device),
     )
     val_loader = DataLoader(
@@ -1125,6 +1171,9 @@ def run_possm_phoneme_finetuning(
     best_payload: dict[str, Any] | None = None
     best_step = 0
     resumed_from_checkpoint: str | None = None
+    train_iteration_index = 0
+    train_batches_consumed = 0
+    resume_rng_state: dict[str, Any] | None = None
 
     if resume_from_latest:
         latest_checkpoint_path = _find_latest_step_checkpoint(checkpoints_dir)
@@ -1144,6 +1193,20 @@ def run_possm_phoneme_finetuning(
                 optimizer.load_state_dict(optimizer_state)
             steps = int(payload.get("steps", 0))
             last_eval_step = int(steps)
+            raw_batch_position = payload.get("train_batch_position")
+            if isinstance(raw_batch_position, dict):
+                train_iteration_index = int(
+                    raw_batch_position.get("iteration_index", 0)
+                )
+                train_batches_consumed = int(
+                    raw_batch_position.get("batches_consumed", 0)
+                )
+                resume_rng_state = payload.get("rng_state")
+            else:
+                print(
+                    "warning: Stage-2 checkpoint predates exact batch/RNG recovery; "
+                    "resuming from the beginning of the deterministic data order."
+                )
             resume_elapsed_seconds = float(payload.get("elapsed_seconds", 0.0) or 0.0)
             resumed_from_checkpoint = str(latest_checkpoint_path)
             checkpoint_metrics = payload.get("metrics")
@@ -1228,6 +1291,8 @@ def run_possm_phoneme_finetuning(
                 metrics=metrics,
                 checkpoint_kind="best",
                 elapsed_seconds=round(time.time() - start_time, 3),
+                train_iteration_index=train_iteration_index,
+                train_batches_consumed=train_batches_consumed,
                 batching_diagnostics=batching_diagnostics,
             )
             best_step = int(steps)
@@ -1252,6 +1317,8 @@ def run_possm_phoneme_finetuning(
                 metrics=step_metrics,
                 checkpoint_kind="step",
                 elapsed_seconds=round(time.time() - start_time, 3),
+                train_iteration_index=train_iteration_index,
+                train_batches_consumed=train_batches_consumed,
                 batching_diagnostics=batching_diagnostics,
             )
             step_checkpoint_path = checkpoints_dir / f"step_{int(steps):06d}.pt"
@@ -1320,18 +1387,53 @@ def run_possm_phoneme_finetuning(
         accumulated_model_seconds = 0.0
         has_pending_gradients = False
 
+    if train_batches_consumed > len(train_loader):
+        raise ValueError(
+            "Stage-2 checkpoint batch position exceeds the reconstructed "
+            f"iteration length: iteration={train_iteration_index}, "
+            f"batches_consumed={train_batches_consumed}, "
+            f"iteration_batches={len(train_loader)}"
+        )
+    if resume_rng_state is not None and train_batches_consumed == len(train_loader):
+        # The checkpoint was written after the final batch but before the
+        # iterator observed StopIteration. Resume directly at the next
+        # deterministic permutation.
+        _restore_torch_rng_state(resume_rng_state)
+        resume_rng_state = None
+        train_iteration_index += 1
+        train_batches_consumed = 0
+
     while True:
         elapsed = time.time() - start_time
         if steps >= int(effective_config.num_steps):
             break
         made_progress = False
+        train_batch_sampler.load_state_dict(
+            {"iteration_count": int(train_iteration_index)}
+        )
         train_loader_iter = iter(train_loader)
+        if train_batches_consumed:
+            for _ in range(int(train_batches_consumed)):
+                try:
+                    next(train_loader_iter)
+                except StopIteration as exc:
+                    raise ValueError(
+                        "Stage-2 checkpoint batch position exceeds the reconstructed "
+                        f"iteration length: iteration={train_iteration_index}, "
+                        f"batches_consumed={train_batches_consumed}"
+                    ) from exc
+        if resume_rng_state is not None:
+            # Reconstructing and advancing the DataLoader can consume torch RNG.
+            # Restore only after reaching the saved cursor.
+            _restore_torch_rng_state(resume_rng_state)
+            resume_rng_state = None
         while True:
             sample_start = time.time()
             try:
                 batch = next(train_loader_iter)
             except StopIteration:
                 break
+            train_batches_consumed += 1
             accumulated_sample_seconds += time.time() - sample_start
             elapsed = time.time() - start_time
             if steps >= int(effective_config.num_steps):
@@ -1398,6 +1500,8 @@ def run_possm_phoneme_finetuning(
         flush_pending_gradients()
         maybe_evaluate()
         maybe_save_resumable_checkpoint()
+        train_iteration_index += 1
+        train_batches_consumed = 0
 
     final_metrics = maybe_evaluate(force=True)
     if final_metrics is None:
@@ -1428,6 +1532,8 @@ def run_possm_phoneme_finetuning(
             metrics=final_metrics,
             checkpoint_kind="final",
             elapsed_seconds=round(time.time() - start_time, 3),
+            train_iteration_index=train_iteration_index,
+            train_batches_consumed=train_batches_consumed,
             batching_diagnostics=batching_diagnostics,
         ),
         checkpoint_final_path,

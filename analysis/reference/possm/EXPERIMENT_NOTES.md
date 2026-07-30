@@ -24,8 +24,9 @@ and 12,000-step budget as the Brain2Text24-only baseline.
 
 ## Where to work
 
-- `notebooks/s6_possm_maskedreconstruction.ipynb`: Brain2Text24-only baseline
-  workflow. It is the reference for the original comparison.
+- `notebooks/s6_possm_maskedreconstruction.ipynb`: historical Brain2Text24-only
+  baseline record. It preserves the original comparison but is not maintained
+  as a current entry point after the explicit contract migration.
 - `notebooks/s13_brain2text25_long_pretraining.ipynb`: older Brain2Text25-only
   workflow. It contains strict 128-wide cache assertions and is not the clean
   entry point for the pooled experiment.
@@ -41,6 +42,8 @@ and 12,000-step budget as the Brain2Text24-only baseline.
   progress serialization.
 - `possm_ssl/phoneme_finetune.py`: Stage-2 data loading, fine-tuning,
   checkpoint recovery, CTC loss, PER, and timing logs.
+- `SIGNAL_AND_DATA_CONTRACTS.md`: the current modular interface for choosing
+  datasets and neural signals across cache inspection, analysis, and training.
 - `../active/ssl_experiments/masked_ssl/cache.py`: shared cache context and
   dataset-specific source-split filtering.
 - `../active/ssl_experiments/ssl_core/scripts/recompute_session_feature_stats.py`:
@@ -53,12 +56,11 @@ and 12,000-step budget as the Brain2Text24-only baseline.
 - `docs/notes/experiment_synthesis.md`: compact cross-experiment interpretation
   of POSSM relative to the supervised Willett-style baselines.
 
-The pooled notebook uses the explicit policy
+The pooled notebook uses one explicit `DatasetPlan`:
 `brain2text24=(competition_train,)` and
-`brain2text25=(train,val)`, together with
-`included_datasets=(brain2text24, brain2text25)`. This allow-list is the
-authoritative Stage-1 pool; do not replace it with an empty exclusion list,
-which can silently include unrelated datasets from the canonical cache.
+`brain2text25=(train,val)`. Dataset selection is positive-only: the plan names
+every dataset and split that participates, and the cache layer has no
+“everything except these datasets” configuration.
 
 ## Colab recovery and outputs
 
@@ -70,8 +72,16 @@ cells. The target remains `STAGE1_RESUME_TARGET_STEPS=12000`.
 Stage 2 writes to the separate `pooled_pretraining_stage2` root. Use
 `STAGE2_RUN_ACTION='fresh'` for the first fine-tune, and
 `'resume_latest'` or an explicit recovery path after interruption. A Stage-2
-checkpoint contains the model/config and progress state needed to continue;
-keep the dataset, architecture, and step budget unchanged when resuming.
+checkpoint contains the model/optimizer, Torch RNG, deterministic sampler
+iteration, exact microbatch cursor, config, and progress state needed to
+continue. New checkpoints therefore reproduce the uninterrupted next-step
+trajectory, including noise augmentation and dropout. Older checkpoints remain
+resumable but print a warning and restart the deterministic data order because
+they do not contain the exact cursor. Keep the dataset, architecture, and step
+budget unchanged when resuming.
+
+The shared refactor and migration behavior are documented in
+`docs/notes/ssl_signal_contract_refactor.md`.
 
 The notebook records Stage-2 train CTC, validation CTC, validation PER,
 checkpoint step, and `sample_seconds`/`model_seconds` in the progress log.
@@ -90,10 +100,9 @@ runs. If `prepare_cache_context` reports that the artifact is stale or
 incompatible, run the exact `recompute_command` printed in the exception or by
 the notebook; do not bypass the metadata check.
 
-The canonical Brain2Text25 cache may be 256-wide even though the common POSSM
-tx-only policy uses the first 128 TX features. The pooled workflow now reads
-Brain2Text25 from the optimized 128-wide root described below. Brain2Text24 is
-read directly from its unchanged canonical root.
+The canonical Brain2Text25 cache may be 256-wide. The pooled workflow reads
+Brain2Text25 from the optimized 128-wide root described below, while
+Brain2Text24 is read directly from its unchanged canonical root.
 
 The notebook's `torch.load` compatibility cell is intentionally idempotent.
 If cells are rerun, keep the saved original loader rather than wrapping the
@@ -124,11 +133,26 @@ feature transformation is selecting columns `[0, 128)` for TX and SBP.
 Preserving SBP exactly is particularly important for planned SBP-only
 cross-year comparisons.
 
-The cache loader is modality-aware. A `tx_only` Stage-1 context opens and
-caches `time_offsets.npy` and `tx.npy`, but not the unused `sbp.npy`. Stage-1
-logs include cumulative cache hit rate, cached GB, bytes read, and evictions.
-Use `drive_direct` first; switch s14's `STAGE1_CACHE_MODE` to `copy_to_local`
-only if the s15 warm benchmark remains slow.
+The cache loader is modality-aware. A `tx_only` context opens TX but not SBP;
+an `sbp_only` context opens SBP but not TX. The pooled POSSM recipe explicitly
+uses 128-channel area-6v SBP. Stage-1 logs include cumulative cache hit rate,
+cached GB, bytes read, and evictions. Use `drive_direct` first; switch s14's
+`STAGE1_CACHE_MODE` to `copy_to_local` only if the s15 warm benchmark remains
+slow.
+
+There is deliberately no global signal default. Each run selects a named
+recipe or constructs a `DatasetPlan` and `SignalSpec`; `tx_only`, `sbp_only`,
+and `tx_sbp` are all valid explicit choices. Cache loading, statistics, raw
+access, manifold/probe construction, and model training consume the same
+objects. Current checkpoints and stats artifacts must contain both contracts;
+incomplete old artifacts fail with a direct missing-contract error. Stage 2
+inherits the exact Stage-1 signal unless an identical `SignalSpec` is supplied.
+
+Both Stage-1's eager shard cache and Stage-2's memory-mapped shard accessor are
+modality-aware. In particular, an SBP-only Stage-2 dataset does not open or
+memory-map `tx.npy`.
+Synthetic tests cover the SBP-only Stage-1 checkpoint handoff, Stage-2
+fine-tuning checkpoint creation, and Stage-2 resume.
 
 The mixed-root view has a composite source signature and its own stats
 namespace:

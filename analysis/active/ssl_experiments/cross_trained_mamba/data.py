@@ -20,6 +20,7 @@ try:
         compute_feature_stats,
     )
     from ssl_core.ctc import LengthAwareBatchSampler
+    from ssl_core.experiment_contract import SignalSpec
 except ModuleNotFoundError:  # pragma: no cover - repo-root unittest fallback
     from analysis.active.ssl_experiments.masked_ssl.probe import (
         AREA6V_FEATURE_DIM,
@@ -30,6 +31,7 @@ except ModuleNotFoundError:  # pragma: no cover - repo-root unittest fallback
         compute_feature_stats,
     )
     from analysis.active.ssl_experiments.ssl_core.ctc import LengthAwareBatchSampler
+    from analysis.active.ssl_experiments.ssl_core.experiment_contract import SignalSpec
 
 
 DATASET_SPLITS: dict[str, tuple[str, str]] = {
@@ -105,11 +107,14 @@ class CrossDatasetSequenceDataset(CanonicalSequenceDataset):
         super().__init__(
             rows,
             cache_root=cache_root,
+            signal_spec=SignalSpec.from_mode(
+                feature_mode,
+                tx_dim=int(area6v_feature_dim),
+                sbp_dim=int(area6v_feature_dim),
+            ),
             stats=stats,
-            feature_mode=feature_mode,
             boundary_key_mode="session",
             dataset=dataset,
-            area6v_feature_dim=area6v_feature_dim,
         )
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
@@ -224,8 +229,11 @@ def compute_dataset_train_stats(
             problem["rows_by_dataset"][dataset]["train"],
             cache_root=Path(problem["cache_root"]),
             mode=str(mode),
-            feature_mode=str(problem["feature_mode"]),
-            area6v_feature_dim=int(area6v_feature_dim),
+            signal_spec=SignalSpec.from_mode(
+                str(problem["feature_mode"]),
+                tx_dim=int(area6v_feature_dim),
+                sbp_dim=int(area6v_feature_dim),
+            ),
         )
     return stats_by_dataset
 

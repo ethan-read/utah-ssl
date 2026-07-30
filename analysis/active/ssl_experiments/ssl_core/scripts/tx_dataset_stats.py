@@ -14,8 +14,6 @@ for _path in (REPO_ROOT, EXPERIMENTS_DIR):
     _path_str = str(_path)
     if _path_str not in sys.path:
         sys.path.insert(0, _path_str)
-from typing import Iterable
-
 import numpy as np
 
 
@@ -66,10 +64,10 @@ def parse_args() -> argparse.Namespace:
         help="Channel-bin values to treat as suspicious sentinels. May be passed multiple times.",
     )
     parser.add_argument(
-        "--exclude-dataset",
+        "--dataset",
         action="append",
-        default=[],
-        help="Dataset names to skip.",
+        default=None,
+        help="Dataset name to analyze. Repeat for an exact subset; omit to inventory all datasets.",
     )
     parser.add_argument("--output-json", type=Path, default=None)
     return parser.parse_args()
@@ -79,9 +77,24 @@ def _quantile(values: np.ndarray, q: float) -> float:
     return float(np.quantile(values, q))
 
 
-def _iter_datasets(cache_root: Path, exclude: Iterable[str]) -> list[Path]:
-    excluded = set(exclude)
-    return sorted(path for path in cache_root.iterdir() if path.is_dir() and path.name not in excluded)
+def _iter_datasets(
+    cache_root: Path,
+    dataset_names: list[str] | None,
+) -> list[Path]:
+    available = {
+        path.name: path
+        for path in cache_root.iterdir()
+        if path.is_dir()
+    }
+    if dataset_names is None:
+        return [available[name] for name in sorted(available)]
+    requested = tuple(dict.fromkeys(str(name).strip() for name in dataset_names))
+    missing = [name for name in requested if name not in available]
+    if missing:
+        raise FileNotFoundError(
+            f"Requested dataset(s) not found under {cache_root}: {missing}"
+        )
+    return [available[name] for name in requested]
 
 
 def _reservoir_push(
@@ -317,7 +330,7 @@ def main() -> int:
             suspicious_values=suspicious_values,
             rng=rng,
         )
-        for dataset_root in _iter_datasets(args.cache_root, args.exclude_dataset)
+        for dataset_root in _iter_datasets(args.cache_root, args.dataset)
     ]
 
     print(_format_table(rows))

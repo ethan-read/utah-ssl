@@ -7,6 +7,7 @@ import json
 import math
 import os
 import random
+import shlex
 import shutil
 import time
 from collections import Counter, OrderedDict, defaultdict
@@ -18,9 +19,9 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from ssl_core.bit_cache_contract import (
-    BIT_CANONICAL_FEATURE_POLICY,
-    canonical_stage1_stats_stem,
+from ssl_core.experiment_contract import (
+    DatasetPlan,
+    SignalSpec,
 )
 
 try:
@@ -38,70 +39,28 @@ RUNTIME_SMOOTHING_MIGRATION_MESSAGE = (
 # Fixed stride for session-stat computation to match the normalized cache artifacts.
 SESSION_STATS_BIN_STRIDE = 2
 AREA6V_FEATURE_DIM = 128
-FEATURE_POLICY = BIT_CANONICAL_FEATURE_POLICY
 
 
 @dataclass
 class CacheAccessConfig:
+    dataset_plan: DatasetPlan | Mapping[str, Sequence[str]]
+    signal_spec: SignalSpec | Mapping[str, Any]
     mode: str = "copy_to_local"
     local_cache_base: str = "/content/utah_ssl_cache"
     force_recopy_local_cache: bool = False
-    excluded_datasets: tuple[str, ...] = ("brain2text25",)
-    included_datasets: tuple[str, ...] | None = None
     seed: int = 7
     segment_bins: int = 64
     use_normalization: bool = True
     examples_per_shard: int = 8
-    tx_dim: int = 128
-    sbp_dim: int = 128
-    feature_mode: str = "tx_only"
     boundary_key_mode: str = "session"
     gaussian_smoothing_sigma_bins: float = 0.0
     shard_cache_ram_gb: float | None = None
     precomputed_session_stats_path: str | Path | None = None
-    pretrain_source_splits: tuple[str, ...] | None = None
-    pretrain_source_splits_by_dataset: dict[str, tuple[str, ...]] | None = None
     dataset_cache_roots: dict[str, str | Path] | None = None
 
     def __post_init__(self) -> None:
-        normalized_excluded = tuple(
-            sorted({str(item).strip() for item in self.excluded_datasets if str(item).strip()})
-        )
-        self.excluded_datasets = normalized_excluded
-        if self.included_datasets is not None:
-            normalized_included = tuple(
-                sorted(
-                    {
-                        str(item).strip()
-                        for item in self.included_datasets
-                        if str(item).strip()
-                    }
-                )
-            )
-            if not normalized_included:
-                raise ValueError("included_datasets must contain at least one dataset")
-            self.included_datasets = normalized_included
-        if self.pretrain_source_splits is not None:
-            normalized_splits = tuple(
-                sorted({str(item).strip().lower() for item in self.pretrain_source_splits if str(item).strip()})
-            )
-            self.pretrain_source_splits = normalized_splits or None
-        if self.pretrain_source_splits_by_dataset is not None:
-            normalized_by_dataset: dict[str, tuple[str, ...]] = {}
-            for dataset, source_splits in self.pretrain_source_splits_by_dataset.items():
-                dataset_name = str(dataset).strip()
-                normalized_dataset_splits = tuple(
-                    sorted(
-                        {
-                            str(item).strip().lower()
-                            for item in source_splits
-                            if str(item).strip()
-                        }
-                    )
-                )
-                if dataset_name and normalized_dataset_splits:
-                    normalized_by_dataset[dataset_name] = normalized_dataset_splits
-            self.pretrain_source_splits_by_dataset = normalized_by_dataset or None
+        self.signal_spec = SignalSpec.from_value(self.signal_spec)
+        self.dataset_plan = DatasetPlan.from_value(self.dataset_plan)
         if self.dataset_cache_roots is not None:
             normalized_cache_roots: dict[str, Path] = {}
             for dataset, cache_root in self.dataset_cache_roots.items():
@@ -116,18 +75,6 @@ class CacheAccessConfig:
             raise ValueError("segment_bins must be positive")
         if self.examples_per_shard <= 0:
             raise ValueError("examples_per_shard must be positive")
-        if self.feature_mode not in {"tx_only", "tx_sbp"}:
-            raise ValueError("feature_mode must be one of {'tx_only', 'tx_sbp'}")
-        if int(self.tx_dim) <= 0:
-            raise ValueError("tx_dim must be positive")
-        if self.feature_mode == "tx_only":
-            if self.sbp_dim is None:
-                self.sbp_dim = 0
-            if int(self.sbp_dim) < 0:
-                raise ValueError("sbp_dim must be non-negative when feature_mode='tx_only'")
-        else:
-            if self.sbp_dim is None or int(self.sbp_dim) <= 0:
-                raise ValueError("sbp_dim must be positive when feature_mode='tx_sbp'")
         if self.boundary_key_mode not in {"session", "subject_if_available"}:
             raise ValueError(
                 "boundary_key_mode must be one of {'session', 'subject_if_available'}"
@@ -139,9 +86,23 @@ class CacheAccessConfig:
 
     @property
     def full_dim(self) -> int:
-        if self.feature_mode == "tx_only":
-            return int(self.tx_dim)
-        return int(self.tx_dim + self.sbp_dim)
+        assert isinstance(self.signal_spec, SignalSpec)
+        return int(self.signal_spec.full_dim)
+
+    @property
+    def feature_mode(self) -> str:
+        assert isinstance(self.signal_spec, SignalSpec)
+        return self.signal_spec.mode
+
+    @property
+    def tx_dim(self) -> int:
+        assert isinstance(self.signal_spec, SignalSpec)
+        return int(self.signal_spec.tx_dim)
+
+    @property
+    def sbp_dim(self) -> int:
+        assert isinstance(self.signal_spec, SignalSpec)
+        return int(self.signal_spec.sbp_dim)
 
 
 @dataclass(frozen=True)
@@ -205,6 +166,11 @@ class CacheContext:
     @property
     def feature_mode(self) -> str:
         return str(self.config.feature_mode)
+
+    @property
+    def signal_spec(self) -> SignalSpec:
+        assert isinstance(self.config.signal_spec, SignalSpec)
+        return self.config.signal_spec
 
     @property
     def boundary_key_mode(self) -> str:
@@ -301,107 +267,30 @@ def _canonical_session_stats_dir(
     )
 
 
-def _normalize_dataset_names_for_stem(dataset_names: Sequence[str]) -> tuple[str, ...]:
-    normalized: list[str] = []
-    for item in dataset_names:
-        value = str(item).strip()
-        if not value:
-            continue
-        normalized.append(value.replace("/", "_"))
-    return tuple(sorted(dict.fromkeys(normalized)))
-
-
-def _canonical_session_stats_stem_from_included(
-    *,
-    dataset_names: Sequence[str],
-) -> str:
-    included = _normalize_dataset_names_for_stem(dataset_names)
-    if included:
-        joined = "_".join(included)
-        return f"ssl_pretrain_datasets_{joined}_v1"
-    return "ssl_pretrain_all_datasets_v1"
-
-
-def _legacy_canonical_session_stats_stem(
-    *,
-    excluded_datasets: Sequence[str],
-) -> str:
-    excluded = tuple(
-        sorted({str(item).strip() for item in excluded_datasets if str(item).strip()})
+def _session_stats_plan_stem(dataset_plan: DatasetPlan) -> str:
+    dataset_names = "_".join(
+        name.replace("/", "_") for name in dataset_plan.dataset_names
     )
-    if excluded:
-        joined = "_".join(item.replace("/", "_") for item in excluded)
-        return f"ssl_pretrain_excluding_{joined}_v1"
-    return "ssl_pretrain_all_datasets_v1"
-
-
-def _discover_included_dataset_names_for_stats(
-    *,
-    cache_root: str | Path,
-    excluded_datasets: Sequence[str],
-) -> tuple[str, ...]:
-    root = Path(cache_root)
-    if not root.exists():
-        return tuple()
-    excluded = {str(item).strip() for item in excluded_datasets if str(item).strip()}
-    discovered = [
-        path.name
-        for path in root.iterdir()
-        if path.is_dir() and (path / "metadata.json").exists() and path.name not in excluded
-    ]
-    return tuple(sorted(discovered))
+    plan_json = json.dumps(dataset_plan.to_dict(), sort_keys=True, separators=(",", ":"))
+    plan_hash = hashlib.sha256(plan_json.encode("utf-8")).hexdigest()[:10]
+    return f"ssl_pretrain_{dataset_names}_plan_{plan_hash}_v2"
 
 
 def resolve_precomputed_session_stats_path(
     *,
     cache_root: str | Path,
-    feature_mode: str,
+    signal_spec: SignalSpec | Mapping[str, Any],
+    dataset_plan: DatasetPlan | Mapping[str, Sequence[str]],
     boundary_key_mode: str,
-    excluded_datasets: Sequence[str],
-    included_datasets: Sequence[str] | None = None,
-) -> Path | None:
+) -> Path:
+    resolved_signal_spec = SignalSpec.from_value(signal_spec)
+    resolved_dataset_plan = DatasetPlan.from_value(dataset_plan)
     stats_dir = _canonical_session_stats_dir(
         cache_root=cache_root,
-        feature_mode=feature_mode,
+        feature_mode=resolved_signal_spec.mode,
         boundary_key_mode=boundary_key_mode,
     )
-    included_datasets = (
-        tuple(
-            sorted(
-                {
-                    str(item).strip()
-                    for item in included_datasets
-                    if str(item).strip()
-                }
-            )
-        )
-        if included_datasets is not None
-        else _discover_included_dataset_names_for_stats(
-            cache_root=cache_root,
-            excluded_datasets=excluded_datasets,
-        )
-    )
-    preferred_stem = canonical_stage1_stats_stem(
-        included_datasets=included_datasets,
-        excluded_datasets=excluded_datasets,
-        fallback_stem=_canonical_session_stats_stem_from_included(
-            dataset_names=included_datasets
-        ),
-    )
-    preferred_path = stats_dir / f"{preferred_stem}.pt"
-    if preferred_path.exists():
-        return preferred_path
-
-    legacy_path = stats_dir / (
-        f"{_legacy_canonical_session_stats_stem(excluded_datasets=excluded_datasets)}.pt"
-    )
-    if legacy_path.exists():
-        return legacy_path
-
-    discovered = sorted(stats_dir.glob("*.pt"))
-    if len(discovered) == 1:
-        return discovered[0]
-    return preferred_path
+    return stats_dir / f"{_session_stats_plan_stem(resolved_dataset_plan)}.pt"
 
 
 def _load_artifact_payload_and_sidecar(
@@ -480,18 +369,13 @@ def build_recompute_session_feature_stats_command(
     *,
     cache_root: str | Path,
     output_path: str | Path,
-    feature_mode: str,
+    signal_spec: SignalSpec | Mapping[str, Any],
+    dataset_plan: DatasetPlan | Mapping[str, Sequence[str]],
     boundary_key_mode: str,
-    tx_dim: int,
-    sbp_dim: int,
-    segment_bins: int,
-    examples_per_shard: int,
-    excluded_datasets: Sequence[str],
-    included_datasets: Sequence[str] | None = None,
-    pretrain_source_splits: Sequence[str] | None = None,
-    pretrain_source_splits_by_dataset: Mapping[str, Sequence[str]] | None = None,
     dataset_cache_roots: Mapping[str, str | Path] | None = None,
 ) -> str:
+    resolved_signal_spec = SignalSpec.from_value(signal_spec)
+    resolved_dataset_plan = DatasetPlan.from_value(dataset_plan)
     cmd = [
         "python",
         "analysis/active/ssl_experiments/ssl_core/scripts/recompute_session_feature_stats.py",
@@ -500,39 +384,28 @@ def build_recompute_session_feature_stats_command(
         "--output-path",
         str(Path(output_path)),
         "--feature-mode",
-        str(feature_mode),
+        str(resolved_signal_spec.mode),
         "--boundary-key-mode",
         str(boundary_key_mode),
         "--tx-dim",
-        str(int(tx_dim)),
+        str(int(resolved_signal_spec.tx_dim)),
         "--sbp-dim",
-        str(int(sbp_dim)),
-        "--segment-bins",
-        str(int(segment_bins)),
-        "--examples-per-shard",
-        str(int(examples_per_shard)),
+        str(int(resolved_signal_spec.sbp_dim)),
+        "--column-start",
+        str(int(resolved_signal_spec.column_start)),
+        "--missing-channel-policy",
+        str(resolved_signal_spec.missing_channel_policy),
     ]
-    for dataset in tuple(sorted({str(item).strip() for item in excluded_datasets if str(item).strip()})):
-        cmd.extend(["--excluded-dataset", str(dataset)])
-    for dataset in tuple(
-        sorted(
-            {
-                str(item).strip()
-                for item in (included_datasets or ())
-                if str(item).strip()
-            }
-        )
-    ):
-        cmd.extend(["--dataset", str(dataset)])
-    for source_split in tuple(sorted({str(item).strip().lower() for item in (pretrain_source_splits or ()) if str(item).strip()})):
-        cmd.extend(["--source-split", str(source_split)])
-    for dataset, source_splits in sorted((pretrain_source_splits_by_dataset or {}).items()):
-        for source_split in tuple(sorted({str(item).strip().lower() for item in source_splits if str(item).strip()})):
-            cmd.extend(["--dataset-source-split", f"{str(dataset)}={str(source_split)}"])
+    for selection in resolved_dataset_plan.datasets:
+        cmd.extend(["--dataset", selection.name])
+        for source_split in selection.source_splits:
+            cmd.extend(
+                ["--dataset-source-split", f"{selection.name}={source_split}"]
+            )
     for dataset, dataset_cache_root in sorted((dataset_cache_roots or {}).items()):
         cmd.extend(["--dataset-cache-root", f"{str(dataset)}={str(Path(dataset_cache_root))}"])
     cmd.append("--overwrite")
-    return " ".join(cmd)
+    return shlex.join(cmd)
 
 
 def _format_bytes(num_bytes: int) -> str:
@@ -662,20 +535,9 @@ def _pretrain_source_splits_for_dataset(
     config: CacheAccessConfig,
     dataset: str,
 ) -> tuple[str, ...] | None:
-    """Resolve the source-split filter for one dataset.
-
-    Dataset-specific filters take precedence over the legacy global filter.
-    This supports pooled experiments whose datasets expose different source
-    split names, such as Brain2Text24 ``competition_train`` versus Brain2Text25
-    ``train``/``val``.
-    """
-
-    by_dataset = config.pretrain_source_splits_by_dataset or {}
-    if str(dataset) in by_dataset:
-        return tuple(by_dataset[str(dataset)])
-    if config.pretrain_source_splits is None:
-        return None
-    return tuple(config.pretrain_source_splits)
+    assert isinstance(config.dataset_plan, DatasetPlan)
+    source_splits = config.dataset_plan.source_splits_by_dataset.get(str(dataset))
+    return tuple(source_splits) if source_splits else None
 
 
 def _load_copy_status(path: Path) -> dict[str, Any] | None:
@@ -847,11 +709,11 @@ class ShardStore:
             for name in ("tx", "sbp")
             if name in requested_modality_names
         )
-        if "tx" not in normalized_modalities:
-            raise ValueError("ShardStore modalities must include 'tx'")
         unsupported = requested_modality_names.difference({"tx", "sbp"})
         if unsupported:
             raise ValueError(f"Unsupported ShardStore modalities: {sorted(unsupported)}")
+        if not normalized_modalities:
+            raise ValueError("ShardStore modalities must include at least one of {'tx', 'sbp'}")
         self.modalities = normalized_modalities
         self._cache: OrderedDict[str, dict[str, np.ndarray | None | int]] = OrderedDict()
         self._cached_bytes = 0
@@ -904,7 +766,11 @@ class ShardStore:
         shard_path = self.dataset_cache_roots.get(dataset, self.cache_root) / relative_path
         shard = {
             "time_offsets": self._load_array(shard_path / "time_offsets.npy"),
-            "tx": self._load_array(shard_path / "tx.npy"),
+            "tx": (
+                self._load_array(shard_path / "tx.npy")
+                if "tx" in self.modalities
+                else None
+            ),
             "sbp": (
                 self._load_array(shard_path / "sbp.npy")
                 if "sbp" in self.modalities
@@ -914,6 +780,11 @@ class ShardStore:
         time_offsets = shard["time_offsets"]
         if time_offsets is None:
             raise FileNotFoundError(f"Missing time_offsets.npy for shard {shard_path}")
+        for modality in self.modalities:
+            if shard[modality] is None:
+                raise FileNotFoundError(
+                    f"Requested modality {modality!r} is missing from shard {shard_path}"
+                )
         shard["bytes"] = int(
             time_offsets.nbytes
             + (0 if shard["tx"] is None else shard["tx"].nbytes)
@@ -1075,6 +946,8 @@ def _compute_session_feature_stats(
     rows_by_dataset: dict[str, list[ExampleRow]],
     config: CacheAccessConfig,
 ) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
+    assert isinstance(config.signal_spec, SignalSpec)
+    feature_contract = config.signal_spec.contract
     print("computing SSL session-level featurewise z-scoring stats...")
     session_rows: dict[str, list[ExampleRow]] = defaultdict(list)
     for dataset, rows in rows_by_dataset.items():
@@ -1110,18 +983,37 @@ def _compute_session_feature_stats(
                 continue
 
             tx = shard["tx"]
-            if isinstance(tx, np.ndarray):
-                tx_window = np.asarray(tx[start:stop:bin_stride], dtype=np.float64)
-                tx_dim = min(tx_window.shape[1], config.tx_dim)
+            if feature_contract.uses_tx and isinstance(tx, np.ndarray):
+                tx_start, tx_stop = config.signal_spec.selected_columns_for_width(
+                    "tx", tx.shape[1]
+                )
+                tx_window = np.asarray(
+                    tx[start:stop:bin_stride, tx_start:tx_stop],
+                    dtype=np.float64,
+                )
+                tx_dim = min(tx_window.shape[1], int(config.tx_dim))
                 sum_x[:tx_dim] += tx_window[:, :tx_dim].sum(axis=0)
                 sum_x2[:tx_dim] += np.square(tx_window[:, :tx_dim]).sum(axis=0)
                 count_x[:tx_dim] += tx_window.shape[0]
 
             sbp = shard["sbp"]
-            if config.feature_mode == "tx_sbp" and isinstance(sbp, np.ndarray):
-                sbp_window = np.asarray(sbp[start:stop:bin_stride], dtype=np.float64)
-                sbp_dim = min(sbp_window.shape[1], config.sbp_dim)
-                sbp_slice = slice(config.tx_dim, config.tx_dim + sbp_dim)
+            if feature_contract.uses_sbp and isinstance(sbp, np.ndarray):
+                sbp_column_start, sbp_column_stop = (
+                    config.signal_spec.selected_columns_for_width("sbp", sbp.shape[1])
+                )
+                sbp_window = np.asarray(
+                    sbp[
+                        start:stop:bin_stride,
+                        sbp_column_start:sbp_column_stop,
+                    ],
+                    dtype=np.float64,
+                )
+                sbp_dim = min(sbp_window.shape[1], int(config.sbp_dim))
+                sbp_start = feature_contract.feature_start(
+                    "sbp",
+                    tx_dim=int(config.tx_dim),
+                )
+                sbp_slice = slice(sbp_start, sbp_start + sbp_dim)
                 sum_x[sbp_slice] += sbp_window[:, :sbp_dim].sum(axis=0)
                 sum_x2[sbp_slice] += np.square(sbp_window[:, :sbp_dim]).sum(axis=0)
                 count_x[sbp_slice] += sbp_window.shape[0]
@@ -1150,26 +1042,10 @@ def load_precomputed_session_feature_stats_into_cache_context(
     session_feature_stats, metadata, path = _load_precomputed_session_feature_stats(
         stats_path=stats_path,
         cache_root=cache_context.drive_cache_root,
-        expected_dim=int(cache_context.full_dim),
-        feature_mode=str(cache_context.feature_mode),
+        signal_spec=cache_context.signal_spec,
+        dataset_plan=cache_context.config.dataset_plan,
         boundary_key_mode=str(cache_context.boundary_key_mode),
-        excluded_datasets=tuple(
-            dataset
-            for dataset in cache_context.available_datasets
-            if dataset not in set(cache_context.pretrain_datasets)
-        ),
-        included_datasets=cache_context.config.included_datasets,
-        tx_dim=int(cache_context.tx_dim),
-        sbp_dim=int(cache_context.sbp_dim),
-        segment_bins=int(cache_context.config.segment_bins),
-        examples_per_shard=int(cache_context.config.examples_per_shard),
-        pretrain_source_splits=cache_context.config.pretrain_source_splits,
-        pretrain_source_splits_by_dataset=cache_context.config.pretrain_source_splits_by_dataset,
-        dataset_cache_roots=(
-            cache_context.drive_dataset_cache_roots
-            if cache_context.config.dataset_cache_roots
-            else None
-        ),
+        dataset_cache_roots=cache_context.drive_dataset_cache_roots,
     )
     cache_context.session_feature_stats = dict(session_feature_stats)
     return {
@@ -1185,40 +1061,27 @@ def _load_precomputed_session_feature_stats(
     *,
     stats_path: str | Path,
     cache_root: str | Path,
-    expected_dim: int,
-    feature_mode: str,
+    signal_spec: SignalSpec | Mapping[str, Any],
+    dataset_plan: DatasetPlan | Mapping[str, Sequence[str]],
     boundary_key_mode: str,
-    excluded_datasets: Sequence[str],
-    included_datasets: Sequence[str] | None = None,
-    tx_dim: int,
-    sbp_dim: int,
-    segment_bins: int,
-    examples_per_shard: int,
-    pretrain_source_splits: Sequence[str] | None = None,
-    pretrain_source_splits_by_dataset: Mapping[str, Sequence[str]] | None = None,
     dataset_cache_roots: Mapping[str, str | Path] | None = None,
 ) -> tuple[dict[str, tuple[torch.Tensor, torch.Tensor]], dict[str, Any], Path]:
+    resolved_signal_spec = SignalSpec.from_value(signal_spec)
+    resolved_dataset_plan = DatasetPlan.from_value(dataset_plan)
+    expected_dim = int(resolved_signal_spec.full_dim)
     path = Path(stats_path)
     canonical_path = resolve_precomputed_session_stats_path(
         cache_root=cache_root,
-        feature_mode=str(feature_mode),
+        signal_spec=resolved_signal_spec,
+        dataset_plan=resolved_dataset_plan,
         boundary_key_mode=str(boundary_key_mode),
-        excluded_datasets=excluded_datasets,
-        included_datasets=included_datasets,
     )
     recompute_cmd = build_recompute_session_feature_stats_command(
         cache_root=cache_root,
         output_path=canonical_path,
-        feature_mode=str(feature_mode),
+        signal_spec=resolved_signal_spec,
+        dataset_plan=resolved_dataset_plan,
         boundary_key_mode=str(boundary_key_mode),
-        tx_dim=int(tx_dim),
-        sbp_dim=int(sbp_dim),
-        segment_bins=int(segment_bins),
-        examples_per_shard=int(examples_per_shard),
-        excluded_datasets=excluded_datasets,
-        included_datasets=included_datasets,
-        pretrain_source_splits=pretrain_source_splits,
-        pretrain_source_splits_by_dataset=pretrain_source_splits_by_dataset,
         dataset_cache_roots=dataset_cache_roots,
     )
     payload, metadata, path, _ = _load_artifact_payload_and_sidecar(
@@ -1266,57 +1129,19 @@ def _load_precomputed_session_feature_stats(
         "source_cache_root": expected_cache_root,
         "source_cache_variant": expected_cache_variant,
         "source_cache_signature": expected_cache_signature,
-        "feature_mode": str(feature_mode),
-        "feature_policy": FEATURE_POLICY,
+        "signal_spec": resolved_signal_spec.to_dict(),
+        "dataset_plan": resolved_dataset_plan.to_dict(),
+        "boundary_key_mode": str(boundary_key_mode),
+        "session_stats_bin_stride": SESSION_STATS_BIN_STRIDE,
     }
     if normalized_dataset_cache_roots:
         common_metadata["source_cache_roots"] = {
             dataset: str(root.resolve())
             for dataset, root in normalized_dataset_cache_roots.items()
         }
-    session_metadata = {
-        "boundary_key_mode": str(boundary_key_mode),
-        "tx_dim": int(tx_dim),
-        "sbp_dim": int(sbp_dim),
-        "full_dim": int(expected_dim),
-        "excluded_datasets": list(
-            sorted({str(item).strip() for item in excluded_datasets if str(item).strip()})
-        ),
-    }
-    normalized_included_datasets = list(
-        sorted(
-            {
-                str(item).strip()
-                for item in (included_datasets or ())
-                if str(item).strip()
-            }
-        )
-    )
-    if normalized_included_datasets:
-        session_metadata["dataset_names"] = normalized_included_datasets
-    normalized_source_splits = tuple(
-        sorted({str(item).strip().lower() for item in (pretrain_source_splits or ()) if str(item).strip()})
-    )
-    if normalized_source_splits:
-        session_metadata["pretrain_source_splits"] = list(normalized_source_splits)
-    normalized_source_splits_by_dataset = {
-        str(dataset): list(
-            sorted({str(item).strip().lower() for item in source_splits if str(item).strip()})
-        )
-        for dataset, source_splits in sorted((pretrain_source_splits_by_dataset or {}).items())
-        if source_splits
-    }
-    if normalized_source_splits_by_dataset:
-        session_metadata["pretrain_source_splits_by_dataset"] = normalized_source_splits_by_dataset
     mismatches = _validate_common_artifact_metadata(
         metadata=metadata,
         expected_metadata=common_metadata,
-    )
-    mismatches.extend(
-        _validate_common_artifact_metadata(
-            metadata=metadata,
-            expected_metadata=session_metadata,
-        )
     )
     if mismatches:
         mismatch_text = "; ".join(mismatches)
@@ -1336,6 +1161,9 @@ def sample_base_segment(
     segment_bins: int,
     py_rng: random.Random,
 ) -> dict[str, Any]:
+    signal_spec = cache_context.config.signal_spec
+    assert isinstance(signal_spec, SignalSpec)
+    feature_contract = signal_spec.contract
     boundary_key = resolve_boundary_key(
         dataset=example.dataset,
         session_id=example.session_id,
@@ -1363,18 +1191,40 @@ def sample_base_segment(
     feature_mask = np.zeros((cache_context.full_dim,), dtype=np.float32)
 
     tx = shard["tx"]
-    if isinstance(tx, np.ndarray):
-        tx_window = np.asarray(tx[src_start:src_stop], dtype=np.float32)
+    if feature_contract.uses_tx and isinstance(tx, np.ndarray):
+        tx_column_start, tx_column_stop = signal_spec.selected_columns_for_width(
+            "tx", tx.shape[1]
+        )
+        tx_window = np.asarray(
+            tx[
+                src_start:src_stop,
+                tx_column_start:tx_column_stop,
+            ],
+            dtype=np.float32,
+        )
         tx_dim = min(tx_window.shape[1], cache_context.tx_dim)
         x_seq[:, :tx_dim] = tx_window[:, :tx_dim]
         feature_mask[:tx_dim] = 1.0
 
     sbp = shard["sbp"]
-    if cache_context.feature_mode == "tx_sbp" and isinstance(sbp, np.ndarray):
-        sbp_window = np.asarray(sbp[src_start:src_stop], dtype=np.float32)
+    if feature_contract.uses_sbp and isinstance(sbp, np.ndarray):
+        sbp_column_start, sbp_column_stop = signal_spec.selected_columns_for_width(
+            "sbp", sbp.shape[1]
+        )
+        sbp_window = np.asarray(
+            sbp[
+                src_start:src_stop,
+                sbp_column_start:sbp_column_stop,
+            ],
+            dtype=np.float32,
+        )
         sbp_dim = min(sbp_window.shape[1], cache_context.sbp_dim)
-        x_seq[:, cache_context.tx_dim : cache_context.tx_dim + sbp_dim] = sbp_window[:, :sbp_dim]
-        feature_mask[cache_context.tx_dim : cache_context.tx_dim + sbp_dim] = 1.0
+        sbp_start = feature_contract.feature_start(
+            "sbp",
+            tx_dim=int(cache_context.tx_dim),
+        )
+        x_seq[:, sbp_start : sbp_start + sbp_dim] = sbp_window[:, :sbp_dim]
+        feature_mask[sbp_start : sbp_start + sbp_dim] = 1.0
 
     x_seq_t = torch.from_numpy(x_seq)
     feature_mask_t = torch.from_numpy(feature_mask)
@@ -1584,6 +1434,51 @@ def build_segment_sampler(
     )
 
 
+def _preflight_cache_inputs(
+    *,
+    dataset_cache_roots: Mapping[str, Path],
+    config: CacheAccessConfig,
+) -> None:
+    """Validate the complete dataset/signal plan before copying or loading shards."""
+
+    assert isinstance(config.signal_spec, SignalSpec)
+    for dataset, cache_root in sorted(dataset_cache_roots.items()):
+        manifest_path = Path(cache_root) / dataset / "manifest.jsonl"
+        if not manifest_path.exists():
+            raise FileNotFoundError(f"Manifest missing for dataset {dataset}: {manifest_path}")
+        source_split_filter = _pretrain_source_splits_for_dataset(config, dataset)
+        allowed_splits = set(source_split_filter or ())
+        selected_rows = 0
+        with manifest_path.open() as handle:
+            for line in handle:
+                payload = json.loads(line)
+                source_split = str(payload.get("source_split", "")).strip().lower()
+                if allowed_splits and source_split not in allowed_splits:
+                    continue
+                selected_rows += 1
+                n_tx_features = int(payload.get("n_tx_features", 0) or 0)
+                n_sbp_features = int(payload.get("n_sbp_features", 0) or 0)
+                if not config.signal_spec.row_is_compatible(
+                    has_tx=bool(payload.get("has_tx", n_tx_features > 0)),
+                    has_sbp=bool(payload.get("has_sbp", n_sbp_features > 0)),
+                    n_tx_features=n_tx_features,
+                    n_sbp_features=n_sbp_features,
+                ):
+                    raise ValueError(
+                        "Dataset plan is incompatible with the selected signal before "
+                        "cache copying begins. "
+                        f"dataset={dataset!r}, source_split={source_split!r}, "
+                        f"example={payload.get('example_id')!r}, "
+                        f"signal_spec={config.signal_spec.to_dict()}, "
+                        f"n_tx_features={n_tx_features}, n_sbp_features={n_sbp_features}."
+                    )
+        if selected_rows == 0:
+            raise ValueError(
+                f"Dataset plan selected no manifest rows for {dataset!r}; "
+                f"requested source splits={sorted(allowed_splits)}"
+            )
+
+
 def prepare_cache_context(
     *,
     cache_candidates: Sequence[Path],
@@ -1606,44 +1501,31 @@ def prepare_cache_context(
         config.dataset_cache_roots,
     )
     available_datasets = sorted(all_drive_dataset_cache_roots)
-    if config.included_datasets is not None:
-        missing_included = sorted(
-            set(config.included_datasets).difference(available_datasets)
-        )
-        if missing_included:
-            raise FileNotFoundError(
-                "Explicitly included dataset(s) are unavailable: "
-                f"{missing_included}. Available datasets: {available_datasets}"
-            )
-        pretrain_datasets = list(config.included_datasets)
-    else:
-        pretrain_datasets = [
-            name
-            for name in available_datasets
-            if name not in set(config.excluded_datasets)
-        ]
-    effective_excluded_datasets = tuple(
-        dataset
-        for dataset in available_datasets
-        if dataset not in set(pretrain_datasets)
+    assert isinstance(config.dataset_plan, DatasetPlan)
+    missing_datasets = sorted(
+        set(config.dataset_plan.dataset_names).difference(available_datasets)
     )
+    if missing_datasets:
+        raise FileNotFoundError(
+            "Dataset plan contains unavailable dataset(s): "
+            f"{missing_datasets}. Available datasets: {available_datasets}"
+        )
+    pretrain_datasets = list(config.dataset_plan.dataset_names)
     drive_dataset_cache_roots = {
         dataset: all_drive_dataset_cache_roots[dataset]
         for dataset in pretrain_datasets
     }
-    if config.dataset_cache_roots:
-        source_signature = _compute_dataset_cache_source_signature(
-            drive_dataset_cache_roots
-        )
-        local_cache_name = f"{drive_cache_root.name}_mixed_{source_signature[:12]}"
-    else:
-        source_signature = _compute_cache_source_signature(drive_cache_root)
-        local_cache_name = drive_cache_root.name
+    _preflight_cache_inputs(
+        dataset_cache_roots=drive_dataset_cache_roots,
+        config=config,
+    )
+    source_signature = _compute_dataset_cache_source_signature(
+        drive_dataset_cache_roots
+    )
+    local_cache_name = f"{drive_cache_root.name}_plan_{source_signature[:12]}"
 
     local_cache_root = Path(config.local_cache_base) / local_cache_name
-    local_cache_status_path = local_cache_root.parent / f"{drive_cache_root.name}_copy_status.json"
-    if config.dataset_cache_roots:
-        local_cache_status_path = local_cache_root.parent / f"{local_cache_name}_copy_status.json"
+    local_cache_status_path = local_cache_root.parent / f"{local_cache_name}_copy_status.json"
 
     if config.force_recopy_local_cache and config.mode == "copy_to_local" and local_cache_root.exists():
         print("removing existing local cache:", local_cache_root)
@@ -1660,14 +1542,11 @@ def prepare_cache_context(
                 local_cache_root=local_cache_root,
                 source_signature=source_signature,
             )
-            and (
-                not config.dataset_cache_roots
-                or copy_status.get("source_cache_roots")
-                == {
-                    dataset: str(root)
-                    for dataset, root in sorted(drive_dataset_cache_roots.items())
-                }
-            )
+            and copy_status.get("source_cache_roots")
+            == {
+                dataset: str(root)
+                for dataset, root in sorted(drive_dataset_cache_roots.items())
+            }
         )
         if (not local_cache_root.exists()) or not copy_is_current:
             if local_cache_root.exists():
@@ -1681,22 +1560,16 @@ def prepare_cache_context(
             print("source signature:", source_signature[:12])
             print("dest  :", local_cache_root)
             t0 = time.time()
-            if config.dataset_cache_roots:
-                file_count = 0
-                total_bytes = 0
-                local_cache_root.mkdir(parents=True, exist_ok=True)
-                for dataset, source_root in sorted(drive_dataset_cache_roots.items()):
-                    copied_files, copied_bytes = copy_tree_with_progress(
-                        source_root / dataset,
-                        local_cache_root / dataset,
-                    )
-                    file_count += copied_files
-                    total_bytes += copied_bytes
-            else:
-                file_count, total_bytes = copy_tree_with_progress(
-                    drive_cache_root,
-                    local_cache_root,
+            file_count = 0
+            total_bytes = 0
+            local_cache_root.mkdir(parents=True, exist_ok=True)
+            for dataset, source_root in sorted(drive_dataset_cache_roots.items()):
+                copied_files, copied_bytes = copy_tree_with_progress(
+                    source_root / dataset,
+                    local_cache_root / dataset,
                 )
+                file_count += copied_files
+                total_bytes += copied_bytes
             _write_copy_status(
                 local_cache_status_path,
                 drive_cache_root=drive_cache_root,
@@ -1705,13 +1578,12 @@ def prepare_cache_context(
                 file_count=file_count,
                 total_bytes=total_bytes,
             )
-            if config.dataset_cache_roots:
-                status_payload = _load_copy_status(local_cache_status_path) or {}
-                status_payload["source_cache_roots"] = {
-                    dataset: str(root)
-                    for dataset, root in sorted(drive_dataset_cache_roots.items())
-                }
-                local_cache_status_path.write_text(json.dumps(status_payload, indent=2))
+            status_payload = _load_copy_status(local_cache_status_path) or {}
+            status_payload["source_cache_roots"] = {
+                dataset: str(root)
+                for dataset, root in sorted(drive_dataset_cache_roots.items())
+            }
+            local_cache_status_path.write_text(json.dumps(status_payload, indent=2))
             print(f"copy complete in {time.time() - t0:.1f}s")
         else:
             print("using existing local cache:", local_cache_root)
@@ -1768,21 +1640,6 @@ def prepare_cache_context(
                     )
                 )
         rows_by_dataset[dataset] = rows
-        if dataset == "brain2text24":
-            full_width_rows = [
-                row
-                for row in rows
-                if int(row.n_tx_features) > AREA6V_FEATURE_DIM
-                or int(row.n_sbp_features) > AREA6V_FEATURE_DIM
-            ]
-            if full_width_rows:
-                row = full_width_rows[0]
-                raise ValueError(
-                    "brain2text24 cache is still full-array width. Run "
-                    "analysis/active/ssl_experiments/ssl_core/scripts/trim_area6v_cache.py before training. "
-                    f"Example {row.shard_relpath}:{row.example_index} reports "
-                    f"n_tx_features={row.n_tx_features}, n_sbp_features={row.n_sbp_features}."
-                )
 
         session_ids = sorted({row.session_id for row in rows})
         if len(session_ids) < 2:
@@ -1818,8 +1675,8 @@ def prepare_cache_context(
     shard_store = ShardStore(
         cache_root,
         shard_cache_ram_gb,
-        modalities=("tx",) if config.feature_mode == "tx_only" else ("tx", "sbp"),
-        dataset_cache_roots=dataset_cache_roots if config.dataset_cache_roots else None,
+        modalities=config.signal_spec.modalities,
+        dataset_cache_roots=dataset_cache_roots,
     )
     has_val_datasets = any(
         session_split_summary[dataset]["val_examples"] > 0
@@ -1832,29 +1689,19 @@ def prepare_cache_context(
             if config.precomputed_session_stats_path is not None
             else resolve_precomputed_session_stats_path(
                 cache_root=drive_cache_root,
-                feature_mode=str(config.feature_mode),
+                signal_spec=config.signal_spec,
+                dataset_plan=config.dataset_plan,
                 boundary_key_mode=str(config.boundary_key_mode),
-                excluded_datasets=effective_excluded_datasets,
             )
         )
         session_feature_stats, _, stats_path = _load_precomputed_session_feature_stats(
             stats_path=resolved_stats_path,
             cache_root=drive_cache_root,
-            expected_dim=int(config.full_dim),
-            feature_mode=str(config.feature_mode),
+            signal_spec=config.signal_spec,
+            dataset_plan=config.dataset_plan,
             boundary_key_mode=str(config.boundary_key_mode),
-            excluded_datasets=effective_excluded_datasets,
-            included_datasets=config.included_datasets,
-            tx_dim=int(config.tx_dim),
-            sbp_dim=int(config.sbp_dim),
-            segment_bins=int(config.segment_bins),
-            examples_per_shard=int(config.examples_per_shard),
-            pretrain_source_splits=config.pretrain_source_splits,
-            pretrain_source_splits_by_dataset=config.pretrain_source_splits_by_dataset,
             dataset_cache_roots=(
                 drive_dataset_cache_roots
-                if config.dataset_cache_roots
-                else None
             ),
         )
         print(f"loaded precomputed SSL session-level featurewise z-scoring stats: {stats_path}")

@@ -15,7 +15,9 @@ from typing import Any
 import numpy as np
 import torch
 
-from masked_ssl.cache import (
+from ssl_core.experiment_contract import SignalSpec
+
+from ssl_core.cache import (
     CacheContext,
     build_segment_sampler,
     get_sampling_plan,
@@ -30,11 +32,11 @@ from .stage1_objectives import build_stage1_objective
 
 @dataclass
 class POSSMTrainingConfig:
+    signal_spec: SignalSpec | dict[str, Any]
     seed: int = 7
     model_family: str = "possm"
     stage: str = "stage1_reconstruction"
     data_mode: str = "normalized"
-    feature_mode: str = "tx_sbp"
     boundary_key_mode: str = "session"
     segment_bins: int = 80
     model_dim: int = 64
@@ -76,8 +78,7 @@ class POSSMTrainingConfig:
             raise ValueError("stage must be 'stage1_reconstruction'")
         if self.data_mode not in {"normalized", "raw"}:
             raise ValueError("data_mode must be one of {'normalized', 'raw'}")
-        if self.feature_mode not in {"tx_only", "tx_sbp"}:
-            raise ValueError("feature_mode must be one of {'tx_only', 'tx_sbp'}")
+        self.signal_spec = SignalSpec.from_value(self.signal_spec)
         if self.boundary_key_mode not in {"session", "subject_if_available"}:
             raise ValueError(
                 "boundary_key_mode must be one of {'session', 'subject_if_available'}"
@@ -148,6 +149,10 @@ class POSSMTrainingConfig:
         if int(self.examples_per_shard) <= 0 or int(self.log_every) <= 0:
             raise ValueError("examples_per_shard and log_every must be positive")
 
+    @property
+    def feature_mode(self) -> str:
+        return self.signal_spec.mode
+
 
 class RawSegmentBatchSampler:
     def __init__(
@@ -171,6 +176,9 @@ class RawSegmentBatchSampler:
         self.np_rng = np.random.default_rng(self.seed)
 
     def _sample_raw_segment(self, example: Any) -> dict[str, Any]:
+        signal_spec = self.cache_context.config.signal_spec
+        assert isinstance(signal_spec, SignalSpec)
+        feature_contract = signal_spec.contract
         boundary_key = resolve_boundary_key(
             dataset=example.dataset,
             session_id=example.session_id,
@@ -198,18 +206,40 @@ class RawSegmentBatchSampler:
         feature_mask = np.zeros((self.cache_context.full_dim,), dtype=np.float32)
 
         tx = shard["tx"]
-        if isinstance(tx, np.ndarray):
-            tx_window = np.asarray(tx[src_start:src_stop], dtype=np.float32)
+        if feature_contract.uses_tx and isinstance(tx, np.ndarray):
+            tx_column_start, tx_column_stop = signal_spec.selected_columns_for_width(
+                "tx", tx.shape[1]
+            )
+            tx_window = np.asarray(
+                tx[
+                    src_start:src_stop,
+                    tx_column_start:tx_column_stop,
+                ],
+                dtype=np.float32,
+            )
             tx_dim = min(tx_window.shape[1], self.cache_context.tx_dim)
             x_seq[:, :tx_dim] = tx_window[:, :tx_dim]
             feature_mask[:tx_dim] = 1.0
 
         sbp = shard["sbp"]
-        if self.cache_context.feature_mode == "tx_sbp" and isinstance(sbp, np.ndarray):
-            sbp_window = np.asarray(sbp[src_start:src_stop], dtype=np.float32)
+        if feature_contract.uses_sbp and isinstance(sbp, np.ndarray):
+            sbp_column_start, sbp_column_stop = signal_spec.selected_columns_for_width(
+                "sbp", sbp.shape[1]
+            )
+            sbp_window = np.asarray(
+                sbp[
+                    src_start:src_stop,
+                    sbp_column_start:sbp_column_stop,
+                ],
+                dtype=np.float32,
+            )
             sbp_dim = min(sbp_window.shape[1], self.cache_context.sbp_dim)
-            x_seq[:, self.cache_context.tx_dim : self.cache_context.tx_dim + sbp_dim] = sbp_window[:, :sbp_dim]
-            feature_mask[self.cache_context.tx_dim : self.cache_context.tx_dim + sbp_dim] = 1.0
+            sbp_start = feature_contract.feature_start(
+                "sbp",
+                tx_dim=int(self.cache_context.tx_dim),
+            )
+            x_seq[:, sbp_start : sbp_start + sbp_dim] = sbp_window[:, :sbp_dim]
+            feature_mask[sbp_start : sbp_start + sbp_dim] = 1.0
 
         x_seq_t = torch.from_numpy(x_seq)
         feature_mask_t = torch.from_numpy(feature_mask)
@@ -425,7 +455,7 @@ def _checkpoint_payload_step(path: Path) -> int | None:
     if parsed_step is not None:
         return int(parsed_step)
     try:
-        payload = torch.load(path, map_location="cpu")
+        payload = torch.load(path, map_location="cpu", weights_only=False)
     except Exception:
         return None
     if not isinstance(payload, dict):
@@ -563,43 +593,18 @@ def _serialize_config(
     *,
     cache_context: CacheContext,
 ) -> dict[str, Any]:
-    cache_root = getattr(cache_context, "cache_root", None)
-    pretrain_datasets = tuple(getattr(cache_context, "pretrain_datasets", ()) or ())
-    cache_config = getattr(cache_context, "config", None)
-    pretrain_source_splits = getattr(
-        cache_config,
-        "pretrain_source_splits",
-        None,
-    )
-    pretrain_source_splits_by_dataset = getattr(
-        cache_config,
-        "pretrain_source_splits_by_dataset",
-        None,
-    )
-    smoothing_provenance = (
-        None
-        if cache_root is None
-        else load_cache_smoothing_provenance(
-            cache_root,
-            dataset=(pretrain_datasets[0] if pretrain_datasets else None),
-        )
+    cache_root = cache_context.cache_root
+    pretrain_datasets = tuple(cache_context.pretrain_datasets)
+    smoothing_provenance = load_cache_smoothing_provenance(
+        cache_root,
+        dataset=(pretrain_datasets[0] if pretrain_datasets else None),
     )
     return {
         **asdict(config),
         "input_dim": int(cache_context.full_dim),
         "cache_use_normalization": bool(cache_context.use_normalization),
-        "pretrain_source_splits": list(pretrain_source_splits or ()),
-        "pretrain_source_splits_by_dataset": {
-            str(dataset): list(source_splits)
-            for dataset, source_splits in sorted(
-                (pretrain_source_splits_by_dataset or {}).items()
-            )
-        },
-        "cache_source_signature": (
-            None
-            if getattr(cache_context, "source_cache_signature", None) is None
-            else str(cache_context.source_cache_signature)
-        ),
+        "dataset_plan": cache_context.config.dataset_plan.to_dict(),
+        "cache_source_signature": str(cache_context.source_cache_signature),
         "cache_smoothing_provenance": smoothing_provenance,
         "cache_gaussian_smoothing_sigma_bins": (
             None
@@ -619,6 +624,9 @@ def _build_checkpoint_payload(
     best_step: int | None,
     checkpoint_kind: str,
     dataset_counter: Counter[str],
+    objective: Any,
+    train_sampler: Any,
+    val_sampler: Any,
     train_history: list[dict[str, Any]] | None = None,
     val_history: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
@@ -635,7 +643,77 @@ def _build_checkpoint_payload(
         "dataset_counts": dict(dataset_counter),
         "train_history": list(train_history or ()),
         "val_history": list(val_history or ()),
+        "rng_state": _capture_rng_state(),
+        "sampler_state": {
+            "train": _capture_sampler_state(train_sampler),
+            "val": _capture_sampler_state(val_sampler),
+        },
+        "objective_state": _capture_objective_state(objective),
     }
+
+
+def _capture_rng_state() -> dict[str, Any]:
+    state: dict[str, Any] = {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state["torch_cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def _restore_rng_state(state: dict[str, Any] | None) -> None:
+    if not state:
+        return
+    if state.get("python") is not None:
+        random.setstate(state["python"])
+    if state.get("numpy") is not None:
+        np.random.set_state(state["numpy"])
+    if state.get("torch") is not None:
+        torch.set_rng_state(state["torch"])
+    if torch.cuda.is_available() and state.get("torch_cuda") is not None:
+        torch.cuda.set_rng_state_all(state["torch_cuda"])
+
+
+def _capture_sampler_state(sampler: Any | None) -> dict[str, Any] | None:
+    if sampler is None:
+        return None
+    py_rng = getattr(sampler, "py_rng", None)
+    np_rng = getattr(sampler, "np_rng", None)
+    if py_rng is None or np_rng is None:
+        return None
+    return {
+        "python": py_rng.getstate(),
+        "numpy_bit_generator": np_rng.bit_generator.state,
+    }
+
+
+def _restore_sampler_state(sampler: Any | None, state: dict[str, Any] | None) -> None:
+    if sampler is None or not state:
+        return
+    py_rng = getattr(sampler, "py_rng", None)
+    np_rng = getattr(sampler, "np_rng", None)
+    if py_rng is None or np_rng is None:
+        raise TypeError("Checkpoint contains sampler state for an incompatible sampler.")
+    py_rng.setstate(state["python"])
+    np_rng.bit_generator.state = state["numpy_bit_generator"]
+
+
+def _capture_objective_state(objective: Any) -> dict[str, Any] | None:
+    generator = getattr(objective, "generator", None)
+    if generator is None:
+        return None
+    return {"torch_generator": generator.get_state()}
+
+
+def _restore_objective_state(objective: Any, state: dict[str, Any] | None) -> None:
+    if not state:
+        return
+    generator = getattr(objective, "generator", None)
+    if generator is None:
+        raise TypeError("Checkpoint contains objective RNG state for an incompatible objective.")
+    generator.set_state(state["torch_generator"])
 
 
 def compute_reconstruction_metrics(
@@ -704,24 +782,24 @@ def _build_model_from_config(config: dict[str, Any]) -> POSSMReconstructionModel
         ),
         ffn_hidden_size=int(config["ffn_hidden_size"]),
         dropout=float(config["dropout"]),
-        use_token_norm=bool(config.get("use_token_norm", True)),
-        temporal_backbone_type=str(config.get("temporal_backbone_type", "gru")),
+        use_token_norm=bool(config["use_token_norm"]),
+        temporal_backbone_type=str(config["temporal_backbone_type"]),
         temporal_gru_hidden_size=(
             None
             if config.get("temporal_gru_hidden_size") is None
             else int(config["temporal_gru_hidden_size"])
         ),
-        temporal_gru_num_layers=int(config.get("temporal_gru_num_layers", 1)),
-        temporal_gru_dropout=float(config.get("temporal_gru_dropout", 0.0)),
-        temporal_gru_bidirectional=bool(config.get("temporal_gru_bidirectional", False)),
-        temporal_backbone_kwargs=dict(config.get("temporal_backbone_kwargs", {})),
+        temporal_gru_num_layers=int(config["temporal_gru_num_layers"]),
+        temporal_gru_dropout=float(config["temporal_gru_dropout"]),
+        temporal_gru_bidirectional=bool(config["temporal_gru_bidirectional"]),
+        temporal_backbone_kwargs=dict(config["temporal_backbone_kwargs"]),
         reconstruction_head_type=str(config["reconstruction_head_type"]),
         reconstruction_mlp_hidden_size=(
             None
             if config.get("reconstruction_mlp_hidden_size") is None
             else int(config["reconstruction_mlp_hidden_size"])
         ),
-        feature_mode=str(config.get("feature_mode", "tx_sbp")),
+        signal_spec=SignalSpec.from_value(config["signal_spec"]),
     )
 
 
@@ -760,6 +838,7 @@ def _initial_run_state(
         "dataset_counts": {},
         "checkpoint_step": 0,
         "checkpoint_kind": None,
+        "resume_state_complete": True,
     }
 
 
@@ -904,6 +983,9 @@ def _train_loop(
                 best_step=best_step,
                 checkpoint_kind="step",
                 dataset_counter=dataset_counter,
+                objective=objective,
+                train_sampler=train_sampler,
+                val_sampler=val_sampler,
                 train_history=train_history,
                 val_history=val_history,
             )
@@ -928,6 +1010,9 @@ def _train_loop(
         best_step=best_step,
         checkpoint_kind="final",
         dataset_counter=dataset_counter,
+        objective=objective,
+        train_sampler=train_sampler,
+        val_sampler=val_sampler,
         train_history=train_history,
         val_history=val_history,
     )
@@ -968,10 +1053,10 @@ def run_possm_training(
     run_name: str | None = None,
 ) -> dict[str, Any]:
     _seed_training_run(int(config.seed))
-    if str(config.feature_mode) != str(cache_context.feature_mode):
+    if config.signal_spec != cache_context.signal_spec:
         raise ValueError(
-            "POSSMTrainingConfig.feature_mode must match CacheAccessConfig.feature_mode. "
-            f"config={config.feature_mode!r} cache={cache_context.feature_mode!r}"
+            "POSSMTrainingConfig.signal_spec must match CacheAccessConfig.signal_spec. "
+            f"config={config.signal_spec} cache={cache_context.signal_spec}"
         )
     if str(config.boundary_key_mode) != str(cache_context.boundary_key_mode):
         raise ValueError(
@@ -1020,7 +1105,7 @@ def run_possm_training(
         temporal_backbone_kwargs=dict(config.temporal_backbone_kwargs),
         reconstruction_head_type=str(config.reconstruction_head_type),
         reconstruction_mlp_hidden_size=config.reconstruction_mlp_hidden_size,
-        feature_mode=str(config.feature_mode),
+        signal_spec=config.signal_spec,
     ).to(device)
     optimizer = _build_optimizer(
         model,
@@ -1066,28 +1151,41 @@ def recover_possm_run_state_from_checkpoint(
     device: torch.device,
 ) -> dict[str, Any]:
     resolved_checkpoint_path = Path(checkpoint_path)
-    payload = torch.load(resolved_checkpoint_path, map_location="cpu")
+    payload = torch.load(resolved_checkpoint_path, map_location="cpu", weights_only=False)
     recovered_config = dict(payload.get("config", {}))
-    recovered_config.setdefault("stage1_objective_type", "plain_mse")
-    recovered_config.setdefault("masking_type", "none")
-    recovered_config.setdefault("mask_prob", 0.0)
-    recovered_config.setdefault("mask_span_bins", 8)
-    recovered_config.setdefault("mask_replace_mode", "zero")
-    recovered_config.setdefault("temporal_backbone_kwargs", {})
-    recovered_config.setdefault("checkpoint_keep_last", 2)
-    if str(payload.get("model_family", recovered_config.get("model_family", ""))) != "possm":
-        raise ValueError("Recovered checkpoint is not a POSSM checkpoint.")
-    if str(recovered_config.get("stage", payload.get("stage", ""))) != "stage1_reconstruction":
-        raise ValueError("Recovered checkpoint is not a POSSM stage-1 reconstruction checkpoint.")
-    if str(recovered_config["feature_mode"]) != str(cache_context.feature_mode):
+    required_config_fields = set(POSSMTrainingConfig.__dataclass_fields__) | {
+        "input_dim",
+        "cache_use_normalization",
+        "dataset_plan",
+    }
+    missing_fields = sorted(required_config_fields - set(recovered_config))
+    if missing_fields:
         raise ValueError(
-            "Recovered checkpoint feature_mode does not match the active cache context. "
-            f"checkpoint={recovered_config['feature_mode']!r} cache={cache_context.feature_mode!r}"
+            "POSSM Stage-1 checkpoint config is incomplete; missing required fields: "
+            + ", ".join(missing_fields)
         )
-    if str(recovered_config.get("boundary_key_mode", "session")) != str(cache_context.boundary_key_mode):
+    if str(payload.get("model_family", "")) != "possm":
+        raise ValueError("Recovered checkpoint is not a POSSM checkpoint.")
+    if str(payload.get("stage", "")) != "stage1_reconstruction":
+        raise ValueError("Recovered checkpoint is not a POSSM stage-1 reconstruction checkpoint.")
+    recovered_signal_spec = SignalSpec.from_value(recovered_config["signal_spec"])
+    if recovered_signal_spec != cache_context.signal_spec:
+        raise ValueError(
+            "Recovered checkpoint signal_spec does not match the active cache context. "
+            f"checkpoint={recovered_signal_spec.to_dict()} "
+            f"cache={cache_context.signal_spec.to_dict()}"
+        )
+    recovered_dataset_plan = recovered_config["dataset_plan"]
+    if recovered_dataset_plan != cache_context.config.dataset_plan.to_dict():
+        raise ValueError(
+            "Recovered checkpoint dataset_plan does not match the active cache context. "
+            f"checkpoint={recovered_dataset_plan} "
+            f"cache={cache_context.config.dataset_plan.to_dict()}"
+        )
+    if str(recovered_config["boundary_key_mode"]) != str(cache_context.boundary_key_mode):
         raise ValueError(
             "Recovered checkpoint boundary_key_mode does not match the active cache context. "
-            f"checkpoint={recovered_config.get('boundary_key_mode', 'session')!r} "
+            f"checkpoint={recovered_config['boundary_key_mode']!r} "
             f"cache={cache_context.boundary_key_mode!r}"
         )
     if int(recovered_config["input_dim"]) != int(cache_context.full_dim):
@@ -1095,8 +1193,8 @@ def recover_possm_run_state_from_checkpoint(
             "Recovered checkpoint input_dim does not match the active cache context. "
             f"checkpoint={int(recovered_config['input_dim'])} cache={int(cache_context.full_dim)}"
         )
-    recovered_use_normalization = bool(recovered_config.get("cache_use_normalization", True))
-    recovered_data_mode = str(recovered_config.get("data_mode", "normalized"))
+    recovered_use_normalization = bool(recovered_config["cache_use_normalization"])
+    recovered_data_mode = str(recovered_config["data_mode"])
     if recovered_data_mode == "normalized" and recovered_use_normalization != bool(cache_context.use_normalization):
         raise ValueError(
             "Recovered checkpoint cache normalization setting does not match the active cache context. "
@@ -1119,7 +1217,7 @@ def recover_possm_run_state_from_checkpoint(
         optimizer.load_state_dict(payload["optimizer_state"])
     objective = build_stage1_objective(
         config=recovered_config,
-        seed=int(recovered_config.get("seed", 7)),
+        seed=int(recovered_config["seed"]),
     )
 
     train_sampler = build_possm_segment_sampler(
@@ -1130,7 +1228,7 @@ def recover_possm_run_state_from_checkpoint(
         segment_bins=int(recovered_config["segment_bins"]),
         dataset_weight_alpha=float(recovered_config["dataset_weight_alpha"]),
         examples_per_shard=int(recovered_config["examples_per_shard"]),
-        data_mode=str(recovered_config.get("data_mode", "normalized")),
+        data_mode=str(recovered_config["data_mode"]),
     )
     try:
         val_sampler = build_possm_segment_sampler(
@@ -1141,10 +1239,20 @@ def recover_possm_run_state_from_checkpoint(
             segment_bins=int(recovered_config["segment_bins"]),
             dataset_weight_alpha=float(recovered_config["dataset_weight_alpha"]),
             examples_per_shard=int(recovered_config["examples_per_shard"]),
-            data_mode=str(recovered_config.get("data_mode", "normalized")),
+            data_mode=str(recovered_config["data_mode"]),
         )
     except RuntimeError:
         val_sampler = None
+    resume_state_complete = all(
+        field in payload
+        for field in ("rng_state", "sampler_state", "objective_state")
+    )
+    if resume_state_complete:
+        sampler_state = payload["sampler_state"]
+        _restore_sampler_state(train_sampler, sampler_state.get("train"))
+        _restore_sampler_state(val_sampler, sampler_state.get("val"))
+        _restore_objective_state(objective, payload.get("objective_state"))
+        _restore_rng_state(payload.get("rng_state"))
 
     run_dir = resolved_checkpoint_path.parent.parent if resolved_checkpoint_path.parent.name == "checkpoints" else resolved_checkpoint_path.parent
     progress_path = run_dir / "progress.jsonl"
@@ -1153,16 +1261,13 @@ def recover_possm_run_state_from_checkpoint(
     recovered_best_score = payload.get("best_score")
     recovered_best_step = payload.get("best_step")
     if best_checkpoint_path.exists():
-        best_payload = torch.load(best_checkpoint_path, map_location="cpu")
+        best_payload = torch.load(best_checkpoint_path, map_location="cpu", weights_only=False)
         best_config = dict(best_payload.get("config", {}))
-        best_config.setdefault("stage1_objective_type", "plain_mse")
-        best_config.setdefault("masking_type", "none")
-        best_config.setdefault("mask_prob", 0.0)
-        best_config.setdefault("mask_span_bins", 8)
-        best_config.setdefault("mask_replace_mode", "zero")
-        best_config.setdefault("temporal_backbone_kwargs", {})
-        best_config.setdefault("checkpoint_keep_last", 2)
-        if best_config != recovered_config:
+        best_compat_config = {key: value for key, value in best_config.items() if key != "num_steps"}
+        recovered_compat_config = {
+            key: value for key, value in recovered_config.items() if key != "num_steps"
+        }
+        if best_compat_config != recovered_compat_config:
             raise ValueError(
                 "Recovered best checkpoint config does not match the resume checkpoint config. "
                 f"best_checkpoint={best_checkpoint_path} resume_checkpoint={resolved_checkpoint_path}"
@@ -1216,6 +1321,7 @@ def recover_possm_run_state_from_checkpoint(
         "dataset_counts": dict(payload.get("dataset_counts", {})),
         "checkpoint_step": checkpoint_step,
         "checkpoint_kind": payload.get("checkpoint_kind"),
+        "resume_state_complete": bool(resume_state_complete),
     }
 
 
@@ -1230,6 +1336,16 @@ def resume_possm_training(
     additional_steps = int(additional_steps)
     if additional_steps < 0:
         raise ValueError("additional_steps must be non-negative")
+    if additional_steps > 0 and str(run_state.get("checkpoint_kind")) == "best":
+        raise ValueError(
+            "checkpoint_best.pt is an evaluation checkpoint, not a resumable training checkpoint. "
+            "Resume from checkpoint_final.pt or a checkpoint under checkpoints/."
+        )
+    if additional_steps > 0 and not bool(run_state.get("resume_state_complete", False)):
+        raise ValueError(
+            "This checkpoint predates exact RNG/sampler-state persistence and cannot be resumed "
+            "without changing the stochastic training trajectory."
+        )
     start_step = int(run_state.get("checkpoint_step", 0) or 0)
     target_step = start_step + additional_steps
     run_state["config"] = {**dict(run_state["config"]), "num_steps": int(target_step)}

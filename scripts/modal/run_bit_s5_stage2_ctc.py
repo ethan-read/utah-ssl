@@ -86,6 +86,10 @@ def run_stage2_ctc(
 
     from analysis.active.ssl_experiments.ssm_ssl.config import GenericSSMSSLConfig
     from analysis.active.ssl_experiments.ssm_ssl.training import run_ctc_finetuning
+    from analysis.active.ssl_experiments.ssl_core.experiment_contract import (
+        DatasetPlan,
+        SignalSpec,
+    )
 
     stage1_run_dir = REMOTE_OUTPUT_VOLUME_ROOT / stage1_output_subdir / stage1_run_name
     checkpoint_path = stage1_run_dir / "checkpoint_best.pt"
@@ -98,18 +102,18 @@ def run_stage2_ctc(
         backbone_type="s5",
         input_mode="temporal_patch",
         dataset="brain2text24",
-        feature_mode="tx_only",
+        dataset_plan=DatasetPlan.from_mapping(
+            {"brain2text24": ("competition_train",)}
+        ),
+        signal_spec=SignalSpec.tx_only(tx_dim=256),
         boundary_key_mode="session",
         cache_root=str(cache_root),
         cache_mode="drive_direct",
         local_cache_base="/tmp/utah_ssl_cache",
-        excluded_datasets=("brain2text25",),
         use_normalization=True,
         precomputed_session_stats_path=None,
         precomputed_split_stats_path=None,
         normalization_mode="global",
-        tx_dim=256,
-        sbp_dim=0,
         segment_bins=256,
         batch_size=int(batch_size),
         ssl_steps=1,

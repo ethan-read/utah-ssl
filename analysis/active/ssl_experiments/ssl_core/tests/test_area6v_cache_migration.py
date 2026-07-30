@@ -16,6 +16,7 @@ for path in (REPO_ROOT, EXPERIMENTS_DIR):
         sys.path.insert(0, path_str)
 
 from ssl_core.scripts.trim_area6v_cache import trim_area6v_cache
+from ssl_core.experiment_contract import SignalSpec
 from masked_ssl.probe import CanonicalShardAccessor, build_competition_split_problem
 
 
@@ -107,14 +108,30 @@ class Area6vCacheMigrationTests(unittest.TestCase):
 
             problem = build_competition_split_problem(
                 cache_root=cache_root,
+                signal_spec=SignalSpec.tx_sbp(tx_dim=128, sbp_dim=128),
                 dataset="brain2text24",
-                feature_mode="tx_sbp",
             )
             accessor = CanonicalShardAccessor(cache_root)
-            x_tx = accessor.load_features(problem["train_rows"][0], feature_mode="tx_only")
-            x_tx_sbp = accessor.load_features(problem["train_rows"][0], feature_mode="tx_sbp")
+            x_tx = accessor.load_features(
+                problem["train_rows"][0],
+                signal_spec=SignalSpec.tx_only(tx_dim=128),
+            )
+            x_tx_sbp = accessor.load_features(
+                problem["train_rows"][0],
+                signal_spec=SignalSpec.tx_sbp(tx_dim=128, sbp_dim=128),
+            )
             self.assertEqual(x_tx.shape, (10, 128))
             self.assertEqual(x_tx_sbp.shape, (10, 256))
+
+            sbp_accessor = CanonicalShardAccessor(cache_root)
+            x_sbp = sbp_accessor.load_features(
+                problem["train_rows"][0],
+                signal_spec=SignalSpec.sbp_only(sbp_dim=128),
+            )
+            cached_shard = next(iter(sbp_accessor._shards.values()))
+            self.assertEqual(x_sbp.shape, (10, 128))
+            self.assertIsNone(cached_shard["tx"])
+            self.assertIsNotNone(cached_shard["sbp"])
 
     def test_second_run_is_idempotent_for_arrays(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

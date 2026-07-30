@@ -19,7 +19,17 @@ def _ensure_repo_import_paths() -> None:
 
 _ensure_repo_import_paths()
 
-from masked_ssl.cache import (
+from ssl_core.experiment_contract import (
+    DatasetPlan,
+    ExperimentRecipe,
+    SignalSpec,
+)
+from ssl_core.feature_contract import (
+    FeatureContract,
+    SUPPORTED_FEATURE_MODES,
+    resolve_feature_contract,
+)
+from ssl_core.cache import (
     CacheAccessConfig,
     CacheContext,
     load_precomputed_session_feature_stats_into_cache_context,
@@ -51,6 +61,14 @@ from .reporting import (
     run_possm_stage2_prediction_diagnostics,
     summarize_possm_stage2_progress,
 )
+from .recipes import (
+    POSSM_B2T24_B2T25_SBP,
+    POSSM_B2T24_SBP,
+    POSSM_BROAD_TX,
+    POSSM_RECIPES,
+    get_possm_recipe,
+    possm_single_dataset_plan,
+)
 from .training import (
     POSSMTrainingConfig,
     build_possm_segment_sampler,
@@ -67,18 +85,29 @@ from .training import (
 __all__ = [
     "CacheAccessConfig",
     "CacheContext",
+    "DatasetPlan",
+    "ExperimentRecipe",
+    "FeatureContract",
     "POSSMEncoder",
     "POSSMFinetuneConfig",
     "POSSMPhonemeModel",
     "POSSMReconstructionModel",
     "POSSMTrainingConfig",
+    "POSSM_B2T24_B2T25_SBP",
+    "POSSM_B2T24_SBP",
+    "POSSM_BROAD_TX",
+    "POSSM_RECIPES",
     "SessionInputAdapterBank",
+    "SignalSpec",
+    "SUPPORTED_FEATURE_MODES",
     "build_possm_segment_sampler",
     "display_possm_stage1_report",
     "display_possm_stage2_report",
     "display_possm_stage2_summary",
     "find_latest_possm_stage2_run_dir",
     "find_latest_possm_step_checkpoint",
+    "get_possm_recipe",
+    "possm_single_dataset_plan",
     "list_possm_checkpoints",
     "list_registered_temporal_backbones",
     "load_precomputed_session_feature_stats_into_cache_context",
@@ -90,6 +119,7 @@ __all__ = [
     "recover_possm_stage2_summary",
     "resolve_latest_possm_checkpoint_path",
     "resolve_possm_checkpoint_path",
+    "resolve_feature_contract",
     "resume_possm_training",
     "run_possm_stage1_prediction_diagnostics",
     "run_possm_stage2_prediction_diagnostics",

@@ -164,7 +164,7 @@ class CacheAuditTests(unittest.TestCase):
             self.assertIn("no_manifest_rows_support_segment_bins_80", ds["findings"])
             self.assertFalse(ds["feature_mode_audits"]["tx_only"]["train_sampling_ok"])
 
-    def test_128_dim_stats_flagged_tx_only_only(self) -> None:
+    def test_128_dim_stats_report_exact_tx_signal(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
             raw_root = tmp / "cache"
@@ -180,7 +180,7 @@ class CacheAuditTests(unittest.TestCase):
             stats = report["stats_audits"][0]
             self.assertTrue(stats["compatible_feature_modes"]["tx_only"])
             self.assertFalse(stats["compatible_feature_modes"]["tx_sbp"])
-            self.assertIn("tx_only_only_not_tx_sbp", stats["findings"])
+            self.assertIn("stats_signal_mode:tx_only", stats["findings"])
 
     def test_256_dim_stats_can_be_tx_only_for_bit_stage1(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

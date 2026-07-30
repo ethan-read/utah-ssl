@@ -93,8 +93,8 @@ def evaluate_checkpoint(
     dataset = CanonicalSequenceDataset(
         rows,
         cache_root=Path(problem["cache_root"]),
+        signal_spec=problem["signal_spec"],
         stats=stats,
-        feature_mode=str(problem["feature_mode"]),
         boundary_key_mode=str(problem["boundary_key_mode"]),
         dataset=str(problem["dataset"]),
     )

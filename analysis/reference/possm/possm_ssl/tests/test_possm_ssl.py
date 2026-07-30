@@ -21,6 +21,7 @@ for path in (REPO_ROOT, EXPERIMENTS_DIR, POSSM_DIR):
         sys.path.insert(0, path_str)
 
 from masked_ssl.cache import _compute_cache_source_signature
+from ssl_core.experiment_contract import DatasetPlan, SignalSpec
 from ssl_core.scripts.recompute_split_feature_stats import (
     resolve_precomputed_split_stats_path as resolve_canonical_split_stats_path,
 )
@@ -77,6 +78,10 @@ class _DummyShardStore:
 
 
 def _make_sampling_cache_context() -> SimpleNamespace:
+    cache_root = Path(tempfile.mkdtemp(prefix="possm_test_cache_"))
+    dataset_root = cache_root / "brain2text24"
+    dataset_root.mkdir()
+    (dataset_root / "metadata.json").write_text("{}\n")
     tx = np.array(
         [
             [1.0, 0.0, 0.0],
@@ -133,6 +138,13 @@ def _make_sampling_cache_context() -> SimpleNamespace:
         has_sbp=True,
     )
     return SimpleNamespace(
+        cache_root=cache_root,
+        source_cache_signature="synthetic-test-signature",
+        config=SimpleNamespace(
+            signal_spec=SignalSpec.tx_sbp(tx_dim=3, sbp_dim=2),
+            dataset_plan=DatasetPlan.from_mapping({"brain2text24": ()}),
+        ),
+        signal_spec=SignalSpec.tx_sbp(tx_dim=3, sbp_dim=2),
         full_dim=5,
         tx_dim=3,
         sbp_dim=2,
@@ -300,22 +312,26 @@ def _write_tiny_canonical_probe_cache(cache_root: Path) -> None:
         },
     }
     (dataset_root / "metadata.json").write_text(json.dumps(metadata))
-    for feature_mode, dim in (("tx_sbp", 5), ("tx_only", 3)):
+    for signal_spec in (
+        SignalSpec.tx_sbp(tx_dim=3, sbp_dim=2),
+        SignalSpec.tx_only(tx_dim=3),
+        SignalSpec.sbp_only(sbp_dim=2),
+    ):
         _write_valid_split_stats_artifact(
             cache_root=cache_root,
             stats_path=resolve_canonical_split_stats_path(
                 cache_root=cache_root,
                 dataset="brain2text24",
                 train_split_name="competition_train",
-                feature_mode=feature_mode,
+                signal_spec=signal_spec,
                 preferred_path=None,
             ),
             dataset="brain2text24",
-            feature_mode=feature_mode,
+            signal_spec=signal_spec,
             boundary_key_mode="session",
+            split_policy="competition_train_test",
             train_split_name="competition_train",
             val_split_name="competition_test",
-            dim=dim,
         )
 
 
@@ -326,9 +342,20 @@ def _make_stage1_checkpoint(
     temporal_gru_hidden_size: int | None = None,
     temporal_backbone_kwargs: dict[str, object] | None = None,
     use_token_norm: bool = True,
+    feature_mode: str = "tx_sbp",
 ) -> Path:
+    input_dim = {
+        "tx_only": 3,
+        "sbp_only": 2,
+        "tx_sbp": 5,
+    }[feature_mode]
+    signal_spec = {
+        "tx_only": SignalSpec.tx_only(tx_dim=3),
+        "sbp_only": SignalSpec.sbp_only(sbp_dim=2),
+        "tx_sbp": SignalSpec.tx_sbp(tx_dim=3, sbp_dim=2),
+    }[feature_mode]
     model = POSSMReconstructionModel(
-        input_dim=5,
+        input_dim=input_dim,
         model_dim=4,
         latent_count=4,
         ffn_hidden_size=16,
@@ -338,7 +365,7 @@ def _make_stage1_checkpoint(
         temporal_gru_hidden_size=temporal_gru_hidden_size,
         temporal_backbone_kwargs=temporal_backbone_kwargs,
         reconstruction_head_type="linear",
-        feature_mode="tx_sbp",
+        signal_spec=signal_spec,
     )
     checkpoint_path = tmp_path / "checkpoint_final.pt"
     torch.save(
@@ -350,9 +377,11 @@ def _make_stage1_checkpoint(
                 "model_family": "possm",
                 "stage": "stage1_reconstruction",
                 "data_mode": "normalized",
-                "feature_mode": "tx_sbp",
+                "feature_mode": feature_mode,
+                "signal_spec": signal_spec.to_dict(),
+                "dataset_plan": {"brain2text24": []},
                 "boundary_key_mode": "session",
-                "input_dim": 5,
+                "input_dim": input_dim,
                 "model_dim": 4,
                 "latent_count": 4,
                 "value_encoder_type": "linear",
@@ -394,12 +423,12 @@ def _make_stage1_checkpoint(
 def _make_legacy_stage1_checkpoint_without_objective_fields(tmp_path: Path) -> Path:
     model = POSSMReconstructionModel(
         input_dim=5,
+        signal_spec=SignalSpec.tx_sbp(tx_dim=3, sbp_dim=2),
         model_dim=4,
         latent_count=4,
         ffn_hidden_size=16,
         dropout=0.0,
         reconstruction_head_type="linear",
-        feature_mode="tx_sbp",
     )
     checkpoint_path = tmp_path / "checkpoint_legacy.pt"
     torch.save(
@@ -412,6 +441,8 @@ def _make_legacy_stage1_checkpoint_without_objective_fields(tmp_path: Path) -> P
                 "stage": "stage1_reconstruction",
                 "data_mode": "normalized",
                 "feature_mode": "tx_sbp",
+                "signal_spec": SignalSpec.tx_sbp(tx_dim=3, sbp_dim=2).to_dict(),
+                "dataset_plan": {"brain2text24": []},
                 "boundary_key_mode": "session",
                 "input_dim": 5,
                 "model_dim": 4,
@@ -448,13 +479,13 @@ def _make_legacy_stage1_checkpoint_without_objective_fields(tmp_path: Path) -> P
 def _make_legacy_stage1_checkpoint_without_temporal_backbone(tmp_path: Path) -> Path:
     model = POSSMReconstructionModel(
         input_dim=5,
+        signal_spec=SignalSpec.tx_sbp(tx_dim=3, sbp_dim=2),
         model_dim=4,
         latent_count=4,
         ffn_hidden_size=16,
         dropout=0.0,
         temporal_backbone_type="identity",
         reconstruction_head_type="linear",
-        feature_mode="tx_sbp",
     )
     checkpoint_path = tmp_path / "checkpoint_legacy_no_temporal.pt"
     model_state = {
@@ -470,6 +501,8 @@ def _make_legacy_stage1_checkpoint_without_temporal_backbone(tmp_path: Path) -> 
                 "stage": "stage1_reconstruction",
                 "data_mode": "normalized",
                 "feature_mode": "tx_sbp",
+                "signal_spec": SignalSpec.tx_sbp(tx_dim=3, sbp_dim=2).to_dict(),
+                "dataset_plan": {"brain2text24": []},
                 "boundary_key_mode": "session",
                 "input_dim": 5,
                 "model_dim": 4,
@@ -572,7 +605,7 @@ class POSSMSSLTests(unittest.TestCase):
             run_state = run_possm_training(
                 cache_context=cache_context,
                 config=POSSMTrainingConfig(
-                    feature_mode="tx_sbp",
+                    signal_spec=SignalSpec.tx_sbp(tx_dim=3, sbp_dim=2),
                     data_mode="normalized",
                     segment_bins=4,
                     model_dim=4,
@@ -603,7 +636,7 @@ class POSSMSSLTests(unittest.TestCase):
             model_dim=4,
             latent_count=4,
             dropout=0.0,
-            feature_mode="tx_sbp",
+            signal_spec=SignalSpec.tx_sbp(tx_dim=3, sbp_dim=2),
         )
         x = torch.randn(2, 6, 5)
         lengths = torch.tensor([6, 4], dtype=torch.long)
@@ -620,7 +653,7 @@ class POSSMSSLTests(unittest.TestCase):
             latent_count=4,
             dropout=0.0,
             temporal_backbone_type="identity",
-            feature_mode="tx_sbp",
+            signal_spec=SignalSpec.tx_sbp(tx_dim=3, sbp_dim=2),
         )
         x = torch.randn(1, 6, 5)
         lengths = torch.tensor([6], dtype=torch.long)
@@ -640,7 +673,7 @@ class POSSMSSLTests(unittest.TestCase):
             temporal_gru_num_layers=1,
             temporal_gru_dropout=0.0,
             temporal_gru_bidirectional=True,
-            feature_mode="tx_sbp",
+            signal_spec=SignalSpec.tx_sbp(tx_dim=3, sbp_dim=2),
         )
         x = torch.randn(2, 6, 5)
         lengths = torch.tensor([6, 4], dtype=torch.long)
@@ -656,7 +689,7 @@ class POSSMSSLTests(unittest.TestCase):
             model_dim=4,
             latent_count=4,
             dropout=0.0,
-            feature_mode="tx_sbp",
+            signal_spec=SignalSpec.tx_sbp(tx_dim=3, sbp_dim=2),
         )
         batch = {
             "x": torch.randn(2, 6, 5),
@@ -783,10 +816,21 @@ class POSSMSSLTests(unittest.TestCase):
     def test_masked_training_config_rejects_zero_mask_setup(self) -> None:
         with self.assertRaises(ValueError):
             POSSMTrainingConfig(
+                signal_spec=SignalSpec.tx_sbp(tx_dim=3, sbp_dim=2),
                 stage1_objective_type="masked_mse",
                 masking_type="none",
                 mask_prob=0.0,
             )
+
+    def test_sbp_only_configs_are_supported(self) -> None:
+        stage1 = POSSMTrainingConfig(signal_spec=SignalSpec.sbp_only(sbp_dim=2))
+        stage2 = POSSMFinetuneConfig(signal_spec=SignalSpec.sbp_only(sbp_dim=2))
+        self.assertEqual(stage1.feature_mode, "sbp_only")
+        self.assertEqual(stage2.feature_mode, "sbp_only")
+
+    def test_stage1_signal_is_explicit(self) -> None:
+        with self.assertRaises(TypeError):
+            POSSMTrainingConfig()
 
     def test_custom_temporal_backbone_registration_flows_through_config_and_model(self) -> None:
         class ToyBackbone(torch.nn.Module):
@@ -801,6 +845,7 @@ class POSSMSSLTests(unittest.TestCase):
 
         register_temporal_backbone("toy_scale", ToyBackbone)
         config = POSSMTrainingConfig(
+            signal_spec=SignalSpec.tx_sbp(tx_dim=3, sbp_dim=2),
             temporal_backbone_type="toy_scale",
             temporal_backbone_kwargs={"scale": 2.0},
         )
@@ -812,7 +857,7 @@ class POSSMSSLTests(unittest.TestCase):
             dropout=0.0,
             temporal_backbone_type="toy_scale",
             temporal_backbone_kwargs={"scale": 2.0},
-            feature_mode="tx_sbp",
+            signal_spec=SignalSpec.tx_sbp(tx_dim=3, sbp_dim=2),
         )
         outputs = model(torch.randn(1, 4, 5), torch.tensor([4], dtype=torch.long))
         self.assertEqual(tuple(outputs["reconstruction"].shape), (1, 4, 5))
@@ -823,7 +868,7 @@ class POSSMSSLTests(unittest.TestCase):
             model_dim=4,
             latent_count=4,
             dropout=0.0,
-            feature_mode="tx_sbp",
+            signal_spec=SignalSpec.tx_sbp(tx_dim=3, sbp_dim=2),
         )
         x = torch.zeros(1, 3, 5)
         lengths = torch.tensor([3], dtype=torch.long)
@@ -921,14 +966,11 @@ class POSSMSSLTests(unittest.TestCase):
         self.assertEqual(int(temporal_backbone.output_size), 7)
         self.assertEqual(checkpoint_cfg["temporal_backbone_type"], "gru")
 
-    def test_recover_stage1_sequence_components_legacy_checkpoint_uses_identity_backbone(self) -> None:
+    def test_recover_stage1_sequence_components_rejects_incomplete_checkpoint(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             checkpoint_path = _make_legacy_stage1_checkpoint_without_temporal_backbone(Path(tmpdir))
-            _, temporal_backbone, checkpoint_cfg, _ = recover_possm_stage1_sequence_components(
-                checkpoint_path=checkpoint_path
-            )
-        self.assertEqual(int(temporal_backbone.output_size), 16)
-        self.assertNotIn("temporal_backbone_type", checkpoint_cfg)
+            with self.assertRaisesRegex(ValueError, "missing required fields"):
+                recover_possm_stage1_sequence_components(checkpoint_path=checkpoint_path)
 
     def test_recover_stage1_sequence_components_raises_on_missing_declared_temporal_weights(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -942,7 +984,7 @@ class POSSMSSLTests(unittest.TestCase):
             run_state = run_possm_training(
                 cache_context=cache_context,
                 config=POSSMTrainingConfig(
-                    feature_mode="tx_sbp",
+                    signal_spec=SignalSpec.tx_sbp(tx_dim=3, sbp_dim=2),
                     data_mode="normalized",
                     segment_bins=4,
                     model_dim=4,
@@ -961,26 +1003,36 @@ class POSSMSSLTests(unittest.TestCase):
             )
             self.assertTrue(Path(run_state["checkpoint_path"]).exists())
             self.assertTrue(any(Path(run_state["checkpoints_dir"]).glob("step_*.pt")))
+            checkpoint_payload = torch.load(
+                run_state["checkpoint_path"],
+                map_location="cpu",
+                weights_only=False,
+            )
+            self.assertIn("rng_state", checkpoint_payload)
+            self.assertIn("sampler_state", checkpoint_payload)
+            self.assertIn("objective_state", checkpoint_payload)
             recovered = recover_possm_run_state_from_checkpoint(
                 cache_context=cache_context,
                 checkpoint_path=run_state["checkpoint_path"],
                 device=torch.device("cpu"),
             )
+            expected_next_batch = run_state["train_sampler"].sample_batch()
+            recovered_next_batch = recovered["train_sampler"].sample_batch()
         self.assertEqual(recovered["checkpoint_step"], 2)
         self.assertEqual(recovered["model"].feature_mode, "tx_sbp")
         self.assertEqual(recovered["train_sampler"].split_name, "train")
+        self.assertTrue(recovered["resume_state_complete"])
+        torch.testing.assert_close(expected_next_batch["x"], recovered_next_batch["x"])
 
-    def test_recover_legacy_checkpoint_injects_objective_defaults(self) -> None:
+    def test_resume_rejects_incomplete_stage1_checkpoint(self) -> None:
         cache_context = _make_sampling_cache_context()
         with tempfile.TemporaryDirectory() as tmpdir:
-            recovered = recover_possm_run_state_from_checkpoint(
-                cache_context=cache_context,
-                checkpoint_path=_make_legacy_stage1_checkpoint_without_objective_fields(Path(tmpdir)),
-                device=torch.device("cpu"),
-            )
-        self.assertEqual(recovered["config"]["stage1_objective_type"], "plain_mse")
-        self.assertEqual(recovered["config"]["masking_type"], "none")
-        self.assertAlmostEqual(float(recovered["config"]["mask_prob"]), 0.0, places=8)
+            with self.assertRaisesRegex(ValueError, "missing required fields"):
+                recover_possm_run_state_from_checkpoint(
+                    cache_context=cache_context,
+                    checkpoint_path=_make_legacy_stage1_checkpoint_without_objective_fields(Path(tmpdir)),
+                    device=torch.device("cpu"),
+                )
 
     def test_run_possm_training_raw_smoke(self) -> None:
         cache_context = _make_sampling_cache_context()
@@ -988,7 +1040,7 @@ class POSSMSSLTests(unittest.TestCase):
             run_state = run_possm_training(
                 cache_context=cache_context,
                 config=POSSMTrainingConfig(
-                    feature_mode="tx_sbp",
+                    signal_spec=SignalSpec.tx_sbp(tx_dim=3, sbp_dim=2),
                     data_mode="raw",
                     segment_bins=4,
                     model_dim=4,
@@ -1390,7 +1442,7 @@ class POSSMSSLTests(unittest.TestCase):
                     seed=7,
                     mode="probe_frozen",
                     dataset="brain2text24",
-                    feature_mode="tx_sbp",
+                    signal_spec=SignalSpec.tx_sbp(tx_dim=3, sbp_dim=2),
                     data_mode="normalized",
                     batch_size=1,
                     num_steps=2,
@@ -1466,7 +1518,7 @@ class POSSMSSLTests(unittest.TestCase):
                     seed=7,
                     mode="probe_frozen",
                     dataset="brain2text24",
-                    feature_mode="tx_sbp",
+                    signal_spec=SignalSpec.tx_sbp(tx_dim=3, sbp_dim=2),
                     data_mode="normalized",
                     batch_size=1,
                     num_steps=1,
@@ -1516,11 +1568,11 @@ class POSSMSSLTests(unittest.TestCase):
                 cache_root=cache_root,
                 stats_path=stats_path,
                 dataset="brain2text24",
-                feature_mode="tx_sbp",
+                signal_spec=SignalSpec.tx_sbp(tx_dim=3, sbp_dim=2),
                 boundary_key_mode="session",
+                split_policy="competition_train_test",
                 train_split_name="competition_train",
                 val_split_name="competition_test",
-                dim=5,
             )
 
             with mock.patch(
@@ -1534,7 +1586,7 @@ class POSSMSSLTests(unittest.TestCase):
                         seed=7,
                         mode="probe_frozen",
                         dataset="brain2text24",
-                        feature_mode="tx_sbp",
+                        signal_spec=SignalSpec.tx_sbp(tx_dim=3, sbp_dim=2),
                         data_mode="normalized",
                         batch_size=1,
                         num_steps=1,
@@ -1581,11 +1633,11 @@ class POSSMSSLTests(unittest.TestCase):
                 cache_root=cache_root,
                 stats_path=stats_path,
                 dataset="brain2text24",
-                feature_mode="tx_sbp",
+                signal_spec=SignalSpec.tx_sbp(tx_dim=3, sbp_dim=2),
                 boundary_key_mode="session",
+                split_policy="competition_train_test",
                 train_split_name="competition_train",
                 val_split_name="competition_test",
-                dim=5,
             )
             stats_path.with_suffix(".json").unlink()
 
@@ -1597,7 +1649,7 @@ class POSSMSSLTests(unittest.TestCase):
                         seed=7,
                         mode="probe_frozen",
                         dataset="brain2text24",
-                        feature_mode="tx_sbp",
+                        signal_spec=SignalSpec.tx_sbp(tx_dim=3, sbp_dim=2),
                         data_mode="normalized",
                         batch_size=1,
                         num_steps=1,
@@ -1646,7 +1698,6 @@ class POSSMSSLTests(unittest.TestCase):
                     "sbp_dim": 2,
                     "full_dim": 5,
                     "feature_policy": "area6v_v1",
-                    "excluded_datasets": [],
                 },
             }
             stats_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1661,7 +1712,7 @@ class POSSMSSLTests(unittest.TestCase):
                         seed=7,
                         mode="probe_frozen",
                         dataset="brain2text24",
-                        feature_mode="tx_sbp",
+                        signal_spec=SignalSpec.tx_sbp(tx_dim=3, sbp_dim=2),
                         data_mode="normalized",
                         batch_size=1,
                         num_steps=1,
@@ -1698,11 +1749,11 @@ class POSSMSSLTests(unittest.TestCase):
                 cache_root=cache_root,
                 stats_path=stats_path,
                 dataset="brain2text24",
-                feature_mode="tx_sbp",
+                signal_spec=SignalSpec.tx_sbp(tx_dim=3, sbp_dim=2),
                 boundary_key_mode="session",
+                split_policy="competition_train_test",
                 train_split_name="competition_train",
                 val_split_name="competition_test",
-                dim=5,
             )
             payload = torch.load(stats_path, map_location="cpu")
             payload["metadata"]["source_cache_signature"] = "stale"
@@ -1717,7 +1768,7 @@ class POSSMSSLTests(unittest.TestCase):
                         seed=7,
                         mode="probe_frozen",
                         dataset="brain2text24",
-                        feature_mode="tx_sbp",
+                        signal_spec=SignalSpec.tx_sbp(tx_dim=3, sbp_dim=2),
                         data_mode="normalized",
                         batch_size=1,
                         num_steps=1,
@@ -1749,7 +1800,7 @@ class POSSMSSLTests(unittest.TestCase):
                     seed=7,
                     mode="probe_frozen",
                     dataset="brain2text24",
-                    feature_mode="tx_sbp",
+                    signal_spec=SignalSpec.tx_sbp(tx_dim=3, sbp_dim=2),
                     data_mode="normalized",
                     batch_size=1,
                     num_steps=2,
@@ -1813,7 +1864,7 @@ class POSSMSSLTests(unittest.TestCase):
                 seed=7,
                 mode="probe_frozen",
                 dataset="brain2text24",
-                feature_mode="tx_sbp",
+                signal_spec=SignalSpec.tx_sbp(tx_dim=3, sbp_dim=2),
                 data_mode="normalized",
                 batch_size=1,
                 num_steps=1,
@@ -1853,7 +1904,151 @@ class POSSMSSLTests(unittest.TestCase):
             self.assertEqual(int(resumed_summary["steps"]), 1)
             final_payload = torch.load(resumed_summary["checkpoint_final_path"], map_location="cpu")
             self.assertIn("optimizer_state", final_payload)
+            self.assertIn("rng_state", final_payload)
+            self.assertIn("train_batch_position", final_payload)
             self.assertTrue(bool(final_payload["dynamic_batching_enabled"]))
+
+    def test_stage2_resume_reproduces_uninterrupted_next_step(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            checkpoint_path = _make_stage1_checkpoint(
+                tmp_path,
+                temporal_gru_hidden_size=7,
+            )
+            _write_tiny_canonical_probe_cache(tmp_path)
+            output_root = tmp_path / "stage2_runs"
+            config = POSSMFinetuneConfig(
+                seed=7,
+                mode="probe_frozen",
+                dataset="brain2text24",
+                signal_spec=SignalSpec.tx_sbp(tx_dim=3, sbp_dim=2),
+                data_mode="normalized",
+                batch_size=1,
+                num_steps=2,
+                learning_rate=1e-3,
+                encoder_learning_rate=3e-4,
+                checkpoint_every_steps=1,
+                input_smoothing_sigma_bins=2.0,
+                white_noise_sd=0.1,
+                constant_offset_sd=0.05,
+                gru_hidden_size=8,
+                gru_num_layers=2,
+                gru_dropout=0.0,
+                conv_kernel_size=3,
+                conv_stride=1,
+            )
+            first_summary = run_possm_phoneme_finetuning(
+                checkpoint_path=checkpoint_path,
+                cache_root=tmp_path,
+                output_root=output_root,
+                run_name="exact_resume_run",
+                config=config,
+                device=torch.device("cpu"),
+            )
+            final_path = Path(first_summary["checkpoint_final_path"])
+            uninterrupted_payload = torch.load(
+                final_path,
+                map_location="cpu",
+                weights_only=False,
+            )
+            step_two_path = Path(first_summary["checkpoints_dir"]) / "step_000002.pt"
+            step_two_path.unlink()
+            final_path.unlink()
+
+            resumed_summary = run_possm_phoneme_finetuning(
+                checkpoint_path=checkpoint_path,
+                cache_root=tmp_path,
+                output_root=output_root,
+                run_name="exact_resume_run",
+                config=config,
+                device=torch.device("cpu"),
+                resume_from_latest=True,
+            )
+            resumed_payload = torch.load(
+                resumed_summary["checkpoint_final_path"],
+                map_location="cpu",
+                weights_only=False,
+            )
+
+            self.assertEqual(int(resumed_payload["steps"]), 2)
+            for name, expected in uninterrupted_payload["model_state"].items():
+                torch.testing.assert_close(
+                    resumed_payload["model_state"][name],
+                    expected,
+                    rtol=0.0,
+                    atol=0.0,
+                )
+
+    def test_sbp_only_stage1_checkpoint_finetunes_and_resumes_stage2(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            checkpoint_path = _make_stage1_checkpoint(
+                tmp_path,
+                temporal_gru_hidden_size=7,
+                feature_mode="sbp_only",
+            )
+            _write_tiny_canonical_probe_cache(tmp_path)
+            output_root = tmp_path / "sbp_stage2_runs"
+            config = POSSMFinetuneConfig(
+                seed=7,
+                mode="finetune_full",
+                dataset="brain2text24",
+                signal_spec=SignalSpec.sbp_only(sbp_dim=2),
+                data_mode="normalized",
+                batch_size=1,
+                num_steps=1,
+                learning_rate=1e-3,
+                encoder_learning_rate=3e-4,
+                checkpoint_every_steps=1,
+                input_smoothing_sigma_bins=0.0,
+                gru_hidden_size=8,
+                gru_num_layers=1,
+                gru_dropout=0.0,
+                conv_kernel_size=3,
+                conv_stride=1,
+            )
+
+            first_summary = run_possm_phoneme_finetuning(
+                checkpoint_path=checkpoint_path,
+                cache_root=tmp_path,
+                output_root=output_root,
+                run_name="sbp_resume_run",
+                config=config,
+                device=torch.device("cpu"),
+            )
+            step_path = Path(first_summary["checkpoints_dir"]) / "step_000001.pt"
+            self.assertTrue(step_path.exists())
+            self.assertEqual(first_summary["feature_mode"], "sbp_only")
+            first_payload = torch.load(
+                first_summary["checkpoint_final_path"],
+                map_location="cpu",
+            )
+            self.assertEqual(first_payload["config"]["signal_spec"]["mode"], "sbp_only")
+            self.assertEqual(
+                int(first_payload["model_state"]["base_encoder.unit_embedding.weight"].shape[0]),
+                2,
+            )
+
+            resumed_summary = run_possm_phoneme_finetuning(
+                checkpoint_path=checkpoint_path,
+                cache_root=tmp_path,
+                output_root=output_root,
+                run_name="sbp_resume_run",
+                config=config,
+                device=torch.device("cpu"),
+                resume_from_latest=True,
+            )
+            self.assertEqual(
+                resumed_summary["resumed_from_checkpoint"],
+                str(step_path),
+            )
+            self.assertEqual(resumed_summary["feature_mode"], "sbp_only")
+            resumed_payload = torch.load(
+                resumed_summary["checkpoint_final_path"],
+                map_location="cpu",
+            )
+            self.assertEqual(resumed_payload["config"]["signal_spec"]["mode"], "sbp_only")
+            self.assertIn("optimizer_state", resumed_payload)
 
     def test_run_possm_phoneme_finetuning_resume_tolerates_older_config_payload(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1865,7 +2060,7 @@ class POSSMSSLTests(unittest.TestCase):
                 seed=7,
                 mode="probe_frozen",
                 dataset="brain2text24",
-                feature_mode="tx_sbp",
+                signal_spec=SignalSpec.tx_sbp(tx_dim=3, sbp_dim=2),
                 data_mode="normalized",
                 batch_size=1,
                 num_steps=1,
@@ -1921,7 +2116,7 @@ class POSSMSSLTests(unittest.TestCase):
                     seed=7,
                     mode="probe_frozen",
                     dataset="brain2text24",
-                    feature_mode="tx_sbp",
+                    signal_spec=SignalSpec.tx_sbp(tx_dim=3, sbp_dim=2),
                     data_mode="normalized",
                     batch_size=1,
                     num_steps=2,
@@ -1965,7 +2160,7 @@ class POSSMSSLTests(unittest.TestCase):
                     seed=7,
                     mode="probe_frozen",
                     dataset="brain2text24",
-                    feature_mode="tx_sbp",
+                    signal_spec=SignalSpec.tx_sbp(tx_dim=3, sbp_dim=2),
                     data_mode="normalized",
                     batch_size=1,
                     num_steps=1,
@@ -2030,15 +2225,15 @@ class POSSMSSLTests(unittest.TestCase):
                     cache_root=tmp_path,
                     dataset="brain2text24",
                     train_split_name="competition_train",
-                    feature_mode="tx_sbp",
+                    signal_spec=SignalSpec.tx_sbp(tx_dim=3, sbp_dim=2),
                     preferred_path=None,
                 ),
                 dataset="brain2text24",
-                feature_mode="tx_sbp",
+                signal_spec=SignalSpec.tx_sbp(tx_dim=3, sbp_dim=2),
                 boundary_key_mode="session",
+                split_policy="competition_train_test",
                 train_split_name="competition_train",
                 val_split_name="competition_test",
-                dim=5,
             )
 
             summary = run_possm_phoneme_finetuning(
@@ -2048,7 +2243,7 @@ class POSSMSSLTests(unittest.TestCase):
                     seed=7,
                     mode="probe_frozen",
                     dataset="brain2text24",
-                    feature_mode="tx_sbp",
+                    signal_spec=SignalSpec.tx_sbp(tx_dim=3, sbp_dim=2),
                     data_mode="normalized",
                     batch_size=2,
                     num_steps=2,

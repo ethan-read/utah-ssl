@@ -523,6 +523,10 @@ def recompute_remote_session_stats(
     from analysis.active.ssl_experiments.ssl_core.scripts.recompute_session_feature_stats import (
         recompute_session_feature_stats,
     )
+    from analysis.active.ssl_experiments.ssl_core.experiment_contract import (
+        DatasetPlan,
+        SignalSpec,
+    )
 
     cache_root = REMOTE_CACHE_VOLUME_ROOT / cache_subdir
     output_path = (
@@ -538,14 +542,14 @@ def recompute_remote_session_stats(
     result = recompute_session_feature_stats(
         cache_root=cache_root,
         output_path=output_path,
-        feature_mode=feature_mode,
+        signal_spec=SignalSpec.from_mode(
+            feature_mode,
+            tx_dim=int(tx_dim),
+            sbp_dim=int(sbp_dim),
+        ),
+        dataset_plan=DatasetPlan.from_mapping({dataset: ()}),
         boundary_key_mode=boundary_key_mode,
-        datasets=(dataset,),
-        tx_dim=int(tx_dim),
-        sbp_dim=int(sbp_dim),
-        segment_bins=int(segment_bins),
         seed=int(seed),
-        examples_per_shard=int(examples_per_shard),
         overwrite=bool(overwrite),
     )
     cache_volume.commit()

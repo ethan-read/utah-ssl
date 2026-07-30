@@ -16,6 +16,8 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
+from ssl_core.experiment_contract import SignalSpec
+
 from .model import S5MaskedEncoder
 from .model_mae import MAX_PATCH_COUNT as MAE_MAX_PATCH_COUNT
 from .model_mae import S5MaskedEncoder as MAES5MaskedEncoder
@@ -45,7 +47,7 @@ def _seed_all(seed: int) -> None:
 class PhonemeFinetuneConfig:
     seed: int = 7
     mode: str = "finetune_full"
-    feature_mode: str = "tx_sbp"
+    signal_spec: SignalSpec | dict[str, Any] | None = None
     boundary_key_mode: str | None = None
     session_limit: int = 8
     target_session_count: int = 4
@@ -63,8 +65,8 @@ class PhonemeFinetuneConfig:
     def __post_init__(self) -> None:
         if self.mode not in {"probe_frozen", "finetune_full"}:
             raise ValueError("mode must be one of {'probe_frozen', 'finetune_full'}")
-        if self.feature_mode not in {"tx_only", "tx_sbp"}:
-            raise ValueError("feature_mode must be one of {'tx_only', 'tx_sbp'}")
+        if self.signal_spec is not None:
+            self.signal_spec = SignalSpec.from_value(self.signal_spec)
         if self.boundary_key_mode is not None and self.boundary_key_mode not in {
             "session",
             "subject_if_available",
@@ -98,6 +100,10 @@ class PhonemeFinetuneConfig:
             raise ValueError("progress_every_steps must be positive")
         if float(self.progress_every_seconds) <= 0.0:
             raise ValueError("progress_every_seconds must be positive")
+
+    @property
+    def feature_mode(self) -> str | None:
+        return None if self.signal_spec is None else self.signal_spec.mode
 
 
 class RawFeatureAdapter(nn.Module):
@@ -304,7 +310,7 @@ def _recover_stage1_encoder(
             post_proj_norm=str(checkpoint_cfg.get("post_proj_norm", "rms")),
             max_patches=int(max_patches),
             source_session_keys=inferred_source_session_keys,
-            feature_mode=str(checkpoint_cfg.get("feature_mode", "tx_only")),
+            signal_spec=SignalSpec.from_value(checkpoint_cfg["signal_spec"]),
             backbone_direction=str(checkpoint_cfg.get("backbone_direction", "bidirectional")),
         )
     else:
@@ -318,7 +324,7 @@ def _recover_stage1_encoder(
             patch_stride=int(checkpoint_cfg["patch_stride"]),
             post_proj_norm=str(checkpoint_cfg.get("post_proj_norm", "rms")),
             source_session_keys=inferred_source_session_keys,
-            feature_mode=str(checkpoint_cfg.get("feature_mode", "tx_only")),
+            signal_spec=SignalSpec.from_value(checkpoint_cfg["signal_spec"]),
             backbone_direction=str(checkpoint_cfg.get("backbone_direction", "causal")),
         )
     base_encoder.load_state_dict(encoder_state)
@@ -356,7 +362,7 @@ def _build_problem(
     return build_downstream_probe_problem(
         cache_root=cache_root,
         probe_config=probe_config,
-        feature_mode=str(config.feature_mode),
+        signal_spec=config.signal_spec,
         boundary_key_mode=(
             str(config.boundary_key_mode) if config.boundary_key_mode is not None else "session"
         ),
@@ -379,14 +385,14 @@ def _train_one_stage(
         problem["target_train_rows"],
         cache_root=Path(problem["cache_root"]),
         mode=target_stats_mode,
-        feature_mode=str(problem["feature_mode"]),
+        signal_spec=problem["signal_spec"],
     )
     train_loader = DataLoader(
         CanonicalSequenceDataset(
             problem["target_train_rows"],
             cache_root=Path(problem["cache_root"]),
             stats=target_stats,
-            feature_mode=str(problem["feature_mode"]),
+            signal_spec=problem["signal_spec"],
             boundary_key_mode=str(problem.get("boundary_key_mode", "session")),
         ),
         **_loader_kwargs(device, int(config.batch_size), shuffle=True),
@@ -397,7 +403,7 @@ def _train_one_stage(
             problem["target_val_rows"],
             cache_root=Path(problem["cache_root"]),
             stats=target_stats,
-            feature_mode=str(problem["feature_mode"]),
+            signal_spec=problem["signal_spec"],
             boundary_key_mode=str(problem.get("boundary_key_mode", "session")),
         ),
         **_loader_kwargs(device, int(config.batch_size), shuffle=False),
@@ -621,6 +627,23 @@ def run_phoneme_finetuning(
         checkpoint_path=resolved_checkpoint_path,
         map_location="cpu",
     )
+    checkpoint_signal_spec = SignalSpec.from_value(checkpoint_cfg["signal_spec"])
+    requested_signal_spec = (
+        SignalSpec.from_value(resolved_config.signal_spec)
+        if resolved_config.signal_spec is not None
+        else None
+    )
+    if requested_signal_spec is None:
+        effective_signal_spec = checkpoint_signal_spec
+    else:
+        effective_signal_spec = requested_signal_spec
+        if effective_signal_spec != checkpoint_signal_spec:
+            raise ValueError(
+                "Stage-2 signal_spec does not match the Stage-1 checkpoint. "
+                "Omit signal_spec to inherit it. "
+                f"checkpoint={checkpoint_signal_spec.to_dict()} "
+                f"requested={effective_signal_spec.to_dict()}"
+            )
     effective_boundary_key_mode = (
         str(resolved_config.boundary_key_mode)
         if resolved_config.boundary_key_mode is not None
@@ -629,6 +652,7 @@ def run_phoneme_finetuning(
     effective_config = PhonemeFinetuneConfig(
         **{
             **asdict(resolved_config),
+            "signal_spec": effective_signal_spec,
             "boundary_key_mode": effective_boundary_key_mode,
         }
     )
@@ -638,9 +662,7 @@ def run_phoneme_finetuning(
     )
 
     metadata = _load_probe_metadata_json(problem["metadata_path"])
-    external_input_dim = int(metadata["n_tx_features"])
-    if str(resolved_config.feature_mode) == "tx_sbp":
-        external_input_dim += int(metadata["n_sbp_features"])
+    external_input_dim = int(effective_signal_spec.full_dim)
 
     input_adapter = _build_input_adapter(
         external_input_dim=external_input_dim,
@@ -649,7 +671,7 @@ def run_phoneme_finetuning(
     encoder = AdaptedPhonemeEncoder(
         base_encoder=copy.deepcopy(base_encoder),
         input_adapter=input_adapter,
-        external_feature_mode=str(resolved_config.feature_mode),
+        external_feature_mode=effective_signal_spec.mode,
     )
     phoneme_head = LinearCTCProbe(
         hidden_size=int(encoder.hidden_size),
@@ -663,7 +685,7 @@ def run_phoneme_finetuning(
     base_output_root.mkdir(parents=True, exist_ok=True)
 
     run_name = (
-        f"stage2_phoneme_{resolved_config.mode}_{resolved_config.feature_mode}_{_timestamp_utc()}"
+        f"stage2_phoneme_{effective_config.mode}_{effective_config.feature_mode}_{_timestamp_utc()}"
     )
     run_dir = base_output_root / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -708,8 +730,9 @@ def run_phoneme_finetuning(
         "checkpoints_dir": str(checkpoints_dir),
         "ssl_checkpoint_path": str(resolved_checkpoint_path),
         "ssl_run_dir": str(stage1_run_dir),
-        "mode": str(resolved_config.mode),
-        "feature_mode": str(resolved_config.feature_mode),
+        "mode": str(effective_config.mode),
+        "feature_mode": str(effective_config.feature_mode),
+        "signal_spec": effective_signal_spec.to_dict(),
         "boundary_key_mode": str(effective_config.boundary_key_mode),
         "checkpoint_every_steps": int(effective_config.checkpoint_every_steps),
         "external_input_dim": int(external_input_dim),
@@ -747,7 +770,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-root", default=None)
     parser.add_argument("--cache-root", required=True)
     parser.add_argument("--mode", choices=["probe_frozen", "finetune_full"], default="finetune_full")
-    parser.add_argument("--feature-mode", choices=["tx_only", "tx_sbp"], default="tx_sbp")
     parser.add_argument(
         "--boundary-key-mode",
         choices=["session", "subject_if_available"],
@@ -779,7 +801,6 @@ def main() -> None:
     config = PhonemeFinetuneConfig(
         seed=int(args.seed),
         mode=str(args.mode),
-        feature_mode=str(args.feature_mode),
         boundary_key_mode=args.boundary_key_mode,
         session_limit=int(args.session_limit),
         target_session_count=int(args.target_session_count),

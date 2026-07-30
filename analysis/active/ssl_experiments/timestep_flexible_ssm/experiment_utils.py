@@ -23,6 +23,7 @@ from .data import (
     compute_rebinned_normalization_stats,
     rebin_features,
     rebinned_input_length,
+    signal_spec_for_rows,
 )
 from .train import _load_or_compute_stats_for_view
 
@@ -184,6 +185,7 @@ class MixedBinSequenceDataset(torch.utils.data.Dataset):
         self.rows = list(rows)
         self.stats = stats
         self.feature_mode = str(feature_mode)
+        self.signal_spec = signal_spec_for_rows(self.rows, feature_mode=self.feature_mode)
         self.boundary_key_mode = str(boundary_key_mode)
         self.dataset = str(dataset)
         self.active_bin_size_ms = int(active_bin_size_ms)
@@ -191,8 +193,8 @@ class MixedBinSequenceDataset(torch.utils.data.Dataset):
         self._base = CanonicalSequenceDataset(
             self.rows,
             cache_root=Path(cache_root),
+            signal_spec=self.signal_spec,
             stats=None,
-            feature_mode=self.feature_mode,
             boundary_key_mode=self.boundary_key_mode,
             dataset=self.dataset,
         )
@@ -203,7 +205,7 @@ class MixedBinSequenceDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
         row = self.rows[idx]
-        x = self._accessor.load_features(row, feature_mode=self.feature_mode)
+        x = self._accessor.load_features(row, signal_spec=self.signal_spec)
         x = rebin_features(x, bin_size_ms=self.active_bin_size_ms)
         if self.duplicate_to_canonical:
             factor = max(1, int(self.active_bin_size_ms) // int(CANONICAL_BIN_SIZE_MS))
@@ -250,6 +252,7 @@ class MissingBinSequenceDataset(torch.utils.data.Dataset):
         self.rows = list(rows)
         self.stats = stats
         self.feature_mode = str(feature_mode)
+        self.signal_spec = signal_spec_for_rows(self.rows, feature_mode=self.feature_mode)
         self.boundary_key_mode = str(boundary_key_mode)
         self.dataset = str(dataset)
         self.drop_probability = float(drop_probability)
@@ -258,8 +261,8 @@ class MissingBinSequenceDataset(torch.utils.data.Dataset):
         self._base = CanonicalSequenceDataset(
             self.rows,
             cache_root=Path(cache_root),
+            signal_spec=self.signal_spec,
             stats=None,
-            feature_mode=self.feature_mode,
             boundary_key_mode=self.boundary_key_mode,
             dataset=self.dataset,
         )
@@ -271,7 +274,7 @@ class MissingBinSequenceDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx: int) -> dict[str, Any]:
         row = self.rows[idx]
         raw = np.asarray(
-            self._accessor.load_features(row, feature_mode=self.feature_mode),
+            self._accessor.load_features(row, signal_spec=self.signal_spec),
             dtype=np.float32,
         )
         observed, deltas_ms, keep_mask = irregular_observation_view(
@@ -331,13 +334,14 @@ class FutureBinsDataset(torch.utils.data.Dataset):
         self.rows = list(rows)
         self.stats = stats
         self.feature_mode = str(feature_mode)
+        self.signal_spec = signal_spec_for_rows(self.rows, feature_mode=self.feature_mode)
         self.boundary_key_mode = str(boundary_key_mode)
         self.dataset = str(dataset)
         self._base = CanonicalSequenceDataset(
             self.rows,
             cache_root=Path(cache_root),
+            signal_spec=self.signal_spec,
             stats=None,
-            feature_mode=self.feature_mode,
             boundary_key_mode=self.boundary_key_mode,
             dataset=self.dataset,
         )
@@ -348,7 +352,10 @@ class FutureBinsDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
         row = self.rows[idx]
-        x = np.asarray(self._accessor.load_features(row, feature_mode=self.feature_mode), dtype=np.float32)
+        x = np.asarray(
+            self._accessor.load_features(row, signal_spec=self.signal_spec),
+            dtype=np.float32,
+        )
         if self.stats is not None:
             x = apply_feature_stats(x, row=row, stats=self.stats)
         return {

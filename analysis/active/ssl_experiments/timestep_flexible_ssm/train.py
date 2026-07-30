@@ -313,7 +313,7 @@ def _load_or_compute_stats_for_view(
             cache_root=Path(config.cache_root),
             dataset=str(config.dataset),
             train_split_name=str(problem["train_split_name"]),
-            feature_mode=str(config.feature_mode),
+            signal_spec=problem["signal_spec"],
             preferred_path=config.precomputed_split_stats_path,
         )
         if not resolved_stats_path.exists() and config.precomputed_split_stats_path is None:
@@ -332,11 +332,11 @@ def _load_or_compute_stats_for_view(
             stats_path=resolved_stats_path,
             cache_root=Path(problem["cache_root"]),
             dataset=str(problem["dataset"]),
-            feature_mode=str(problem["feature_mode"]),
+            signal_spec=problem["signal_spec"],
             boundary_key_mode=str(problem["boundary_key_mode"]),
             train_split_name=str(problem["train_split_name"]),
             val_split_name=str(problem["val_split_name"]),
-            expected_dim=int(sample_dim),
+            split_policy=str(problem["split_policy"]),
         )
         return (
             (

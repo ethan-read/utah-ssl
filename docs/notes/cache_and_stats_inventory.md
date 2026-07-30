@@ -17,6 +17,7 @@ training time on the BA44/IFG columns.
 Current feature-mode semantics are therefore:
 
 - `tx_only`: first `128` area-6v TX features
+- `sbp_only`: first `128` area-6v SBP features
 - `tx_sbp`: first `128` area-6v TX features plus first `128` area-6v SBP
   features, for `256` total input features
 
@@ -36,8 +37,8 @@ resumed.
 - notes:
   - `brain2text24` has `16088` rows and `28` sessions
   - supports `segment_bins=80`
-  - after area-6v migration, both `tx_only` and `tx_sbp` sampling should use
-    `128` TX columns and `128` SBP columns at most
+  - after area-6v migration, `tx_only`, `sbp_only`, and `tx_sbp` sampling
+    should use `128` columns per requested modality at most
 
 ### Google Drive
 - path: `/content/drive/MyDrive/utah_ssl/data/cache_v1`
@@ -84,7 +85,7 @@ directly from the canonical roots and is not copied or modified.
 
 The matching pooled session stats live under:
 
-- `utah_ssl/data/stats/session_feature_stats/possm_b2t24_canonical_b2t25_area6v_sigma2p0_v1/tx_only/session/`
+- `utah_ssl/data/stats/session_feature_stats/possm_b2t24_canonical_b2t25_area6v_sigma2p0_v1/sbp_only/session/`
 
 The preparation notebook performs logical example-level validation before a
 partial cache is promoted to its final root.
@@ -108,16 +109,16 @@ pretraining choice:
 - feature mode: `tx_only`
 - use `SBP` later for downstream speech decoding when available
 - keep `20 ms` bins and session-level z-scoring
-- default stage-1 dataset set may include `brain2text24` and the auxiliary Utah
-  datasets, while excluding `brain2text25`, but the important paper-faithful
-  point is that pretraining itself is `TX`-only because some datasets lack
-  `SBP`
+- the exact broad dataset/split plan is `BIT_STAGE1_DATASET_SPLITS` in
+  `ssl_core/bit_cache_contract.py`; it positively lists the seven datasets and
+  every allowed source split
+- pretraining is `TX`-only because some datasets lack `SBP`
 
 - Drive root:
   - `/content/drive/MyDrive/utah_ssl/data/stats/session_feature_stats/`
 - current canonical Stage-1 target path:
-  - `/content/drive/MyDrive/utah_ssl/data/stats/session_feature_stats/smoothed_sigma2p0/tx_only/session/ssl_pretrain_including_brain2text24_excluding_brain2text25_v1.pt`
-  - `/content/drive/MyDrive/utah_ssl/data/stats/session_feature_stats/smoothed_sigma2p0/tx_only/session/ssl_pretrain_including_brain2text24_excluding_brain2text25_v1.json`
+  - `/content/drive/MyDrive/utah_ssl/data/stats/session_feature_stats/smoothed_sigma2p0/tx_only/session/ssl_pretrain_000950_brain2text24_motor_data_plug_n_play_unsupervised_cursor_recalibration_offline_unsupervised_cursor_recalibration_online_willett_handwriting_plan_f8843486db_v2.pt`
+  - `/content/drive/MyDrive/utah_ssl/data/stats/session_feature_stats/smoothed_sigma2p0/tx_only/session/ssl_pretrain_000950_brain2text24_motor_data_plug_n_play_unsupervised_cursor_recalibration_offline_unsupervised_cursor_recalibration_online_willett_handwriting_plan_f8843486db_v2.json`
 
 Stage-2 phoneme fine-tuning uses train-split global stats computed on the
 released Willett `competition_train` rows and then applied to both train and
@@ -125,9 +126,13 @@ validation examples:
 
 - Drive root:
   - `/content/drive/MyDrive/utah_ssl/data/stats/split_feature_stats/`
-- current POSSM Stage-2 target path:
-  - `/content/drive/MyDrive/utah_ssl/data/stats/split_feature_stats/raw/brain2text24/competition_train/tx_only/global_v1.pt`
-  - `/content/drive/MyDrive/utah_ssl/data/stats/split_feature_stats/raw/brain2text24/competition_train/tx_only/global_v1.json`
+- current pooled-SBP POSSM Stage-2 target path:
+  - `/content/drive/MyDrive/utah_ssl/data/stats/split_feature_stats/raw/brain2text24/competition_train/sbp_only/global_v1.pt`
+  - `/content/drive/MyDrive/utah_ssl/data/stats/split_feature_stats/raw/brain2text24/competition_train/sbp_only/global_v1.json`
+
+The historical TX baseline uses the parallel `tx_only/global_v1.{pt,json}`
+location. The artifact metadata must match the complete `SignalSpec`, not just
+the directory name.
 
 The `.pt` files contain tensors/arrays. The paired `.json` files contain
 human-readable provenance such as cache variant, feature mode, split policy,

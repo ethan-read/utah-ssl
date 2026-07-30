@@ -181,15 +181,13 @@ def run_ssl_pretraining(
     progress_log_path = resolved_run_dir / "progress.jsonl"
     metrics_rows: list[dict[str, Any]] = []
     cache_config = CacheAccessConfig(
+        dataset_plan=config.dataset_plan,
+        signal_spec=config.signal_spec,
         mode=str(config.cache_mode),
         local_cache_base=str(config.local_cache_base),
-        excluded_datasets=tuple(config.excluded_datasets),
         seed=int(config.seed),
         segment_bins=int(config.segment_bins),
         use_normalization=bool(config.use_normalization),
-        tx_dim=int(config.tx_dim),
-        sbp_dim=int(config.sbp_dim),
-        feature_mode=str(config.feature_mode),
         boundary_key_mode=str(config.boundary_key_mode),
         precomputed_session_stats_path=config.precomputed_session_stats_path,
     )
@@ -359,7 +357,7 @@ def _make_ctc_loader(
     *,
     cache_root: Path,
     stats: Any,
-    feature_mode: str,
+    signal_spec: Any,
     boundary_key_mode: str,
     dataset: str,
     model_input_dim: int,
@@ -380,8 +378,8 @@ def _make_ctc_loader(
         CanonicalSequenceDataset(
             rows,
             cache_root=cache_root,
+            signal_spec=signal_spec,
             stats=stats,
-            feature_mode=str(feature_mode),
             boundary_key_mode=str(boundary_key_mode),
             dataset=str(dataset),
             pad_feature_dim_to=int(model_input_dim),
@@ -402,18 +400,18 @@ def _load_or_compute_ctc_stats(config: GenericSSMSSLConfig, problem: dict[str, A
                 cache_root=Path(problem["cache_root"]),
                 dataset=str(problem["dataset"]),
                 train_split_name=str(problem["train_split_name"]),
-                feature_mode=str(problem["feature_mode"]),
+                signal_spec=problem["signal_spec"],
                 preferred_path=config.precomputed_split_stats_path,
             )
             (mean_t, std_t), _, loaded_path = load_precomputed_split_feature_stats(
                 stats_path=stats_path,
                 cache_root=Path(problem["cache_root"]),
                 dataset=str(problem["dataset"]),
-                feature_mode=str(problem["feature_mode"]),
+                signal_spec=problem["signal_spec"],
                 boundary_key_mode=str(problem["boundary_key_mode"]),
                 train_split_name=str(problem["train_split_name"]),
                 val_split_name=str(problem["val_split_name"]),
-                expected_dim=int(sample_dim),
+                split_policy=str(problem["split_policy"]),
             )
             print(f"loaded precomputed generic SSM CTC split stats: {loaded_path}", flush=True)
             return (
@@ -511,18 +509,18 @@ def run_ctc_finetuning(
     metrics_rows: list[dict[str, Any]] = []
     problem = build_competition_split_problem(
         cache_root=Path(config.cache_root),
+        signal_spec=config.signal_spec,
         dataset=str(config.dataset),
-        feature_mode=str(config.feature_mode),
         boundary_key_mode=str(config.boundary_key_mode),
     )
-    raw_sample_dim = _feature_dim_from_rows(problem["train_rows"], feature_mode=str(config.feature_mode))
+    raw_sample_dim = int(config.signal_spec.full_dim)
     sample_dim = max(int(raw_sample_dim), int(config.input_dim))
     stats = _load_or_compute_ctc_stats(config, problem, raw_sample_dim)
     train_loader = _make_ctc_loader(
         problem["train_rows"],
         cache_root=Path(problem["cache_root"]),
         stats=stats,
-        feature_mode=str(problem["feature_mode"]),
+        signal_spec=problem["signal_spec"],
         boundary_key_mode=str(problem["boundary_key_mode"]),
         dataset=str(problem["dataset"]),
         model_input_dim=int(sample_dim),
@@ -535,7 +533,7 @@ def run_ctc_finetuning(
         problem["val_rows"],
         cache_root=Path(problem["cache_root"]),
         stats=stats,
-        feature_mode=str(problem["feature_mode"]),
+        signal_spec=problem["signal_spec"],
         boundary_key_mode=str(problem["boundary_key_mode"]),
         dataset=str(problem["dataset"]),
         model_input_dim=int(sample_dim),

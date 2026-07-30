@@ -12,6 +12,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from s5 import BidirectionalS5SequenceBackbone, S5SequenceBackbone
 
+from ssl_core.experiment_contract import SignalSpec
+
 try:
     from ssl_core.patching import causal_conv_lengths as _core_causal_conv_lengths
     from ssl_core.patching import patch_batch as _core_patch_batch
@@ -131,6 +133,7 @@ class POSSMEncoder(nn.Module):
         self,
         *,
         input_dim: int,
+        signal_spec: SignalSpec | dict[str, Any],
         model_dim: int = 64,
         latent_count: int = 4,
         value_encoder_type: str = "linear",
@@ -138,7 +141,6 @@ class POSSMEncoder(nn.Module):
         ffn_hidden_size: int = 256,
         dropout: float = 0.1,
         use_token_norm: bool = True,
-        feature_mode: str = "tx_sbp",
     ) -> None:
         super().__init__()
         self.input_dim = int(input_dim)
@@ -146,7 +148,8 @@ class POSSMEncoder(nn.Module):
         self.latent_count = int(latent_count)
         self.hidden_size = int(self.model_dim * self.latent_count)
         self.token_dim = int(self.model_dim)
-        self.feature_mode = str(feature_mode)
+        self.signal_spec = SignalSpec.from_value(signal_spec)
+        self.feature_mode = self.signal_spec.mode
         self.source_session_keys: tuple[str, ...] = ()
 
         self.unit_embedding = nn.Embedding(self.input_dim, self.model_dim)
@@ -458,6 +461,7 @@ class POSSMReconstructionModel(nn.Module):
         self,
         *,
         input_dim: int,
+        signal_spec: SignalSpec | dict[str, Any],
         model_dim: int = 64,
         latent_count: int = 4,
         value_encoder_type: str = "linear",
@@ -473,10 +477,10 @@ class POSSMReconstructionModel(nn.Module):
         temporal_backbone_kwargs: dict[str, Any] | None = None,
         reconstruction_head_type: str = "linear",
         reconstruction_mlp_hidden_size: int | None = None,
-        feature_mode: str = "tx_sbp",
     ) -> None:
         super().__init__()
-        self.feature_mode = str(feature_mode)
+        self.signal_spec = SignalSpec.from_value(signal_spec)
+        self.feature_mode = self.signal_spec.mode
         self.input_dim = int(input_dim)
         self.source_session_keys: tuple[str, ...] = ()
         self.encoder = POSSMEncoder(
@@ -488,7 +492,7 @@ class POSSMReconstructionModel(nn.Module):
             ffn_hidden_size=int(ffn_hidden_size),
             dropout=float(dropout),
             use_token_norm=bool(use_token_norm),
-            feature_mode=str(feature_mode),
+            signal_spec=self.signal_spec,
         )
         self.temporal_backbone_type = str(temporal_backbone_type)
         self.temporal_backbone = build_temporal_backbone(
@@ -684,11 +688,9 @@ class POSSMPhonemeModel(nn.Module):
         emission_mode: str = "post_decoder_conv",
         pre_decoder_patch_size: int = 14,
         pre_decoder_patch_stride: int = 4,
-        temporal_patch_kernel_size: int | None = None,
-        temporal_patch_stride: int | None = None,
         conv_hidden_size: int | None = None,
-        conv_kernel_size: int | None = None,
-        conv_stride: int | None = None,
+        conv_kernel_size: int = 14,
+        conv_stride: int = 4,
         conv_dropout: float = 0.1,
         session_adapter_keys: tuple[str, ...] = (),
         session_adapter_enabled: bool = True,
@@ -720,16 +722,8 @@ class POSSMPhonemeModel(nn.Module):
             tuple(session_adapter_keys),
             input_dim=int(base_encoder.input_dim),
         )
-        self.conv_kernel_size = (
-            int(conv_kernel_size)
-            if conv_kernel_size is not None
-            else (int(temporal_patch_kernel_size) if temporal_patch_kernel_size is not None else 14)
-        )
-        self.conv_stride = (
-            int(conv_stride)
-            if conv_stride is not None
-            else (int(temporal_patch_stride) if temporal_patch_stride is not None else 4)
-        )
+        self.conv_kernel_size = int(conv_kernel_size)
+        self.conv_stride = int(conv_stride)
         if self.conv_kernel_size <= 0 or self.conv_stride <= 0:
             raise ValueError("conv kernel size and stride must be positive")
         self.conv_dropout_rate = float(conv_dropout)

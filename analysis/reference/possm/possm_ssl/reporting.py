@@ -12,6 +12,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from masked_ssl.probe import CanonicalSequenceDataset, compute_feature_stats
+from ssl_core.experiment_contract import SignalSpec
 
 from .phoneme_finetune import (
     POSSMFinetuneConfig,
@@ -263,7 +264,7 @@ def run_possm_stage2_prediction_diagnostics(
     problem = _build_problem(
         cache_root=Path(payload["cache_root"]),
         config=config,
-        feature_mode=str(payload.get("feature_mode", config.feature_mode)),
+        signal_spec=SignalSpec.from_value(config.signal_spec),
         boundary_key_mode=str(dict(payload["config"]).get("boundary_key_mode", config.boundary_key_mode)),
     )
     stats = (
@@ -271,7 +272,7 @@ def run_possm_stage2_prediction_diagnostics(
             problem["train_rows"],
             cache_root=Path(problem["cache_root"]),
             mode="global",
-            feature_mode=str(problem["feature_mode"]),
+            signal_spec=problem["signal_spec"],
         )
         if str(config.data_mode) == "normalized"
         else None
@@ -281,7 +282,7 @@ def run_possm_stage2_prediction_diagnostics(
             problem["val_rows"],
             cache_root=Path(problem["cache_root"]),
             stats=stats,
-            feature_mode=str(problem["feature_mode"]),
+            signal_spec=problem["signal_spec"],
             boundary_key_mode=str(problem.get("boundary_key_mode", "session")),
             dataset=str(problem.get("dataset", config.dataset)),
         ),

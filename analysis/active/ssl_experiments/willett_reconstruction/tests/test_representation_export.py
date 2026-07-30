@@ -15,6 +15,7 @@ from analysis.active.ssl_experiments.ssl_core.stats_artifact_test_utils import (
 from analysis.active.ssl_experiments.ssl_core.scripts.recompute_split_feature_stats import (
     resolve_precomputed_split_stats_path,
 )
+from analysis.active.ssl_experiments.ssl_core.experiment_contract import SignalSpec
 from analysis.active.ssl_experiments.willett_reconstruction.data import (
     adapter_keys_from_rows,
     build_willett_problem,
@@ -133,18 +134,18 @@ class WillettRepresentationExportTest(unittest.TestCase):
             cache_root=cache_root,
             dataset="brain2text24",
             train_split_name="competition_train",
-            feature_mode="tx_only",
+            signal_spec=SignalSpec.tx_only(tx_dim=3),
             preferred_path=None,
         )
         _write_valid_split_stats_artifact(
             cache_root=cache_root,
             stats_path=stats_path,
             dataset="brain2text24",
-            feature_mode="tx_only",
+            signal_spec=SignalSpec.tx_only(tx_dim=3),
             boundary_key_mode="session",
+            split_policy="competition_train_test",
             train_split_name="competition_train",
             val_split_name="competition_test",
-            dim=3,
         )
         model_config = WillettReconstructionConfig(
             cache_root=cache_root,

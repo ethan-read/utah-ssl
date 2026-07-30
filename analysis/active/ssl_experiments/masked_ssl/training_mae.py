@@ -6,13 +6,15 @@ import json
 import random
 import time
 from collections import Counter, defaultdict
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
+
+from ssl_core.experiment_contract import SignalSpec
 
 from .cache import CacheContext, build_segment_sampler, runtime_smoothing_requested
 from .cache import resolve_boundary_key
@@ -30,9 +32,9 @@ def _seed_training_run(seed: int) -> None:
 
 @dataclass
 class SSLTrainingConfig:
+    signal_spec: SignalSpec | dict[str, Any]
     seed: int = 7
     objective_mode: str = "masked_reconstruction_mae"
-    feature_mode: str = "tx_only"
     boundary_key_mode: str = "session"
     segment_bins: int = 80
     patch_size: int = 4
@@ -74,8 +76,7 @@ class SSLTrainingConfig:
     def __post_init__(self) -> None:
         if self.objective_mode != "masked_reconstruction_mae":
             raise ValueError("objective_mode must be 'masked_reconstruction_mae'")
-        if self.feature_mode not in {"tx_only", "tx_sbp"}:
-            raise ValueError("feature_mode must be one of {'tx_only', 'tx_sbp'}")
+        self.signal_spec = SignalSpec.from_value(self.signal_spec)
         if self.boundary_key_mode not in {"session", "subject_if_available"}:
             raise ValueError(
                 "boundary_key_mode must be one of {'session', 'subject_if_available'}"
@@ -119,7 +120,7 @@ class SSLTrainingConfig:
 
     def checkpoint_config(self) -> dict[str, Any]:
         return {
-            "feature_mode": str(self.feature_mode),
+            "signal_spec": self.signal_spec.to_dict(),
             "boundary_key_mode": str(self.boundary_key_mode),
             "patch_size": int(self.patch_size),
             "patch_stride": int(self.patch_stride),
@@ -142,6 +143,10 @@ class SSLTrainingConfig:
             "decoder_dropout": float(self.decoder_dropout),
             "decoder_backbone_direction": str(self.decoder_backbone_direction),
         }
+
+    @property
+    def feature_mode(self) -> str:
+        return self.signal_spec.mode
 
 
 def _build_ssl_optimizer(
@@ -273,7 +278,8 @@ def _serialize_ssl_training_config(
     return {
         "seed": int(config.seed),
         "objective_mode": str(config.objective_mode),
-        "feature_mode": str(config.feature_mode),
+        "signal_spec": config.signal_spec.to_dict(),
+        "dataset_plan": cache_context.config.dataset_plan.to_dict(),
         "boundary_key_mode": str(config.boundary_key_mode),
         "input_dim": int(cache_context.full_dim),
         "source_session_keys": list(_source_session_keys_from_cache_context(cache_context)),
@@ -500,7 +506,6 @@ def recover_ssl_run_state_from_checkpoint(
     checkpoint_path: str | Path,
     cache_context: CacheContext,
     device: torch.device,
-    fallback_config: SSLTrainingConfig | None = None,
 ) -> dict[str, Any]:
     resolved_checkpoint_path = Path(checkpoint_path)
     if not resolved_checkpoint_path.exists():
@@ -514,45 +519,10 @@ def recover_ssl_run_state_from_checkpoint(
     if not recovered_config and config_path.exists():
         recovered_config = json.loads(config_path.read_text())
 
-    had_reconstruction_head_mode = "reconstruction_head_mode" in recovered_config
-    had_reconstruction_head_type = "reconstruction_head_type" in recovered_config
-    had_backbone_direction = "backbone_direction" in recovered_config
-    had_max_patches = "max_patches" in recovered_config
-    had_decoder_num_layers = "decoder_num_layers" in recovered_config
-    had_decoder_dropout = "decoder_dropout" in recovered_config
-    had_decoder_backbone_direction = "decoder_backbone_direction" in recovered_config
-    fallback_payload = asdict(fallback_config) if fallback_config is not None else {}
-    for key, value in fallback_payload.items():
-        recovered_config.setdefault(key, value)
-    recovered_config.setdefault("objective_mode", "masked_reconstruction_mae")
-    recovered_config.setdefault("boundary_key_mode", "session")
-    if not had_reconstruction_head_mode:
-        recovered_config["reconstruction_head_mode"] = "with_output_norm"
-    if not had_reconstruction_head_type:
-        recovered_config["reconstruction_head_type"] = "linear"
-    if not had_backbone_direction:
-        recovered_config["backbone_direction"] = "bidirectional"
-    if not had_max_patches:
-        recovered_config["max_patches"] = int(
-            _effective_max_patches(
-                segment_bins=int(recovered_config["segment_bins"]),
-                patch_size=int(recovered_config["patch_size"]),
-                patch_stride=int(recovered_config["patch_stride"]),
-                explicit_max_patches=None,
-            )
-        )
-    if not had_decoder_num_layers:
-        recovered_config["decoder_num_layers"] = 1
-    if not had_decoder_dropout:
-        recovered_config["decoder_dropout"] = 0.0
-    if not had_decoder_backbone_direction:
-        recovered_config["decoder_backbone_direction"] = "bidirectional"
-    recovered_config.setdefault("decoder_hidden_size", None)
-    recovered_config.setdefault("decoder_s5_state_size", None)
-    recovered_config.setdefault("mask_token_placement", "visible_only")
-
     required_keys = [
-        "feature_mode",
+        "signal_spec",
+        "dataset_plan",
+        "boundary_key_mode",
         "segment_bins",
         "input_dim",
         "patch_size",
@@ -584,10 +554,18 @@ def recover_ssl_run_state_from_checkpoint(
         raise KeyError(
             f"Recovered SSL config is missing keys needed for analysis/probe recovery: {missing_keys}"
         )
-    if str(recovered_config["feature_mode"]) != str(cache_context.feature_mode):
+    recovered_signal_spec = SignalSpec.from_value(recovered_config["signal_spec"])
+    if recovered_signal_spec != cache_context.signal_spec:
         raise ValueError(
-            "Recovered checkpoint feature_mode does not match the active cache context. "
-            f"checkpoint={recovered_config['feature_mode']!r} cache={cache_context.feature_mode!r}"
+            "Recovered checkpoint signal_spec does not match the active cache context. "
+            f"checkpoint={recovered_signal_spec.to_dict()} "
+            f"cache={cache_context.signal_spec.to_dict()}"
+        )
+    if recovered_config["dataset_plan"] != cache_context.config.dataset_plan.to_dict():
+        raise ValueError(
+            "Recovered checkpoint dataset_plan does not match the active cache context. "
+            f"checkpoint={recovered_config['dataset_plan']} "
+            f"cache={cache_context.config.dataset_plan.to_dict()}"
         )
     cache_boundary_key_mode = str(getattr(cache_context, "boundary_key_mode", "session"))
     if str(recovered_config.get("boundary_key_mode", "session")) != cache_boundary_key_mode:
@@ -612,7 +590,7 @@ def recover_ssl_run_state_from_checkpoint(
         patch_stride=int(recovered_config["patch_stride"]),
         post_proj_norm=str(recovered_config.get("post_proj_norm", "rms")),
         source_session_keys=tuple(recovered_config.get("source_session_keys", ())),
-        feature_mode=str(recovered_config.get("feature_mode", "tx_only")),
+        signal_spec=recovered_signal_spec,
         reconstruction_head_mode=str(
             recovered_config.get("reconstruction_head_mode", "with_output_norm")
         ),
@@ -721,10 +699,10 @@ def run_ssl_training(
             "run_ssl_training: runtime Gaussian smoothing is no longer supported. "
             "Use a pre-smoothed cache root with gaussian_smoothing_sigma_bins=0.0."
         )
-    if str(config.feature_mode) != str(cache_context.feature_mode):
+    if config.signal_spec != cache_context.signal_spec:
         raise ValueError(
-            "SSLTrainingConfig.feature_mode must match CacheAccessConfig.feature_mode. "
-            f"config={config.feature_mode!r} cache={cache_context.feature_mode!r}"
+            "SSLTrainingConfig.signal_spec must match CacheAccessConfig.signal_spec. "
+            f"config={config.signal_spec} cache={cache_context.signal_spec}"
         )
     if str(config.boundary_key_mode) != str(cache_context.boundary_key_mode):
         raise ValueError(
@@ -764,7 +742,7 @@ def run_ssl_training(
         patch_stride=int(config.patch_stride),
         post_proj_norm=str(config.post_proj_norm),
         source_session_keys=_source_session_keys_from_cache_context(cache_context),
-        feature_mode=str(config.feature_mode),
+        signal_spec=config.signal_spec,
         reconstruction_head_mode=str(config.reconstruction_head_mode),
         reconstruction_head_type=str(config.reconstruction_head_type),
         backbone_direction=str(config.backbone_direction),

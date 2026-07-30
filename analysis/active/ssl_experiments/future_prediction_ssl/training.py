@@ -20,6 +20,7 @@ if str(_EXPERIMENTS_ROOT) not in sys.path:
 
 try:
     from ssl_core.cache import CacheAccessConfig, CacheContext, build_segment_sampler, prepare_cache_context
+    from ssl_core.experiment_contract import DatasetPlan, SignalSpec
     from ssl_core.ctc import (
         CanonicalSequenceDataset,
         LengthAwareBatchSampler,
@@ -34,6 +35,10 @@ try:
     from ssl_core.reporting import ProgressPrinter, append_jsonl, write_metrics_csv
     from ssm_ssl.training import load_encoder_checkpoint
 except ModuleNotFoundError:  # pragma: no cover - repo-root unittest fallback
+    from analysis.active.ssl_experiments.ssl_core.experiment_contract import (
+        DatasetPlan,
+        SignalSpec,
+    )
     from analysis.active.ssl_experiments.ssl_core.cache import (
         CacheAccessConfig,
         CacheContext,
@@ -147,17 +152,20 @@ def _prepare_future_cache_context(config: FuturePredictionSSLConfig) -> CacheCon
             f"Requested pretrain dataset(s) not found under {cache_root}: {missing}. "
             f"Available datasets: {available_datasets}"
         )
-    excluded_datasets = tuple(name for name in available_datasets if name not in set(requested))
     cache_config = CacheAccessConfig(
+        dataset_plan=DatasetPlan.from_mapping(
+            {dataset: () for dataset in requested}
+        ),
+        signal_spec=SignalSpec.from_mode(
+            config.feature_mode,
+            tx_dim=int(config.tx_dim),
+            sbp_dim=int(config.sbp_dim),
+        ),
         mode=str(config.cache_mode),
         local_cache_base=str(config.local_cache_base),
-        excluded_datasets=excluded_datasets,
         seed=int(config.seed),
         segment_bins=int(config.segment_bins),
         use_normalization=bool(config.use_normalization),
-        tx_dim=int(config.tx_dim),
-        sbp_dim=int(config.sbp_dim),
-        feature_mode=str(config.feature_mode),
         boundary_key_mode=str(config.boundary_key_mode),
         precomputed_session_stats_path=config.precomputed_session_stats_path,
     )
@@ -356,7 +364,7 @@ def _make_probe_loader(
     *,
     cache_root: Path,
     stats: dict[str, tuple[np.ndarray, np.ndarray]] | None,
-    feature_mode: str,
+    signal_spec: SignalSpec,
     boundary_key_mode: str,
     dataset: str,
     model_input_dim: int,
@@ -377,8 +385,8 @@ def _make_probe_loader(
         CanonicalSequenceDataset(
             rows,
             cache_root=cache_root,
+            signal_spec=signal_spec,
             stats=stats,
-            feature_mode=str(feature_mode),
             boundary_key_mode=str(boundary_key_mode),
             dataset=str(dataset),
             pad_feature_dim_to=int(model_input_dim),
@@ -728,20 +736,25 @@ def run_frozen_linear_ctc_probe(
     metrics_rows: list[dict[str, Any]] = []
 
     cache_context = _prepare_future_cache_context(config)
+    signal_spec = SignalSpec.from_mode(
+        config.feature_mode,
+        tx_dim=int(config.tx_dim),
+        sbp_dim=int(config.sbp_dim),
+    )
     problem = build_competition_split_problem(
         cache_root=Path(config.cache_root),
+        signal_spec=signal_spec,
         dataset=str(config.dataset),
-        feature_mode=str(config.feature_mode),
         boundary_key_mode=str(config.boundary_key_mode),
     )
-    raw_sample_dim = _feature_dim_from_rows(problem["train_rows"], feature_mode=str(config.feature_mode))
+    raw_sample_dim = int(signal_spec.full_dim)
     sample_dim = max(int(raw_sample_dim), int(config.input_dim))
     stats = _stats_to_numpy(cache_context.session_feature_stats)
     train_loader = _make_probe_loader(
         problem["train_rows"],
         cache_root=Path(problem["cache_root"]),
         stats=stats,
-        feature_mode=str(problem["feature_mode"]),
+        signal_spec=problem["signal_spec"],
         boundary_key_mode=str(problem["boundary_key_mode"]),
         dataset=str(problem["dataset"]),
         model_input_dim=int(sample_dim),
@@ -754,7 +767,7 @@ def run_frozen_linear_ctc_probe(
         problem["val_rows"],
         cache_root=Path(problem["cache_root"]),
         stats=stats,
-        feature_mode=str(problem["feature_mode"]),
+        signal_spec=problem["signal_spec"],
         boundary_key_mode=str(problem["boundary_key_mode"]),
         dataset=str(problem["dataset"]),
         model_input_dim=int(sample_dim),

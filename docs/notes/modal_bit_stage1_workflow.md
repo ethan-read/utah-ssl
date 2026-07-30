@@ -32,7 +32,9 @@ Supporting Modal utilities are:
 This Modal path currently runs the BIT-style stage-1 configuration as:
 
 - backbone: `S5`
-- feature mode: `tx_only`
+- signal: explicit 256-channel TX with zero-padding for narrower datasets
+- datasets and source splits: the exact named `BIT_STAGE1_DATASET_SPLITS` plan
+  (`brain2text24/competition_test` is absent)
 - boundary key mode: `session`
 - cache root: smoothed cache
 - stats: precomputed session-level stats
@@ -59,8 +61,8 @@ Use these local paths as the source of truth for the current Modal stage-1 run:
 
 The relevant stats artifact is:
 
-- `/Users/home/thesis/data/stats/session_feature_stats/smoothed_sigma2p0/tx_only/session/ssl_pretrain_including_brain2text24_excluding_brain2text25_v1.pt`
-- `/Users/home/thesis/data/stats/session_feature_stats/smoothed_sigma2p0/tx_only/session/ssl_pretrain_including_brain2text24_excluding_brain2text25_v1.json`
+- `/Users/home/thesis/data/stats/session_feature_stats/smoothed_sigma2p0/tx_only/session/ssl_pretrain_000950_brain2text24_motor_data_plug_n_play_unsupervised_cursor_recalibration_offline_unsupervised_cursor_recalibration_online_willett_handwriting_plan_f8843486db_v2.pt`
+- `/Users/home/thesis/data/stats/session_feature_stats/smoothed_sigma2p0/tx_only/session/ssl_pretrain_000950_brain2text24_motor_data_plug_n_play_unsupervised_cursor_recalibration_offline_unsupervised_cursor_recalibration_online_willett_handwriting_plan_f8843486db_v2.json`
 
 ## Modal Persistent Volumes
 
@@ -102,8 +104,8 @@ The `utah-ssl-cache` volume should contain:
       smoothed_sigma2p0/
         tx_only/
           session/
-            ssl_pretrain_including_brain2text24_excluding_brain2text25_v1.pt
-            ssl_pretrain_including_brain2text24_excluding_brain2text25_v1.json
+            ssl_pretrain_000950_brain2text24_motor_data_plug_n_play_unsupervised_cursor_recalibration_offline_unsupervised_cursor_recalibration_online_willett_handwriting_plan_f8843486db_v2.pt
+            ssl_pretrain_000950_brain2text24_motor_data_plug_n_play_unsupervised_cursor_recalibration_offline_unsupervised_cursor_recalibration_online_willett_handwriting_plan_f8843486db_v2.json
   uploads/
     ...
 ```

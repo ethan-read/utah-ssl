@@ -21,6 +21,7 @@ from masked_ssl.cache import (  # noqa: E402
     _compute_dataset_cache_source_signature,
     prepare_cache_context,
 )
+from ssl_core.experiment_contract import DatasetPlan, SignalSpec  # noqa: E402
 from ssl_core.scripts.prepare_possm_pooled_cache import (  # noqa: E402
     SUMMARY_NAME,
     prepare_possm_pooled_caches,
@@ -373,6 +374,40 @@ class ShardStoreModalityTests(unittest.TestCase):
             self.assertGreaterEqual(summary["evictions"], 1)
             self.assertGreater(summary["bytes_read"], 0)
 
+    def test_requested_missing_modality_fails_instead_of_returning_none(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            shard = self._write_shard(root, "shard_000", 0.0)
+            (root / shard / "sbp.npy").unlink()
+            store = ShardStore(root, ram_cache_gb=0.01, modalities=("sbp",))
+
+            with self.assertRaisesRegex(FileNotFoundError, "Requested modality 'sbp'"):
+                store.get(shard)
+
+    def test_sbp_only_context_does_not_load_tx(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            primary = root / "canonical"
+            _write_source_root(primary, value_offset=0.0)
+
+            context = prepare_cache_context(
+                cache_candidates=[primary],
+                config=CacheAccessConfig(
+                    dataset_plan={"brain2text24": ()},
+                    signal_spec=SignalSpec.sbp_only(sbp_dim=128),
+                    mode="drive_direct",
+                    use_normalization=False,
+                ),
+            )
+
+            shard = context.shard_store.get(
+                context.rows_by_dataset["brain2text24"][0].shard_relpath
+            )
+            self.assertIsNone(shard["tx"])
+            self.assertIsNotNone(shard["sbp"])
+            self.assertEqual(context.full_dim, 128)
+            self.assertEqual(context.shard_store.summary()["modalities"], ["sbp"])
+
     def test_mixed_root_context_keeps_primary_b2t24_and_overrides_b2t25(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -395,13 +430,13 @@ class ShardStoreModalityTests(unittest.TestCase):
             context = prepare_cache_context(
                 cache_candidates=[primary],
                 config=CacheAccessConfig(
+                    dataset_plan={
+                        "brain2text24": (),
+                        "brain2text25": (),
+                    },
+                    signal_spec=SignalSpec.tx_only(tx_dim=128),
                     mode="drive_direct",
-                    excluded_datasets=(),
                     use_normalization=False,
-                    feature_mode="tx_only",
-                    tx_dim=128,
-                    sbp_dim=128,
-                    included_datasets=("brain2text24", "brain2text25"),
                     dataset_cache_roots={"brain2text25": optimized},
                 ),
             )
@@ -434,7 +469,6 @@ class ShardStoreModalityTests(unittest.TestCase):
             root = Path(tmpdir)
             primary = root / "canonical"
             optimized = root / "optimized"
-            stats_path = root / "mixed_stats.pt"
             _write_source_root(primary, value_offset=0.0)
             _write_dataset(
                 optimized,
@@ -447,36 +481,41 @@ class ShardStoreModalityTests(unittest.TestCase):
                 "brain2text25": ("train", "val"),
             }
 
-            recompute_session_feature_stats(
-                cache_root=primary,
-                output_path=stats_path,
-                feature_mode="tx_only",
-                datasets=("brain2text24", "brain2text25"),
-                tx_dim=128,
-                sbp_dim=128,
-                segment_bins=4,
-                examples_per_shard=1,
-                source_splits_by_dataset=split_policy,
-                dataset_cache_roots={"brain2text25": optimized},
-            )
-            context = prepare_cache_context(
-                cache_candidates=[primary],
-                config=CacheAccessConfig(
-                    mode="drive_direct",
-                    excluded_datasets=(),
-                    use_normalization=True,
-                    feature_mode="tx_only",
-                    tx_dim=128,
-                    sbp_dim=128,
-                    segment_bins=4,
-                    examples_per_shard=1,
-                    included_datasets=("brain2text24", "brain2text25"),
-                    precomputed_session_stats_path=stats_path,
-                    pretrain_source_splits_by_dataset=split_policy,
+            for feature_mode in ("tx_only", "sbp_only"):
+                stats_path = root / f"mixed_stats_{feature_mode}.pt"
+                recompute_session_feature_stats(
+                    cache_root=primary,
+                    output_path=stats_path,
+                    signal_spec=SignalSpec.from_mode(
+                        feature_mode, tx_dim=128, sbp_dim=128
+                    ),
+                    dataset_plan=DatasetPlan.from_mapping(split_policy),
                     dataset_cache_roots={"brain2text25": optimized},
-                ),
-            )
-            self.assertGreater(len(context.session_feature_stats), 0)
+                )
+                stats_metadata = json.loads(stats_path.with_suffix(".json").read_text())
+                self.assertEqual(
+                    stats_metadata["signal_spec"],
+                    SignalSpec.from_mode(
+                        feature_mode, tx_dim=128, sbp_dim=128
+                    ).to_dict(),
+                )
+                context = prepare_cache_context(
+                    cache_candidates=[primary],
+                    config=CacheAccessConfig(
+                        dataset_plan=DatasetPlan.from_mapping(split_policy),
+                        signal_spec=SignalSpec.from_mode(
+                            feature_mode, tx_dim=128, sbp_dim=128
+                        ),
+                        mode="drive_direct",
+                        use_normalization=True,
+                        segment_bins=4,
+                        examples_per_shard=1,
+                        precomputed_session_stats_path=stats_path,
+                        dataset_cache_roots={"brain2text25": optimized},
+                    ),
+                )
+                self.assertGreater(len(context.session_feature_stats), 0)
+                self.assertEqual(context.full_dim, 128)
 
 
 if __name__ == "__main__":

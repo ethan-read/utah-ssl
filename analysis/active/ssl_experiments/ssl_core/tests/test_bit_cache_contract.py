@@ -17,16 +17,16 @@ for path in (REPO_ROOT, EXPERIMENTS_DIR):
         sys.path.insert(0, path_str)
 
 from ssl_core.bit_cache_contract import (
-    BIT_CANONICAL_FEATURE_POLICY,
-    BIT_STAGE1_DEFAULT_EXCLUDED_DATASETS,
-    BIT_STAGE1_DEFAULT_INCLUDED_DATASETS,
-    BIT_STAGE1_DEFAULT_STATS_STEM,
-    BIT_STAGE1_FEATURE_MODE,
-    BIT_STAGE1_SBP_DIM,
+    BIT_STAGE1_DATASET_SPLITS,
+    BIT_STAGE1_DATASETS,
     BIT_STAGE1_TX_DIM,
 )
-from ssl_core.scripts.harmonize_bit_cache import harmonize_bit_cache
-from masked_ssl.cache import CacheAccessConfig, prepare_cache_context
+from ssl_core.experiment_contract import DatasetPlan, SignalSpec
+from masked_ssl.cache import (
+    CacheAccessConfig,
+    prepare_cache_context,
+    resolve_precomputed_session_stats_path,
+)
 from ssl_core.scripts.prepare_bit_cache import prepare_bit_cache
 from ssl_core.stats_artifact_test_utils import write_valid_session_stats_artifact
 
@@ -67,6 +67,11 @@ def _write_tx_sbp_dataset(
                 "example_id": f"{dataset}-0",
                 "session_id": session_id,
                 "subject_id": session_id.split(".")[0],
+                "source_split": (
+                    "competition_train"
+                    if dataset == "brain2text24"
+                    else "train"
+                ),
                 "shard_relpath": f"{dataset}/shards/shard_000",
                 "example_index": 0,
                 "n_time_bins": 3,
@@ -79,6 +84,11 @@ def _write_tx_sbp_dataset(
                 "example_id": f"{dataset}-1",
                 "session_id": session_id.replace("01", "02"),
                 "subject_id": session_id.split(".")[0],
+                "source_split": (
+                    "competition_train"
+                    if dataset == "brain2text24"
+                    else "val"
+                ),
                 "shard_relpath": f"{dataset}/shards/shard_000",
                 "example_index": 1,
                 "n_time_bins": 3,
@@ -130,6 +140,7 @@ def _write_motor_data_dataset(cache_root: Path) -> None:
                     "example_id": f"motor-{shard_id}-{example_index}",
                     "session_id": f"motor.2025.01.0{example_index + 1}",
                     "subject_id": "motor",
+                    "source_split": "none",
                     "shard_relpath": f"motor_data/shards/{shard_id}",
                     "example_index": example_index,
                     "n_time_bins": 3,
@@ -182,6 +193,7 @@ def _write_tx_only_dataset(
                 "example_id": f"{dataset}-0",
                 "session_id": f"{dataset}.2025.01.01",
                 "subject_id": dataset,
+                "source_split": BIT_STAGE1_DATASET_SPLITS[dataset][0],
                 "shard_relpath": f"{dataset}/shards/shard_000",
                 "example_index": 0,
                 "n_time_bins": 3,
@@ -194,6 +206,7 @@ def _write_tx_only_dataset(
                 "example_id": f"{dataset}-1",
                 "session_id": f"{dataset}.2025.01.02",
                 "subject_id": dataset,
+                "source_split": BIT_STAGE1_DATASET_SPLITS[dataset][0],
                 "shard_relpath": f"{dataset}/shards/shard_000",
                 "example_index": 1,
                 "n_time_bins": 3,
@@ -241,42 +254,24 @@ def _write_full_bit_cache(cache_root: Path) -> None:
 
 
 class BitCacheContractTests(unittest.TestCase):
-    def test_harmonize_bit_cache_trims_braintotext25_and_pads_motor_data_tx_only(self) -> None:
+    def test_prepare_bit_cache_rejects_source_as_destination(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             cache_root = Path(tmpdir) / "cache_v1"
             _write_full_bit_cache(cache_root)
+            with self.assertRaisesRegex(ValueError, "destination separate"):
+                prepare_bit_cache(
+                    cache_root=cache_root,
+                    output_root=cache_root,
+                    dry_run=True,
+                )
 
-            summary = harmonize_bit_cache(cache_root)
-
-            self.assertEqual(summary["feature_policy"], BIT_CANONICAL_FEATURE_POLICY)
-            b2t25_tx = np.load(cache_root / "brain2text25/shards/shard_000/tx.npy")
-            b2t25_sbp = np.load(cache_root / "brain2text25/shards/shard_000/sbp.npy")
-            self.assertEqual(b2t25_tx.shape[1], 128)
-            self.assertEqual(b2t25_sbp.shape[1], 128)
-
-            motor_tx_128 = np.load(cache_root / "motor_data/shards/shard_000/tx.npy")
-            motor_tx_256 = np.load(cache_root / "motor_data/shards/shard_001/tx.npy")
-            self.assertEqual(motor_tx_128.shape[1], BIT_STAGE1_TX_DIM)
-            self.assertEqual(motor_tx_256.shape[1], BIT_STAGE1_TX_DIM)
-
-            motor_rows = [
-                json.loads(line)
-                for line in (cache_root / "motor_data/manifest.jsonl").read_text().splitlines()
-            ]
-            self.assertEqual({row["n_tx_features"] for row in motor_rows}, {BIT_STAGE1_TX_DIM})
-            self.assertEqual({row["n_sbp_features"] for row in motor_rows}, {0})
-
-            b2t25_metadata = json.loads((cache_root / "brain2text25/metadata.json").read_text())
-            self.assertTrue(b2t25_metadata["area6v_migration"]["area6v_only"])
-            self.assertFalse(b2t25_metadata["canonical_cache_policy"]["stage1_default_included"])
-
-            included_metadata = json.loads((cache_root / "000950/metadata.json").read_text())
-            self.assertTrue(included_metadata["canonical_cache_policy"]["stage1_default_included"])
-
-    def test_prepare_bit_cache_uses_tx_only_defaults_and_special_stats_stem(self) -> None:
+    def test_prepare_bit_cache_uses_exact_named_plan_without_mutating_source(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             cache_root = Path(tmpdir) / "cache_v1"
             _write_full_bit_cache(cache_root)
+            b2t25_tx_before = np.load(
+                cache_root / "brain2text25/shards/shard_000/tx.npy"
+            ).copy()
 
             summary = prepare_bit_cache(
                 cache_root=cache_root,
@@ -284,37 +279,48 @@ class BitCacheContractTests(unittest.TestCase):
             )
 
             bit_prep = summary["bit_prep"]
-            self.assertEqual(bit_prep["recommended_ssl_feature_mode"], BIT_STAGE1_FEATURE_MODE)
-            self.assertEqual(bit_prep["recommended_boundary_key_mode"], "session")
-            self.assertEqual(bit_prep["recommended_tx_dim"], BIT_STAGE1_TX_DIM)
-            self.assertEqual(bit_prep["excluded_dataset_names"], list(BIT_STAGE1_DEFAULT_EXCLUDED_DATASETS))
-            self.assertNotIn("brain2text25", bit_prep["dataset_names"])
-            self.assertTrue(
-                str(bit_prep["recommended_stats_output_path"]).endswith(
-                    f"/tx_only/session/{BIT_STAGE1_DEFAULT_STATS_STEM}.pt"
-                )
+            self.assertEqual(
+                bit_prep["dataset_plan"],
+                {
+                    dataset: list(source_splits)
+                    for dataset, source_splits in BIT_STAGE1_DATASET_SPLITS.items()
+                },
             )
+            self.assertEqual(bit_prep["signal_spec"]["mode"], "tx_only")
+            self.assertEqual(bit_prep["signal_spec"]["tx_dim"], BIT_STAGE1_TX_DIM)
+            self.assertEqual(bit_prep["boundary_key_mode"], "session")
+            self.assertNotIn("brain2text25", bit_prep["dataset_plan"])
+            np.testing.assert_array_equal(
+                np.load(cache_root / "brain2text25/shards/shard_000/tx.npy"),
+                b2t25_tx_before,
+            )
+            stats_path = str(bit_prep["stats_output_path"])
+            self.assertIn("/tx_only/session/ssl_pretrain_", stats_path)
+            self.assertTrue(stats_path.endswith("_v2.pt"))
 
     def test_prepare_cache_context_discovers_bit_stage1_stats_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             cache_root = Path(tmpdir) / "cache_v1_smoothed_sigma2p0"
             _write_full_bit_cache(cache_root)
-            harmonize_bit_cache(cache_root)
-            stats_path = (
-                Path(tmpdir)
-                / "stats"
-                / "session_feature_stats"
-                / "smoothed_sigma2p0"
-                / "tx_only"
-                / "session"
-                / f"{BIT_STAGE1_DEFAULT_STATS_STEM}.pt"
+            dataset_plan = DatasetPlan.from_mapping(
+                BIT_STAGE1_DATASET_SPLITS
+            )
+            signal_spec = SignalSpec.tx_only(
+                tx_dim=BIT_STAGE1_TX_DIM,
+                missing_channel_policy="zero_pad",
+            )
+            stats_path = resolve_precomputed_session_stats_path(
+                cache_root=cache_root,
+                signal_spec=signal_spec,
+                dataset_plan=dataset_plan,
+                boundary_key_mode="session",
             )
             stats_entries = {
                 f"{dataset}:{dataset}.2025.01.01": (
                     torch.zeros(BIT_STAGE1_TX_DIM),
                     torch.ones(BIT_STAGE1_TX_DIM),
                 )
-                for dataset in BIT_STAGE1_DEFAULT_INCLUDED_DATASETS
+                for dataset in BIT_STAGE1_DATASETS
             }
             stats_entries.update(
                 {
@@ -322,35 +328,35 @@ class BitCacheContractTests(unittest.TestCase):
                         torch.zeros(BIT_STAGE1_TX_DIM),
                         torch.ones(BIT_STAGE1_TX_DIM),
                     )
-                    for dataset in BIT_STAGE1_DEFAULT_INCLUDED_DATASETS
+                    for dataset in BIT_STAGE1_DATASETS
                 }
             )
             write_valid_session_stats_artifact(
                 cache_root=cache_root,
                 stats_path=stats_path,
                 stats_entries=stats_entries,
-                feature_mode="tx_only",
+                signal_spec=signal_spec,
+                dataset_plan=dataset_plan,
                 boundary_key_mode="session",
-                tx_dim=BIT_STAGE1_TX_DIM,
-                sbp_dim=BIT_STAGE1_SBP_DIM,
-                excluded_datasets=BIT_STAGE1_DEFAULT_EXCLUDED_DATASETS,
             )
 
             context = prepare_cache_context(
                 cache_candidates=[cache_root],
                 config=CacheAccessConfig(
+                    dataset_plan={
+                        dataset: source_splits
+                        for dataset, source_splits in BIT_STAGE1_DATASET_SPLITS.items()
+                    },
+                    signal_spec=signal_spec,
                     mode="drive_direct",
-                    excluded_datasets=BIT_STAGE1_DEFAULT_EXCLUDED_DATASETS,
-                    feature_mode="tx_only",
-                    tx_dim=BIT_STAGE1_TX_DIM,
-                    sbp_dim=BIT_STAGE1_SBP_DIM,
                     use_normalization=True,
+                    precomputed_session_stats_path=stats_path,
                 ),
             )
 
             self.assertEqual(
                 sorted(context.pretrain_datasets),
-                sorted(BIT_STAGE1_DEFAULT_INCLUDED_DATASETS),
+                sorted(BIT_STAGE1_DATASETS),
             )
             self.assertEqual(
                 sorted(context.session_feature_stats),

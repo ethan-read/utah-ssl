@@ -21,6 +21,9 @@ from typing import Any, Iterable, Sequence
 import numpy as np
 import torch
 
+from ssl_core.feature_contract import SUPPORTED_FEATURE_MODES
+from ssl_core.experiment_contract import SignalSpec
+
 from masked_ssl.cache import (
     CacheAccessConfig,
     _compute_cache_source_signature,
@@ -33,7 +36,7 @@ from masked_ssl.cache import (
 
 DEFAULT_DATASET = "brain2text24"
 DEFAULT_SEGMENT_BINS = 80
-DEFAULT_FEATURE_MODES = ("tx_only", "tx_sbp")
+DEFAULT_FEATURE_MODES = SUPPORTED_FEATURE_MODES
 
 
 @dataclass(frozen=True)
@@ -344,20 +347,28 @@ def _build_context_for_mode(
     segment_bins: int,
     feature_mode: str,
 ) -> dict[str, Any]:
-    available_datasets = sorted(path.name for path in cache_root.iterdir() if path.is_dir()) if cache_root.exists() else []
-    excluded = tuple(name for name in available_datasets if name != dataset_name)
-    config = CacheAccessConfig(
-        mode="drive_direct",
-        excluded_datasets=excluded,
-        seed=7,
-        segment_bins=int(segment_bins),
-        use_normalization=False,
-        examples_per_shard=8,
-        feature_mode=str(feature_mode),
-        boundary_key_mode="session",
-        gaussian_smoothing_sigma_bins=0.0,
-    )
     try:
+        metadata = json.loads(
+            (cache_root / dataset_name / "metadata.json").read_text()
+        )
+        feature_layout = metadata.get("feature_layout") or {}
+        tx_dim = int(feature_layout.get("n_tx_features", 0) or 0)
+        sbp_dim = int(feature_layout.get("n_sbp_features", 0) or 0)
+        config = CacheAccessConfig(
+            dataset_plan={dataset_name: ()},
+            signal_spec=SignalSpec.from_mode(
+                feature_mode,
+                tx_dim=tx_dim,
+                sbp_dim=sbp_dim,
+            ),
+            mode="drive_direct",
+            seed=7,
+            segment_bins=int(segment_bins),
+            use_normalization=False,
+            examples_per_shard=8,
+            boundary_key_mode="session",
+            gaussian_smoothing_sigma_bins=0.0,
+        )
         context = prepare_cache_context(cache_candidates=[cache_root], config=config)
     except Exception as exc:
         return {
@@ -531,21 +542,26 @@ def _classify_stats_feature_modes(
 ) -> dict[str, bool]:
     dims = sorted({int(dim) for dim in unique_dims if int(dim) > 0})
     if not dims:
-        return {"tx_only": False, "tx_sbp": False}
-    feature_mode = None if not isinstance(metadata, dict) else metadata.get("feature_mode")
-    if feature_mode == "tx_only":
-        return {"tx_only": True, "tx_sbp": False}
-    if feature_mode == "tx_sbp":
-        return {"tx_only": False, "tx_sbp": True}
+        return {mode: False for mode in SUPPORTED_FEATURE_MODES}
+    signal_spec = None if not isinstance(metadata, dict) else metadata.get("signal_spec")
+    feature_mode = (
+        signal_spec.get("mode")
+        if isinstance(signal_spec, dict)
+        else (None if not isinstance(metadata, dict) else metadata.get("feature_mode"))
+    )
+    if feature_mode in SUPPORTED_FEATURE_MODES:
+        return {mode: mode == feature_mode for mode in SUPPORTED_FEATURE_MODES}
     if len(dims) == 1:
         only_dim = int(dims[0])
         return {
             "tx_only": bool(only_dim in {128, 256}),
+            "sbp_only": bool(only_dim in {128, 256}),
             "tx_sbp": bool(only_dim in {256, 512}),
         }
     smallest_dim = min(dims)
     return {
         "tx_only": bool(smallest_dim in {128, 256}),
+        "sbp_only": bool(smallest_dim in {128, 256}),
         "tx_sbp": False,
     }
 
@@ -607,10 +623,15 @@ def audit_stats_artifact(spec: StatsAuditInput, dataset_names: Sequence[str]) ->
         name: sorted(dataset_session_keys.get(name, set()))
         for name in dataset_names
     }
-    if report["compatible_feature_modes"]["tx_only"] and not report["compatible_feature_modes"]["tx_sbp"]:
-        report["findings"].append("tx_only_only_not_tx_sbp")
-    if not report["compatible_feature_modes"]["tx_only"]:
-        report["findings"].append("insufficient_dims_for_tx_only")
+    compatible_modes = [
+        mode
+        for mode, compatible in report["compatible_feature_modes"].items()
+        if compatible
+    ]
+    if len(compatible_modes) == 1:
+        report["findings"].append(f"stats_signal_mode:{compatible_modes[0]}")
+    if not compatible_modes:
+        report["findings"].append("stats_signal_mode_unresolved")
     return report
 
 
@@ -701,7 +722,13 @@ def compare_stats_to_roots(
                 manifest_sessions = (ds.get("manifest_summary") or {}).get("session_count")
                 manifest_session_keys = set()
                 mode_audits = ds.get("feature_mode_audits") or {}
-                mode_report = mode_audits.get("tx_only") or next(iter(mode_audits.values()), {})
+                stats_signal_spec = stats_meta.get("signal_spec")
+                stats_mode = (
+                    stats_signal_spec.get("mode")
+                    if isinstance(stats_signal_spec, dict)
+                    else stats_meta.get("feature_mode")
+                )
+                mode_report = mode_audits.get(stats_mode) or next(iter(mode_audits.values()), {})
                 summary = mode_report.get("session_split_summary") or {}
                 for split_name in ("train_session_ids", "val_session_ids"):
                     values = summary.get(split_name)
@@ -818,7 +845,8 @@ def print_report(report: dict[str, Any]) -> None:
             compat = stats_report.get("compatible_feature_modes") or {}
             print(
                 f"- {stats_report.get('stats_path')} | exists={stats_report.get('exists')} "
-                f"sessions={stats_report.get('session_count')} tx_only={compat.get('tx_only')} tx_sbp={compat.get('tx_sbp')}"
+                f"sessions={stats_report.get('session_count')} modes="
+                f"{[mode for mode, compatible in compat.items() if compatible]}"
             )
             if stats_report.get("findings"):
                 print(f"  findings: {', '.join(stats_report['findings'])}")
@@ -845,7 +873,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset", default=DEFAULT_DATASET, help="Primary dataset to audit.")
     parser.add_argument("--compare-dataset", action="append", default=[], help="Additional dataset(s) to include.")
     parser.add_argument("--segment-bins", type=int, default=DEFAULT_SEGMENT_BINS, help="Segment length to test against sampling eligibility.")
-    parser.add_argument("--feature-mode", action="append", choices=sorted(DEFAULT_FEATURE_MODES), default=[], help="Feature mode(s) to audit. Defaults to both tx_only and tx_sbp.")
+    parser.add_argument("--feature-mode", action="append", choices=sorted(DEFAULT_FEATURE_MODES), default=[], help="Feature mode(s) to audit. Defaults to tx_only, sbp_only, and tx_sbp.")
     parser.add_argument("--sample-shards", type=int, default=3, help="Number of shards to inspect per dataset when not doing a deep array check.")
     parser.add_argument("--deep-array-check", action="store_true", help="Scan every shard for array-level consistency and dense-channel checks.")
     parser.add_argument("--output-json", type=Path, default=None, help="Optional path to save the JSON report.")

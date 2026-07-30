@@ -26,6 +26,7 @@ try:
     from ssl_core.stats import (
         compute_feature_stats,
     )
+    from ssl_core.experiment_contract import SignalSpec
 except ModuleNotFoundError:  # pragma: no cover - repo-root unittest fallback
     from analysis.active.ssl_experiments.masked_ssl.probe import apply_feature_stats
     from analysis.active.ssl_experiments.ssl_core.cache import (
@@ -42,6 +43,7 @@ except ModuleNotFoundError:  # pragma: no cover - repo-root unittest fallback
     from analysis.active.ssl_experiments.ssl_core.stats import (
         compute_feature_stats,
     )
+    from analysis.active.ssl_experiments.ssl_core.experiment_contract import SignalSpec
 
 
 @dataclass(frozen=True)
@@ -349,11 +351,30 @@ def build_willett_problem(
     cv_num_folds: int = 5,
     cv_fold_index: int = 0,
 ) -> dict[str, Any]:
+    metadata_path = Path(cache_root) / str(dataset) / "metadata.json"
+    metadata = json.loads(metadata_path.read_text())
+    feature_layout = dict(metadata.get("feature_layout") or {})
+    tx_dim = int(metadata.get("n_tx_features", feature_layout.get("n_tx_features", 0)))
+    sbp_dim = int(metadata.get("n_sbp_features", feature_layout.get("n_sbp_features", 0)))
+    if tx_dim <= 0 or sbp_dim <= 0:
+        manifest_path = Path(cache_root) / str(dataset) / "manifest.jsonl"
+        first_manifest_row = next(
+            json.loads(line)
+            for line in manifest_path.read_text().splitlines()
+            if line.strip()
+        )
+        tx_dim = max(tx_dim, int(first_manifest_row.get("n_tx_features", 0)))
+        sbp_dim = max(sbp_dim, int(first_manifest_row.get("n_sbp_features", 0)))
+    signal_spec = SignalSpec.from_mode(
+        str(feature_mode),
+        tx_dim=tx_dim,
+        sbp_dim=sbp_dim,
+    )
     if str(split_policy) == "competition_train_test":
         problem = build_competition_split_problem(
             cache_root=Path(cache_root),
             dataset=str(dataset),
-            feature_mode=str(feature_mode),
+            signal_spec=signal_spec,
             boundary_key_mode=str(boundary_key_mode),
         )
         return problem
@@ -361,7 +382,7 @@ def build_willett_problem(
         problem = build_source_split_problem(
             cache_root=Path(cache_root),
             dataset=str(dataset),
-            feature_mode=str(feature_mode),
+            signal_spec=signal_spec,
             boundary_key_mode=str(boundary_key_mode),
             train_split_name="train",
             val_split_name="val",
@@ -377,7 +398,7 @@ def build_willett_problem(
     problem = build_competition_split_problem(
         cache_root=Path(cache_root),
         dataset=str(dataset),
-        feature_mode=str(feature_mode),
+        signal_spec=signal_spec,
         boundary_key_mode=str(boundary_key_mode),
     )
 
@@ -461,6 +482,14 @@ def compute_willett_normalization_stats(
     mode: str,
 ) -> dict[str, tuple[np.ndarray, np.ndarray]] | tuple[np.ndarray, np.ndarray] | None:
     resolved_mode = str(mode)
+    if not rows:
+        raise ValueError("Cannot compute normalization stats for an empty row set")
+    first_row = rows[0]
+    signal_spec = SignalSpec.from_mode(
+        str(feature_mode),
+        tx_dim=int(first_row.n_tx_features),
+        sbp_dim=int(first_row.n_sbp_features),
+    )
     if resolved_mode == "none":
         return None
     if resolved_mode == "global":
@@ -468,19 +497,24 @@ def compute_willett_normalization_stats(
             rows,
             cache_root=cache_root,
             mode="global",
-            feature_mode=feature_mode,
+            signal_spec=signal_spec,
         )
     if resolved_mode == "per_session":
         return compute_feature_stats(
             rows,
             cache_root=cache_root,
             mode="per_session",
-            feature_mode=feature_mode,
+            signal_spec=signal_spec,
         )
     if resolved_mode != "block":
         raise ValueError("mode must be one of {'block', 'global', 'per_session', 'none'}")
 
-    accessor = CanonicalSequenceDataset(rows, cache_root=cache_root, stats=None, feature_mode=feature_mode)._accessor
+    accessor = CanonicalSequenceDataset(
+        rows,
+        cache_root=cache_root,
+        signal_spec=signal_spec,
+        stats=None,
+    )._accessor
     try:
         grouped: dict[str, list[Any]] = {}
         for row in rows:
@@ -491,7 +525,7 @@ def compute_willett_normalization_stats(
             sum_x = None
             sum_x2 = None
             for row in group_rows:
-                x = accessor.load_features(row, feature_mode=feature_mode)
+                x = accessor.load_features(row, signal_spec=signal_spec)
                 x64 = x.astype(np.float64, copy=False)
                 if sum_x is None:
                     sum_x = x64.sum(axis=0)
@@ -531,22 +565,27 @@ class ConcatenatedPredictedTxSequenceDataset(torch.utils.data.Dataset):
         self.boundary_key_mode = str(boundary_key_mode)
         self.dataset = str(dataset)
         self.export_accessor = export_accessor
+        signal_spec = SignalSpec.tx_only(tx_dim=int(self.rows[0].n_tx_features))
         self._base = CanonicalSequenceDataset(
             self.rows,
             cache_root=cache_root,
+            signal_spec=signal_spec,
             stats=None,
-            feature_mode="tx_only",
             boundary_key_mode=self.boundary_key_mode,
             dataset=self.dataset,
         )
         self._accessor = self._base._accessor
+        self.signal_spec = signal_spec
 
     def __len__(self) -> int:
         return len(self.rows)
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
         row = self.rows[idx]
-        raw_tx = np.asarray(self._accessor.load_features(row, feature_mode="tx_only"), dtype=np.float32)
+        raw_tx = np.asarray(
+            self._accessor.load_features(row, signal_spec=self.signal_spec),
+            dtype=np.float32,
+        )
         predicted_tx = np.asarray(self.export_accessor.duplicated_predicted_tx_for_row(row), dtype=np.float32)
         usable = min(int(raw_tx.shape[0]), int(predicted_tx.shape[0]))
         if usable <= 0:

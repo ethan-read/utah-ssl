@@ -11,11 +11,13 @@ from masked_ssl.objectives_mae import compute_masked_reconstruction_metrics
 from masked_ssl.phoneme_finetune import _recover_stage1_encoder
 from masked_ssl.probe import _recover_encoder_from_notebook_checkpoint
 from masked_ssl.training_mae import SSLTrainingConfig
+from ssl_core.experiment_contract import SignalSpec
 
 
 def _make_model() -> MaskedSSLModel:
     return MaskedSSLModel(
         input_dim=4,
+        signal_spec=SignalSpec.tx_only(tx_dim=4),
         hidden_size=16,
         s5_state_size=8,
         num_layers=1,
@@ -24,7 +26,6 @@ def _make_model() -> MaskedSSLModel:
         patch_stride=1,
         post_proj_norm="rms",
         source_session_keys=("s0", "s1"),
-        feature_mode="tx_only",
         reconstruction_head_mode="no_output_norm",
         reconstruction_head_type="mlp",
         backbone_direction="bidirectional",
@@ -73,7 +74,10 @@ class MaskedSSLMAETests(unittest.TestCase):
 
     def test_mae_training_config_requires_visible_only_mask_mode(self) -> None:
         with self.assertRaises(ValueError):
-            SSLTrainingConfig(mask_token_placement="before_projection")
+            SSLTrainingConfig(
+                signal_spec=SignalSpec.tx_only(tx_dim=4),
+                mask_token_placement="before_projection",
+            )
 
     def test_mae_checkpoint_loads_in_probe_recovery(self) -> None:
         model = _make_model()
@@ -93,7 +97,7 @@ class MaskedSSLMAETests(unittest.TestCase):
                         "dropout": 0.0,
                         "post_proj_norm": "rms",
                         "source_session_keys": ["s0", "s1"],
-                        "feature_mode": "tx_only",
+                        "signal_spec": SignalSpec.tx_only(tx_dim=4).to_dict(),
                         "backbone_direction": "bidirectional",
                         "max_patches": 8,
                     },
@@ -124,7 +128,7 @@ class MaskedSSLMAETests(unittest.TestCase):
                         "dropout": 0.0,
                         "post_proj_norm": "rms",
                         "source_session_keys": ["s0", "s1"],
-                        "feature_mode": "tx_only",
+                        "signal_spec": SignalSpec.tx_only(tx_dim=4).to_dict(),
                         "backbone_direction": "bidirectional",
                         "max_patches": 8,
                     },

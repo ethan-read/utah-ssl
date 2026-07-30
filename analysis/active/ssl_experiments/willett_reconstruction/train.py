@@ -330,19 +330,18 @@ def run_willett_reconstruction(config: WillettReconstructionConfig) -> dict[str,
             cache_root=Path(config.cache_root),
             dataset=str(config.dataset),
             train_split_name=str(problem["train_split_name"]),
-            feature_mode=str(config.feature_mode),
+            signal_spec=problem["signal_spec"],
             preferred_path=config.precomputed_split_stats_path,
         )
         (mean_t, std_t), stats_metadata, loaded_stats_path = load_precomputed_split_feature_stats(
             stats_path=resolved_stats_path,
             cache_root=Path(problem["cache_root"]),
             dataset=str(problem["dataset"]),
-            feature_mode=str(problem["feature_mode"]),
+            signal_spec=problem["signal_spec"],
             boundary_key_mode=str(problem["boundary_key_mode"]),
             split_policy=str(problem["split_policy"]),
             train_split_name=str(problem["train_split_name"]),
             val_split_name=str(problem["val_split_name"]),
-            expected_dim=base_sample_dim,
         )
         train_stats = (
             mean_t.numpy().astype(np.float32, copy=False),
@@ -387,8 +386,8 @@ def run_willett_reconstruction(config: WillettReconstructionConfig) -> dict[str,
         val_dataset = CanonicalSequenceDataset(
             problem["val_rows"],
             cache_root=Path(problem["cache_root"]),
+            signal_spec=problem["signal_spec"],
             stats=val_stats,
-            feature_mode=str(problem["feature_mode"]),
             boundary_key_mode=str(problem["boundary_key_mode"]),
             dataset=str(problem["dataset"]),
         )
@@ -458,8 +457,8 @@ def run_willett_reconstruction(config: WillettReconstructionConfig) -> dict[str,
             CanonicalSequenceDataset(
                 adapter_rows,
                 cache_root=Path(problem["cache_root"]),
+                signal_spec=problem["signal_spec"],
                 stats=train_stats,
-                feature_mode=str(problem["feature_mode"]),
                 boundary_key_mode=str(problem["boundary_key_mode"]),
                 dataset=str(problem["dataset"]),
             )

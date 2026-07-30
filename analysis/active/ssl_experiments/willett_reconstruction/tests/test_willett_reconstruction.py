@@ -15,6 +15,7 @@ from analysis.active.ssl_experiments.ssl_core.scripts.recompute_split_feature_st
 from analysis.active.ssl_experiments.ssl_core.stats_artifact_test_utils import (
     write_valid_split_stats_artifact as _write_valid_split_stats_artifact,
 )
+from analysis.active.ssl_experiments.ssl_core.experiment_contract import SignalSpec
 from analysis.active.ssl_experiments.willett_reconstruction.data import (
     ConcatenatedPredictedTxSequenceDataset,
     FuturePredictionExportAccessor,
@@ -541,18 +542,18 @@ class WillettReconstructionTest(unittest.TestCase):
             cache_root=cache_root,
             dataset="brain2text24",
             train_split_name="competition_train",
-            feature_mode="tx_only",
+            signal_spec=SignalSpec.tx_only(tx_dim=3),
             preferred_path=None,
         )
         _write_valid_split_stats_artifact(
             cache_root=cache_root,
             stats_path=stats_path,
             dataset="brain2text24",
-            feature_mode="tx_only",
+            signal_spec=SignalSpec.tx_only(tx_dim=3),
             boundary_key_mode="session",
+            split_policy="competition_train_test",
             train_split_name="competition_train",
             val_split_name="competition_test",
-            dim=3,
         )
         config = WillettReconstructionConfig(
             cache_root=cache_root,
@@ -611,18 +612,18 @@ class WillettReconstructionTest(unittest.TestCase):
             cache_root=cache_root,
             dataset="brain2text24",
             train_split_name="competition_train",
-            feature_mode="tx_only",
+            signal_spec=SignalSpec.tx_only(tx_dim=3),
             preferred_path=None,
         )
         _write_valid_split_stats_artifact(
             cache_root=cache_root,
             stats_path=stats_path,
             dataset="brain2text24",
-            feature_mode="tx_only",
+            signal_spec=SignalSpec.tx_only(tx_dim=3),
             boundary_key_mode="session",
+            split_policy="competition_train_test",
             train_split_name="competition_train",
             val_split_name="competition_test",
-            dim=3,
         )
         config = WillettReconstructionConfig(
             cache_root=cache_root,
@@ -701,7 +702,7 @@ class WillettReconstructionTest(unittest.TestCase):
             cache_root=cache_root,
             output_path=output_path,
             dataset="brain2text25",
-            feature_mode="tx_sbp",
+            signal_spec=SignalSpec.tx_sbp(tx_dim=5, sbp_dim=5),
             boundary_key_mode="session",
             split_policy="source_train_val",
             overwrite=True,
@@ -722,18 +723,18 @@ class WillettReconstructionTest(unittest.TestCase):
             cache_root=cache_root,
             dataset="brain2text24",
             train_split_name="competition_train",
-            feature_mode="tx_only",
+            signal_spec=SignalSpec.tx_only(tx_dim=3),
             preferred_path=None,
         )
         _write_valid_split_stats_artifact(
             cache_root=cache_root,
             stats_path=stats_path,
             dataset="brain2text24",
-            feature_mode="tx_only",
+            signal_spec=SignalSpec.tx_only(tx_dim=3),
             boundary_key_mode="session",
+            split_policy="competition_train_test",
             train_split_name="competition_train",
             val_split_name="competition_test",
-            dim=3,
         )
         config = WillettReconstructionConfig(
             cache_root=cache_root,
@@ -819,18 +820,18 @@ class WillettReconstructionTest(unittest.TestCase):
             cache_root=cache_root,
             dataset="brain2text24",
             train_split_name="competition_train",
-            feature_mode="tx_only",
+            signal_spec=SignalSpec.tx_only(tx_dim=3),
             preferred_path=None,
         )
         _write_valid_split_stats_artifact(
             cache_root=cache_root,
             stats_path=stats_path,
             dataset="brain2text24",
-            feature_mode="tx_only",
+            signal_spec=SignalSpec.tx_only(tx_dim=3),
             boundary_key_mode="session",
+            split_policy="competition_train_test",
             train_split_name="competition_train",
             val_split_name="competition_test",
-            dim=3,
         )
         config = WillettReconstructionConfig(
             cache_root=cache_root,
@@ -906,18 +907,18 @@ class WillettReconstructionTest(unittest.TestCase):
             cache_root=cache_root,
             dataset="brain2text24",
             train_split_name="competition_train",
-            feature_mode="tx_only",
+            signal_spec=SignalSpec.tx_only(tx_dim=3),
             preferred_path=None,
         )
         _write_valid_split_stats_artifact(
             cache_root=cache_root,
             stats_path=stats_path,
             dataset="brain2text24",
-            feature_mode="tx_only",
+            signal_spec=SignalSpec.tx_only(tx_dim=3),
             boundary_key_mode="session",
+            split_policy="competition_train_test",
             train_split_name="competition_train",
             val_split_name="competition_test",
-            dim=3,
         )
         payload = torch.load(stats_path, map_location="cpu")
         payload["metadata"]["source_cache_signature"] = "stale"

@@ -331,7 +331,7 @@ def _load_train_stats(
             cache_root=Path(config.cache_root),
             dataset=str(config.dataset),
             train_split_name=str(problem["train_split_name"]),
-            feature_mode=str(config.feature_mode),
+            signal_spec=problem["signal_spec"],
             preferred_path=config.precomputed_split_stats_path,
         )
         if stats_path.exists():
@@ -339,11 +339,11 @@ def _load_train_stats(
                 stats_path=stats_path,
                 cache_root=Path(problem["cache_root"]),
                 dataset=str(problem["dataset"]),
-                feature_mode=str(problem["feature_mode"]),
+                signal_spec=problem["signal_spec"],
                 boundary_key_mode=str(problem["boundary_key_mode"]),
                 train_split_name=str(problem["train_split_name"]),
                 val_split_name=str(problem["val_split_name"]),
-                expected_dim=int(base_sample_dim),
+                split_policy=str(problem["split_policy"]),
             )
             return (
                 mean_t.numpy().astype(np.float32, copy=False),
@@ -530,8 +530,8 @@ def export_willett_representations(config: RepresentationExportConfig) -> dict[s
         CanonicalSequenceDataset(
             selected_rows,
             cache_root=Path(problem["cache_root"]),
+            signal_spec=problem["signal_spec"],
             stats=train_stats,
-            feature_mode=str(problem["feature_mode"]),
             boundary_key_mode=str(problem["boundary_key_mode"]),
             dataset=str(problem["dataset"]),
         )
