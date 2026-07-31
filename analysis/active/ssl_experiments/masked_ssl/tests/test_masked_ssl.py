@@ -1827,6 +1827,37 @@ class MaskedSSLTests(unittest.TestCase):
         sampler_b.load_state_dict(saved_state)
         self.assertEqual(list(iter(sampler_b)), expected_next)
 
+    def test_length_aware_batch_sampler_reports_iteration_specific_batch_count(self) -> None:
+        rows = [
+            CanonicalProbeManifestRow(
+                example_id=f"ex-{idx}",
+                session_id="t12.2022.08.10",
+                subject_id="t12",
+                source_split="competition_train",
+                has_labels=True,
+                shard_relpath="brain2text24/toy_shard",
+                example_index=idx,
+                n_tx_features=3,
+                n_sbp_features=2,
+                target_length=2,
+                transcript="AA",
+                n_time_bins=length,
+            )
+            for idx, length in enumerate((4, 20, 5, 19, 6, 18, 7, 17, 8, 16))
+        ]
+        sampler = LengthAwareBatchSampler(
+            rows,
+            max_examples_per_microbatch=3,
+            max_padded_time_per_microbatch=30,
+            shuffle=True,
+            seed=11,
+        )
+
+        for iteration_count in range(5):
+            expected = sampler.num_batches_for_iteration(iteration_count)
+            sampler.load_state_dict({"iteration_count": iteration_count})
+            self.assertEqual(len(list(iter(sampler))), expected)
+
     def test_length_aware_batch_sampler_validation_order_is_stable(self) -> None:
         rows = [
             CanonicalProbeManifestRow(

@@ -572,14 +572,26 @@ class LengthAwareBatchSampler(torch.utils.data.Sampler[list[int]]):
             raise ValueError("iteration_count must be non-negative")
         self._iteration_count = iteration_count
 
-    def _ordered_indices(self) -> list[int]:
+    def _ordered_indices(self, *, iteration_count: int | None = None) -> list[int]:
         indices = list(range(len(self.rows)))
         if not self.shuffle:
             return indices
+        resolved_iteration_count = (
+            int(self._iteration_count)
+            if iteration_count is None
+            else int(iteration_count)
+        )
+        if resolved_iteration_count < 0:
+            raise ValueError("iteration_count must be non-negative")
         generator = torch.Generator()
-        generator.manual_seed(self.seed + self._iteration_count)
+        generator.manual_seed(self.seed + resolved_iteration_count)
         permutation = torch.randperm(len(indices), generator=generator)
         return permutation.tolist()
+
+    def num_batches_for_iteration(self, iteration_count: int) -> int:
+        """Return the deterministic batch count for one sampler iteration."""
+        ordered_indices = self._ordered_indices(iteration_count=int(iteration_count))
+        return len(self._build_batches(ordered_indices))
 
     def _build_batches(self, ordered_indices: Sequence[int]) -> list[list[int]]:
         batches: list[list[int]] = []
@@ -611,8 +623,7 @@ class LengthAwareBatchSampler(torch.utils.data.Sampler[list[int]]):
             yield batch
 
     def __len__(self) -> int:
-        ordered_indices = list(range(len(self.rows)))
-        return len(self._build_batches(ordered_indices))
+        return self.num_batches_for_iteration(self._iteration_count)
 
 
 def _session_ids_from_split(split: Any) -> tuple[tuple[str, ...], tuple[str, ...]]:

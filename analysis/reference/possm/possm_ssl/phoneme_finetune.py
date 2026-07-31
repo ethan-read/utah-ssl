@@ -1387,18 +1387,22 @@ def run_possm_phoneme_finetuning(
         accumulated_model_seconds = 0.0
         has_pending_gradients = False
 
-    if train_batches_consumed > len(train_loader):
+    resume_iteration_batches = train_batch_sampler.num_batches_for_iteration(
+        train_iteration_index
+    )
+    if train_batches_consumed > resume_iteration_batches:
         raise ValueError(
             "Stage-2 checkpoint batch position exceeds the reconstructed "
             f"iteration length: iteration={train_iteration_index}, "
             f"batches_consumed={train_batches_consumed}, "
-            f"iteration_batches={len(train_loader)}"
+            f"iteration_batches={resume_iteration_batches}"
         )
-    if resume_rng_state is not None and train_batches_consumed == len(train_loader):
+    if train_batches_consumed == resume_iteration_batches:
         # The checkpoint was written after the final batch but before the
         # iterator observed StopIteration. Resume directly at the next
         # deterministic permutation.
-        _restore_torch_rng_state(resume_rng_state)
+        if resume_rng_state is not None:
+            _restore_torch_rng_state(resume_rng_state)
         resume_rng_state = None
         train_iteration_index += 1
         train_batches_consumed = 0
