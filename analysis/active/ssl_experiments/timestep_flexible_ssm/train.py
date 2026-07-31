@@ -17,13 +17,13 @@ import torch
 from torch.utils.data import DataLoader
 
 try:
-    from ssl_core.scripts.recompute_split_feature_stats import (
+    from ssl_core.stats import (
         load_precomputed_split_feature_stats,
         resolve_precomputed_split_stats_path,
     )
     from ssl_core.ctc import compute_ctc_loss_sum
 except ModuleNotFoundError:  # pragma: no cover - repo-root unittest fallback
-    from analysis.active.ssl_experiments.ssl_core.scripts.recompute_split_feature_stats import (
+    from analysis.active.ssl_experiments.ssl_core.stats import (
         load_precomputed_split_feature_stats,
         resolve_precomputed_split_stats_path,
     )

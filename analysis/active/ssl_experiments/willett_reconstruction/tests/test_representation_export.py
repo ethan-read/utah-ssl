@@ -12,7 +12,7 @@ import torch
 from analysis.active.ssl_experiments.ssl_core.stats_artifact_test_utils import (
     write_valid_split_stats_artifact as _write_valid_split_stats_artifact,
 )
-from analysis.active.ssl_experiments.ssl_core.scripts.recompute_split_feature_stats import (
+from analysis.active.ssl_experiments.ssl_core.stats import (
     resolve_precomputed_split_stats_path,
 )
 from analysis.active.ssl_experiments.ssl_core.experiment_contract import SignalSpec

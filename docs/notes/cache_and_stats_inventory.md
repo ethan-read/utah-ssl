@@ -83,9 +83,13 @@ destinations are projected/repacked independently so smoothing is not
 regenerated across new example boundaries. Brain2Text24 continues to come
 directly from the canonical roots and is not copied or modified.
 
-The matching pooled session stats live under:
+The matching pooled session stats use the generic mixed-data-view layout:
 
-- `utah_ssl/data/stats/session_feature_stats/possm_b2t24_canonical_b2t25_area6v_sigma2p0_v1/sbp_only/session/`
+- `utah_ssl/data/stats/session_feature_stats/smoothed_sigma2p0_mixed_<source-signature>/sbp_only/session/`
+
+The remaining filename is derived from the explicit `DatasetPlan`. Neither the
+directory nor the artifact metadata names POSSM; any compatible SSL model can
+reuse the same statistics.
 
 The preparation notebook performs logical example-level validation before a
 partial cache is promoted to its final root.
@@ -100,6 +104,38 @@ Reusable normalization statistics should now live with the data artifacts under
 `utah_ssl/data/stats`, not under experiment-output folders. The older
 `outputs/ssl_experiments/contrastive/precomputed_ssl_session_stats` location is
 legacy and may be absent in a fresh Drive organization.
+
+### Active Artifact Set
+
+Do not precompute every raw/smoothed, signal-mode, and normalization-scope
+combination. Generate an artifact only for a pipeline that actually consumes
+it. As of 2026-07-31, the active pooled POSSM workflow needs exactly:
+
+| Purpose | Cache view | Signal | Scope | Selected rows |
+|---|---|---|---|---|
+| pooled Stage 1 | sigma-2 pre-smoothed | SBP | session | B2T24 `competition_train`; B2T25 `train`,`val` |
+| Stage 2 | raw | SBP | global | B2T24 `competition_train` |
+
+A fresh B2T24-only SBP baseline adds one optional artifact: sigma-2
+pre-smoothed, SBP, session scope, B2T24 `competition_train`. Existing completed
+TX checkpoints retain their original artifacts for reproducibility but do not
+make those artifacts active defaults.
+
+The `.pt` tensor payload and `.json` provenance sidecar are one logical
+artifact. Keep both. Raw and smoothed stats are not interchangeable, but both
+versions are not required unless both data views are actually consumed.
+
+Drive audit on 2026-07-31 found ten historical logical artifacts: four session,
+four split/global, and two under the obsolete `stage1_global_feature_stats`
+namespace. None supplies the current pooled SBP-session plus raw-B2T24-SBP
+global pair. Treat `stage1_global_feature_stats` and negative-policy names such
+as `excluding_brain2text25` as legacy. Do not create new files under those
+namespaces.
+
+The seven artifacts under `/Users/home/thesis/data/stats` predate the current
+local cache signatures and/or area-6v dimensions. They are historical copies,
+not valid active defaults. Validated loaders should reject them rather than
+silently reusing them.
 
 ### Canonical Drive Layout
 
@@ -137,6 +173,47 @@ the directory name.
 The `.pt` files contain tensors/arrays. The paired `.json` files contain
 human-readable provenance such as cache variant, feature mode, split policy,
 dataset list, and creation time.
+
+Use the shared generator for new artifacts:
+
+- `analysis/active/ssl_experiments/ssl_core/scripts/recompute_feature_stats.py`
+
+Select `--scope session` for pretraining/session normalization or
+`--scope global` for train-split global normalization. New artifacts retain
+the established Brain2Text24 compatibility keys (`session_feature_stats` or
+top-level `mean`/`std`) and also expose a common `feature_stats` map with
+`stats_schema=feature_stats_v1`.
+
+Run the command separately against raw and pre-smoothed cache roots; cache
+identity is part of each artifact's path and metadata. Session scope requires
+an explicit source-split selection for every dataset, preventing an accidental
+train/test-policy change. For example:
+
+```bash
+python analysis/active/ssl_experiments/ssl_core/scripts/recompute_feature_stats.py \
+  --scope session \
+  --cache-root /content/drive/MyDrive/utah_ssl/data/cache_v1_smoothed_sigma2p0 \
+  --dataset brain2text24 \
+  --dataset-source-split brain2text24=competition_train \
+  --feature-mode sbp_only
+
+python analysis/active/ssl_experiments/ssl_core/scripts/recompute_feature_stats.py \
+  --scope global \
+  --cache-root /content/drive/MyDrive/utah_ssl/data/cache_v1 \
+  --dataset brain2text24 \
+  --split-policy competition_train_test \
+  --feature-mode sbp_only
+```
+
+The first command defaults to the established session-stat hierarchy; the
+second defaults to the established Brain2Text24
+`split_feature_stats/.../global_v1.pt` path. Existing artifacts in either old
+payload shape remain readable and do not need conversion.
+
+`ssl_core.stats` is the sole public Python API. The older
+`recompute_session_feature_stats.py` and `recompute_split_feature_stats.py`
+entry points remain compatibility wrappers/implementation modules for older
+notebooks; new code should neither import from them nor invoke them directly.
 
 ### Legacy Output-Root Locations
 

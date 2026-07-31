@@ -31,7 +31,7 @@ from ssl_core.scripts.build_smoothed_cache import build_smoothed_cache
 from masked_ssl.cache import (
     resolve_precomputed_session_stats_path,
 )
-from ssl_core.scripts.recompute_session_feature_stats import recompute_session_feature_stats
+from ssl_core.stats import recompute_session_feature_stats
 
 
 DEFAULT_SIGMA_BINS = BIT_STAGE1_SIGMA_BINS

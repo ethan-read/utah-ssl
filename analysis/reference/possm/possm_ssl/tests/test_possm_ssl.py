@@ -22,7 +22,7 @@ for path in (REPO_ROOT, EXPERIMENTS_DIR, POSSM_DIR):
 
 from masked_ssl.cache import _compute_cache_source_signature
 from ssl_core.experiment_contract import DatasetPlan, SignalSpec
-from ssl_core.scripts.recompute_split_feature_stats import (
+from ssl_core.stats import (
     resolve_precomputed_split_stats_path as resolve_canonical_split_stats_path,
 )
 from analysis.active.ssl_experiments.ssl_core.stats_artifact_test_utils import (

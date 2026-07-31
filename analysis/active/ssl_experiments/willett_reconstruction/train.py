@@ -18,7 +18,7 @@ from torch.utils.data import DataLoader
 
 try:
     from ssl_core.ctc import CanonicalSequenceDataset, compute_ctc_loss_sum
-    from ssl_core.scripts.recompute_split_feature_stats import (
+    from ssl_core.stats import (
         load_precomputed_split_feature_stats,
         resolve_precomputed_split_stats_path,
     )
@@ -27,7 +27,7 @@ except ModuleNotFoundError:  # pragma: no cover - repo-root unittest fallback
         CanonicalSequenceDataset,
         compute_ctc_loss_sum,
     )
-    from analysis.active.ssl_experiments.ssl_core.scripts.recompute_split_feature_stats import (
+    from analysis.active.ssl_experiments.ssl_core.stats import (
         load_precomputed_split_feature_stats,
         resolve_precomputed_split_stats_path,
     )

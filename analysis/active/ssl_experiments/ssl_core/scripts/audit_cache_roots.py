@@ -23,6 +23,7 @@ import torch
 
 from ssl_core.feature_contract import SUPPORTED_FEATURE_MODES
 from ssl_core.experiment_contract import SignalSpec
+from ssl_core.normalization_stats import extract_feature_stats_entries
 
 from masked_ssl.cache import (
     CacheAccessConfig,
@@ -585,9 +586,13 @@ def audit_stats_artifact(spec: StatsAuditInput, dataset_names: Sequence[str]) ->
         return report
 
     payload = torch.load(path, map_location="cpu")
-    raw_stats = payload.get("session_feature_stats")
-    if not isinstance(raw_stats, dict):
-        report["findings"].append("missing_session_feature_stats_dict")
+    try:
+        scope, raw_stats = extract_feature_stats_entries(payload)
+    except ValueError:
+        report["findings"].append("missing_feature_stats")
+        return report
+    if scope != "session":
+        report["findings"].append(f"unexpected_stats_scope:{scope}")
         return report
 
     metadata = payload.get("metadata")

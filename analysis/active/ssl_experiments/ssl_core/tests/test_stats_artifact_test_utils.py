@@ -9,17 +9,17 @@ import torch
 
 from analysis.active.ssl_experiments.masked_ssl.cache import (
     CacheAccessConfig,
-    build_recompute_session_feature_stats_command,
-    resolve_precomputed_session_stats_path,
 )
 from analysis.active.ssl_experiments.ssl_core.experiment_contract import (
     DatasetPlan,
     SignalSpec,
 )
 from analysis.active.ssl_experiments.ssm_ssl.config import GenericSSMSSLConfig
-from analysis.active.ssl_experiments.ssl_core.scripts.recompute_split_feature_stats import (
+from analysis.active.ssl_experiments.ssl_core.stats import (
+    build_recompute_session_feature_stats_command,
     build_recompute_split_feature_stats_command,
     load_precomputed_split_feature_stats,
+    resolve_precomputed_session_stats_path,
     resolve_precomputed_split_stats_path,
 )
 from analysis.active.ssl_experiments.ssl_core.stats_artifact_test_utils import (
@@ -147,6 +147,35 @@ class StatsArtifactTestUtilsTests(unittest.TestCase):
         metadata = json.loads(stats_path.with_suffix(".json").read_text())
         self.assertEqual(payload["metadata"], metadata)
         self.assertEqual(sorted(payload["session_feature_stats"]), ["brain2text25:t00.2025.01.01"])
+
+    def test_mixed_session_stats_path_is_data_derived_not_model_named(self) -> None:
+        root = Path(self._tmp_dir())
+        primary = root / "cache_v1_smoothed_sigma2p0"
+        override = root / "cache_v1_b2t25_area6v_sigma2p0_v1"
+        for cache_root, dataset in (
+            (primary, "brain2text24"),
+            (override, "brain2text25"),
+        ):
+            dataset_root = cache_root / dataset
+            dataset_root.mkdir(parents=True)
+            (dataset_root / "manifest.jsonl").write_text("")
+            (dataset_root / "metadata.json").write_text("{}")
+
+        path = resolve_precomputed_session_stats_path(
+            cache_root=primary,
+            signal_spec=SignalSpec.sbp_only(sbp_dim=128),
+            dataset_plan=DatasetPlan.from_mapping(
+                {
+                    "brain2text24": ("competition_train",),
+                    "brain2text25": ("train", "val"),
+                }
+            ),
+            boundary_key_mode="session",
+            dataset_cache_roots={"brain2text25": override},
+        )
+
+        self.assertIn("smoothed_sigma2p0_mixed_", str(path))
+        self.assertNotIn("possm", str(path).lower())
 
     def test_cache_config_requires_an_explicit_dataset_plan(self) -> None:
         with self.assertRaises(TypeError):

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import torch
@@ -13,6 +12,11 @@ from analysis.active.ssl_experiments.ssl_core.experiment_contract import (
     DatasetPlan,
     SignalSpec,
 )
+from analysis.active.ssl_experiments.ssl_core.normalization_stats import (
+    write_feature_stats_artifact,
+)
+
+
 def write_valid_split_stats_artifact(
     *,
     cache_root: Path,
@@ -45,14 +49,17 @@ def write_valid_split_stats_artifact(
         "val_split_name": str(val_split_name),
         "feature_dim": resolved_dim,
     }
-    payload = {
-        "mean": torch.zeros(resolved_dim) if mean is None else torch.as_tensor(mean).clone(),
-        "std": torch.ones(resolved_dim) if std is None else torch.as_tensor(std).clone(),
-        "metadata": metadata,
-    }
-    stats_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(payload, stats_path)
-    stats_path.with_suffix(".json").write_text(json.dumps(metadata, indent=2) + "\n")
+    write_feature_stats_artifact(
+        output_path=stats_path,
+        scope="global",
+        entries={
+            "global": (
+                torch.zeros(resolved_dim) if mean is None else torch.as_tensor(mean).clone(),
+                torch.ones(resolved_dim) if std is None else torch.as_tensor(std).clone(),
+            )
+        },
+        metadata=metadata,
+    )
 
 
 def write_valid_session_stats_artifact(
@@ -86,10 +93,9 @@ def write_valid_session_stats_artifact(
         "boundary_key_mode": str(boundary_key_mode),
         "session_stats_bin_stride": 2,
     }
-    payload = {
-        "session_feature_stats": stats_entries,
-        "metadata": metadata,
-    }
-    stats_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(payload, stats_path)
-    stats_path.with_suffix(".json").write_text(json.dumps(metadata, indent=2) + "\n")
+    write_feature_stats_artifact(
+        output_path=stats_path,
+        scope="session",
+        entries=stats_entries,
+        metadata=metadata,
+    )

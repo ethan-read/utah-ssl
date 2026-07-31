@@ -46,8 +46,8 @@ and 12,000-step budget as the Brain2Text24-only baseline.
   datasets and neural signals across cache inspection, analysis, and training.
 - `../active/ssl_experiments/masked_ssl/cache.py`: shared cache context and
   dataset-specific source-split filtering.
-- `../active/ssl_experiments/ssl_core/scripts/recompute_session_feature_stats.py`:
-  session-statistics recomputation helper.
+- `../active/ssl_experiments/ssl_core/scripts/recompute_feature_stats.py`:
+  model-independent session/global normalization-statistics generator.
 - `docs/notes/cache_and_stats_inventory.md`: canonical cache roots and stats
   inventory.
 - `docs/notes/archive/possm_reproduction_results.md`: detailed history of the
@@ -154,12 +154,21 @@ memory-map `tx.npy`.
 Synthetic tests cover the SBP-only Stage-1 checkpoint handoff, Stage-2
 fine-tuning checkpoint creation, and Stage-2 resume.
 
-The mixed-root view has a composite source signature and its own stats
-namespace:
-`stats/session_feature_stats/possm_b2t24_canonical_b2t25_area6v_sigma2p0_v1/`.
+The mixed-root view has a composite source signature and a model-independent
+stats namespace:
+`stats/session_feature_stats/smoothed_sigma2p0_mixed_<source-signature>/`.
 Do not reuse the old pooled artifact by path. Do not resume a partially trained
 run across old and optimized shard topologies; optimized-cache runs start from
 step zero under their separate run/output names.
+
+The active S14 workflow should expose only two required normalization
+artifacts: pooled pre-smoothed SBP session stats for Stage 1 and raw
+Brain2Text24 `competition_train` SBP global stats for Stage 2. Add the
+Brain2Text24-only pre-smoothed SBP session artifact only when running a fresh
+SBP baseline. TX/TX+SBP and `stage1_global_feature_stats` files are historical
+reproduction inputs, not current defaults. Use `ssl_core.stats` from Python and
+`recompute_feature_stats.py` from notebooks; do not introduce another
+POSSM-specific stats namespace.
 
 ## Speedup idea: CUDA BF16 Stage 2
 

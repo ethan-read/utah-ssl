@@ -1,4 +1,7 @@
-"""Recompute train-split global feature stats from a canonical cache root."""
+"""Global split-stat implementation and compatibility CLI.
+
+New workflows should use ``recompute_feature_stats.py --scope global``.
+"""
 
 from __future__ import annotations
 
@@ -21,6 +24,10 @@ import torch
 
 from ssl_core.feature_contract import SUPPORTED_FEATURE_MODES
 from ssl_core.experiment_contract import SignalSpec
+from ssl_core.normalization_stats import (
+    extract_feature_stats_entries,
+    write_feature_stats_artifact,
+)
 
 try:
     from masked_ssl.cache import (
@@ -53,6 +60,8 @@ except ModuleNotFoundError:  # pragma: no cover - repo-root unittest fallback
 DEFAULT_DATASET = "brain2text24"
 DEFAULT_BOUNDARY_KEY_MODE = "session"
 DEFAULT_SPLIT_NAME = "competition_train"
+
+
 def _timestamp_utc() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -88,7 +97,9 @@ def build_recompute_split_feature_stats_command(
     return shlex.join(
         [
             "python",
-            "analysis/active/ssl_experiments/ssl_core/scripts/recompute_split_feature_stats.py",
+            "analysis/active/ssl_experiments/ssl_core/scripts/recompute_feature_stats.py",
+            "--scope",
+            "global",
             "--cache-root",
             str(Path(cache_root)),
             "--dataset",
@@ -169,15 +180,23 @@ def load_precomputed_split_feature_stats(
         artifact_name="split stats",
         expected_kind="split_feature_stats",
     )
-    if "mean" not in payload or "std" not in payload:
+    try:
+        payload_scope, stats_entries = extract_feature_stats_entries(payload)
+    except ValueError as exc:
         raise ValueError(
-            "Precomputed split stats payload is missing mean/std tensors.\n"
+            "Precomputed split stats payload is missing valid feature statistics.\n"
+            f"expected_path: {canonical_path}\n"
+            f"requested_path: {path}\n"
+            f"recompute_command: {recompute_cmd}"
+        ) from exc
+    if payload_scope != "global" or set(stats_entries) != {"global"}:
+        raise ValueError(
+            "Precomputed split stats artifact does not contain global statistics.\n"
             f"expected_path: {canonical_path}\n"
             f"requested_path: {path}\n"
             f"recompute_command: {recompute_cmd}"
         )
-    mean_t = torch.as_tensor(payload.get("mean")).float().cpu()
-    std_t = torch.as_tensor(payload.get("std")).float().cpu()
+    mean_t, std_t = stats_entries["global"]
 
     expected_cache_root = str(Path(cache_root).resolve())
     expected_cache_variant = _cache_variant_name(cache_root)
@@ -312,14 +331,13 @@ def recompute_split_feature_stats(
         "feature_dim": int(mean.shape[0]),
     }
 
-    payload = {
-        "mean": mean,
-        "std": std,
-        "metadata": metadata,
-    }
-    resolved_output_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(payload, resolved_output_path)
-    metadata_path.write_text(json.dumps(metadata, indent=2) + "\n")
+    payload = write_feature_stats_artifact(
+        output_path=resolved_output_path,
+        scope="global",
+        entries={"global": (mean, std)},
+        metadata=metadata,
+    )
+    metadata = dict(payload["metadata"])
 
     return {
         "output_path": resolved_output_path,

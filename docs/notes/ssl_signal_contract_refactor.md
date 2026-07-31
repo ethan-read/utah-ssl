@@ -99,6 +99,20 @@ policy, boundary mode, and Stage-2 split policy. This prevents a cache's
 declared native width from producing a differently shaped artifact at a
 128-channel path.
 
+Normalization artifacts are model-independent. The shared
+`recompute_feature_stats.py` command generates both session and global scopes
+with a common `feature_stats_v1` envelope. It also retains the established
+Brain2Text24 payload keys, so existing session (`session_feature_stats`) and
+global (`mean`/`std`) artifacts remain readable without conversion. Mixed-root
+session paths are derived from the composite cache signature rather than a
+POSSM-specific name.
+
+`ssl_core.stats` is the public Python surface and
+`recompute_feature_stats.py` is the public CLI. Scope-specific implementation
+modules remain only for compatibility and internal reuse. The active artifact
+policy is demand-driven: do not materialize the full cross-product of cache
+views, signals, scopes, and split policies.
+
 The one-time Brain2Text25 cache preparation remains in
 `analysis/reference/possm/notebooks/s15_possm_pooled_cache_preparation.ipynb`.
 Cache roots and reusable statistics are inventoried in

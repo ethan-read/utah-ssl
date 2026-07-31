@@ -23,6 +23,7 @@ from ssl_core.experiment_contract import (
     DatasetPlan,
     SignalSpec,
 )
+from ssl_core.normalization_stats import extract_feature_stats_entries
 
 try:
     import psutil
@@ -282,13 +283,25 @@ def resolve_precomputed_session_stats_path(
     signal_spec: SignalSpec | Mapping[str, Any],
     dataset_plan: DatasetPlan | Mapping[str, Sequence[str]],
     boundary_key_mode: str,
+    dataset_cache_roots: Mapping[str, str | Path] | None = None,
 ) -> Path:
     resolved_signal_spec = SignalSpec.from_value(signal_spec)
     resolved_dataset_plan = DatasetPlan.from_value(dataset_plan)
-    stats_dir = _canonical_session_stats_dir(
-        cache_root=cache_root,
-        feature_mode=resolved_signal_spec.mode,
-        boundary_key_mode=boundary_key_mode,
+    primary_root = Path(cache_root)
+    effective_roots = {
+        dataset: Path((dataset_cache_roots or {}).get(dataset, primary_root))
+        for dataset in resolved_dataset_plan.dataset_names
+    }
+    cache_variant = _cache_variant_name(primary_root)
+    if any(root.resolve() != primary_root.resolve() for root in effective_roots.values()):
+        source_signature = _compute_dataset_cache_source_signature(effective_roots)
+        cache_variant = f"{cache_variant}_mixed_{source_signature[:12]}"
+    stats_dir = (
+        _canonical_stats_root_for_cache(primary_root)
+        / "session_feature_stats"
+        / cache_variant
+        / resolved_signal_spec.mode
+        / str(boundary_key_mode)
     )
     return stats_dir / f"{_session_stats_plan_stem(resolved_dataset_plan)}.pt"
 
@@ -378,7 +391,9 @@ def build_recompute_session_feature_stats_command(
     resolved_dataset_plan = DatasetPlan.from_value(dataset_plan)
     cmd = [
         "python",
-        "analysis/active/ssl_experiments/ssl_core/scripts/recompute_session_feature_stats.py",
+        "analysis/active/ssl_experiments/ssl_core/scripts/recompute_feature_stats.py",
+        "--scope",
+        "session",
         "--cache-root",
         str(Path(cache_root)),
         "--output-path",
@@ -1075,6 +1090,7 @@ def _load_precomputed_session_feature_stats(
         signal_spec=resolved_signal_spec,
         dataset_plan=resolved_dataset_plan,
         boundary_key_mode=str(boundary_key_mode),
+        dataset_cache_roots=dataset_cache_roots,
     )
     recompute_cmd = build_recompute_session_feature_stats_command(
         cache_root=cache_root,
@@ -1091,16 +1107,17 @@ def _load_precomputed_session_feature_stats(
         artifact_name="session stats",
         expected_kind="session_featurewise_zscore_stats",
     )
-    raw_stats = payload.get("session_feature_stats")
-    if not isinstance(raw_stats, dict):
-        raise KeyError("Precomputed session stats payload is missing 'session_feature_stats'.")
+    try:
+        payload_scope, raw_stats = extract_feature_stats_entries(payload)
+    except ValueError as exc:
+        raise KeyError(
+            "Precomputed session stats payload is missing valid feature statistics."
+        ) from exc
+    if payload_scope != "session":
+        raise ValueError("Precomputed session stats payload has global scope.")
 
     session_feature_stats: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
     for key, value in raw_stats.items():
-        if not isinstance(value, (tuple, list)) or len(value) != 2:
-            raise ValueError(
-                f"Session stats entry for {key!r} must be a 2-item (mean, std) tuple/list."
-            )
         mean, std = value
         mean_t = torch.as_tensor(mean).float().cpu()
         std_t = torch.as_tensor(std).float().cpu()
@@ -1692,6 +1709,7 @@ def prepare_cache_context(
                 signal_spec=config.signal_spec,
                 dataset_plan=config.dataset_plan,
                 boundary_key_mode=str(config.boundary_key_mode),
+                dataset_cache_roots=drive_dataset_cache_roots,
             )
         )
         session_feature_stats, _, stats_path = _load_precomputed_session_feature_stats(

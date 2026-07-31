@@ -26,7 +26,7 @@ from ssl_core.scripts.prepare_possm_pooled_cache import (  # noqa: E402
     SUMMARY_NAME,
     prepare_possm_pooled_caches,
 )
-from ssl_core.scripts.recompute_session_feature_stats import (  # noqa: E402
+from ssl_core.stats import (  # noqa: E402
     recompute_session_feature_stats,
 )
 from ssl_core.scripts.repack_cache_shards import repack_cache_root  # noqa: E402

@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from analysis.active.ssl_experiments.ssl_core.scripts.recompute_split_feature_stats import (
+from analysis.active.ssl_experiments.ssl_core.stats import (
     recompute_split_feature_stats,
     resolve_precomputed_split_stats_path as resolve_canonical_split_stats_path,
 )

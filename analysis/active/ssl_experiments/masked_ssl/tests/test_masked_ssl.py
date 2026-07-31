@@ -56,7 +56,7 @@ from masked_ssl.sweeps import resolve_cache_candidates_for_sigma
 from masked_ssl.training import SSLTrainingConfig, recover_ssl_run_state_from_checkpoint
 from s5 import BidirectionalS5SequenceBackbone, S5SequenceBackbone, reverse_padded_sequence
 from ssl_core.scripts.build_smoothed_cache import build_smoothed_cache
-from ssl_core.scripts.recompute_session_feature_stats import recompute_session_feature_stats
+from ssl_core.stats import recompute_session_feature_stats
 from ssl_core.experiment_contract import DatasetPlan, SignalSpec
 from analysis.active.ssl_experiments.ssl_core.stats_artifact_test_utils import (
     write_valid_session_stats_artifact as _write_valid_session_stats_artifact,

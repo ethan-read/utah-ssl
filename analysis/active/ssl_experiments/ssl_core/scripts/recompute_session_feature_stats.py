@@ -1,4 +1,7 @@
-"""Recompute session-level featurewise z-scoring stats from a cache root."""
+"""Session-stat implementation and compatibility CLI.
+
+New workflows should use ``recompute_feature_stats.py --scope session``.
+"""
 
 from __future__ import annotations
 
@@ -20,6 +23,7 @@ import torch
 
 from ssl_core.feature_contract import SUPPORTED_FEATURE_MODES
 from ssl_core.experiment_contract import DatasetPlan, SignalSpec
+from ssl_core.normalization_stats import write_feature_stats_artifact
 from masked_ssl.cache import (
     CacheAccessConfig,
     SESSION_STATS_BIN_STRIDE,
@@ -146,13 +150,13 @@ def recompute_session_feature_stats(
         for dataset in context.pretrain_datasets
     }
 
-    payload = {
-        "session_feature_stats": session_feature_stats,
-        "metadata": metadata,
-    }
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(payload, output_path)
-    metadata_path.write_text(json.dumps(metadata, indent=2) + "\n")
+    payload = write_feature_stats_artifact(
+        output_path=output_path,
+        scope="session",
+        entries=session_feature_stats,
+        metadata=metadata,
+    )
+    metadata = dict(payload["metadata"])
 
     return {
         "output_path": output_path,
