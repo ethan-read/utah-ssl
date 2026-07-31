@@ -136,7 +136,11 @@ cross-year comparisons.
 The cache loader is modality-aware. A `tx_only` context opens TX but not SBP;
 an `sbp_only` context opens SBP but not TX. The pooled POSSM recipe explicitly
 uses 128-channel area-6v SBP. Stage-1 logs include cumulative cache hit rate,
-cached GB, bytes read, and evictions. Use `drive_direct` first; switch s14's
+cached GB, bytes read, and evictions. Logged training rows and every validation
+row also contain `dataset_mse` and `dataset_valid_elements`, so pooled B2T24/25
+runs can be diagnosed without changing the aggregate optimization or checkpoint
+selection loss. The Stage-1 report plots these per-dataset curves separately.
+Use `drive_direct` first; switch s14's
 `STAGE1_CACHE_MODE` to `copy_to_local` only if the s15 warm benchmark remains
 slow.
 

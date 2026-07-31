@@ -334,7 +334,8 @@ held-out B2T24 test labels for model selection.
 
 The next agent should consider implementing:
 
-1. Per-dataset train and validation MSE during Stage 1.
+1. ~~Per-dataset train and validation MSE during Stage 1.~~ Implemented in the
+   Stage-1 progress log and report.
 2. Fixed, larger validation panels rather than two newly sampled batches.
 3. Per-dataset zero-predictor and previous-bin-predictor MSE after the exact
    training normalization.

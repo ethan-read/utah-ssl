@@ -723,11 +723,47 @@ def compute_reconstruction_metrics(
     config: dict[str, Any],
     *,
     device: torch.device,
+    include_dataset_metrics: bool = False,
 ) -> dict[str, Any]:
     resolved_config = dict(config)
     stage1_batch = objective.prepare_batch(raw_batch, device=device, config=resolved_config)
     outputs = model(stage1_batch.x_input, stage1_batch.lengths, session_ids=stage1_batch.session_ids)
     metrics = objective.compute_loss(outputs, stage1_batch)
+    if include_dataset_metrics and raw_batch.get("datasets") is not None:
+        datasets = [str(dataset) for dataset in raw_batch["datasets"]]
+        if len(datasets) != int(stage1_batch.x_target.shape[0]):
+            raise ValueError(
+                "raw_batch['datasets'] must have one entry per Stage-1 example. "
+                f"datasets={len(datasets)} batch_size={int(stage1_batch.x_target.shape[0])}"
+            )
+        valid_time = (
+            torch.arange(stage1_batch.x_target.shape[1], device=stage1_batch.lengths.device).unsqueeze(0)
+            < stage1_batch.lengths.unsqueeze(1)
+        )
+        valid = valid_time.unsqueeze(-1) & stage1_batch.feature_mask.bool().unsqueeze(1)
+        if stage1_batch.loss_mask is not None:
+            valid = valid & stage1_batch.loss_mask.bool()
+        squared_error = (outputs["reconstruction"].detach() - stage1_batch.x_target).pow(2)
+        dataset_mse: dict[str, float] = {}
+        dataset_valid_elements: dict[str, int] = {}
+        for dataset in dict.fromkeys(datasets):
+            example_indices = torch.tensor(
+                [idx for idx, value in enumerate(datasets) if value == dataset],
+                dtype=torch.long,
+                device=valid.device,
+            )
+            dataset_valid = valid.index_select(0, example_indices)
+            valid_count = int(dataset_valid.sum().item())
+            if valid_count <= 0:
+                continue
+            dataset_error = squared_error.index_select(0, example_indices)
+            dataset_mse[dataset] = float(dataset_error.masked_select(dataset_valid).mean().item())
+            dataset_valid_elements[dataset] = valid_count
+        metrics = {
+            **metrics,
+            "dataset_mse": dataset_mse,
+            "dataset_valid_elements": dataset_valid_elements,
+        }
     if stage1_batch.mask_metadata is not None:
         metrics = {**metrics, "mask_metadata": dict(stage1_batch.mask_metadata)}
     return metrics
@@ -747,6 +783,8 @@ def evaluate_model(
     was_training = model.training
     model.eval()
     losses: list[float] = []
+    dataset_squared_error_sums: Counter[str] = Counter()
+    dataset_valid_element_counts: Counter[str] = Counter()
     with torch.no_grad():
         for _ in range(int(num_batches)):
             batch = sampler.sample_batch()
@@ -756,11 +794,26 @@ def evaluate_model(
                 objective,
                 config,
                 device=device,
+                include_dataset_metrics=True,
             )
             losses.append(float(metrics["mse"]))
+            for dataset, dataset_mse in metrics.get("dataset_mse", {}).items():
+                valid_count = int(metrics["dataset_valid_elements"][dataset])
+                dataset_squared_error_sums[dataset] += float(dataset_mse) * valid_count
+                dataset_valid_element_counts[dataset] += valid_count
     if was_training:
         model.train()
-    return {"loss": float(np.mean(losses)), "mse": float(np.mean(losses))}
+    dataset_mse = {
+        dataset: float(dataset_squared_error_sums[dataset] / valid_count)
+        for dataset, valid_count in dataset_valid_element_counts.items()
+        if valid_count > 0
+    }
+    return {
+        "loss": float(np.mean(losses)),
+        "mse": float(np.mean(losses)),
+        "dataset_mse": dataset_mse,
+        "dataset_valid_elements": dict(dataset_valid_element_counts),
+    }
 
 
 def _emit_progress(progress_path: Path, payload: dict[str, Any]) -> None:
@@ -895,18 +948,19 @@ def _train_loop(
         sample_seconds = time.time() - sample_start
         dataset_counter.update(batch["datasets"])
         model_start = time.time()
+        should_log_step = step == 1 or step % log_every == 0
         metrics = compute_reconstruction_metrics(
             model,
             batch,
             objective,
             config_payload,
             device=device,
+            include_dataset_metrics=should_log_step,
         )
         loss = metrics["loss"]
         loss.backward()
         optimizer.step()
         model_seconds = time.time() - model_start
-        should_log_step = step == 1 or step % log_every == 0
         sampler_cache_context = getattr(train_sampler, "cache_context", None)
         shard_cache_summary = (
             sampler_cache_context.shard_store.summary()
@@ -930,12 +984,21 @@ def _train_loop(
         }
         if shard_cache_summary is not None:
             train_record["shard_cache"] = shard_cache_summary
+        if should_log_step:
+            train_record["dataset_mse"] = dict(metrics.get("dataset_mse", {}))
+            train_record["dataset_valid_elements"] = dict(
+                metrics.get("dataset_valid_elements", {})
+            )
         train_history.append(train_record)
         if should_log_step:
             _emit_progress(progress_path, train_record)
             print(
                 f"step={step:04d} train_loss={metrics['mse']:.6f} "
                 f"sample_s={sample_seconds:.2f} model_s={model_seconds:.2f}"
+                + "".join(
+                    f" {dataset}_mse={dataset_mse:.6f}"
+                    for dataset, dataset_mse in sorted(metrics.get("dataset_mse", {}).items())
+                )
                 + (
                     " "
                     f"cache_hit={float(shard_cache_summary.get('cache_hit_rate', 0.0)):.2%} "
@@ -961,10 +1024,20 @@ def _train_loop(
                 "step": int(step),
                 "elapsed_seconds": round(time.time() - loop_start, 3),
                 "loss": float(val_result["loss"]),
+                "dataset_mse": dict(val_result.get("dataset_mse", {})),
+                "dataset_valid_elements": dict(
+                    val_result.get("dataset_valid_elements", {})
+                ),
             }
             val_history.append(val_record)
             _emit_progress(progress_path, val_record)
-            print(f"step={step:04d} val_loss={val_result['loss']:.6f}")
+            print(
+                f"step={step:04d} val_loss={val_result['loss']:.6f}"
+                + "".join(
+                    f" {dataset}_mse={dataset_mse:.6f}"
+                    for dataset, dataset_mse in sorted(val_result.get("dataset_mse", {}).items())
+                )
+            )
             if float(val_result["loss"]) < float(best_score):
                 best_score = float(val_result["loss"])
                 best_step = int(step)

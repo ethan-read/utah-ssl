@@ -64,15 +64,61 @@ def display_possm_stage1_report(
     if plot and not train_df.empty:
         import matplotlib.pyplot as plt
 
-        plt.figure(figsize=(8, 4))
-        plt.plot(train_df["step"], train_df["loss"], label="train MSE")
+        dataset_names = sorted(
+            {
+                str(dataset)
+                for record in records
+                for dataset in (record.get("dataset_mse") or {})
+            }
+        )
+        ncols = 2 if dataset_names else 1
+        fig, axes = plt.subplots(1, ncols, figsize=(13 if dataset_names else 8, 4))
+        aggregate_ax = axes[0] if dataset_names else axes
+        aggregate_ax.plot(train_df["step"], train_df["loss"], label="train MSE")
         if not val_df.empty:
-            plt.plot(val_df["step"], val_df["loss"], marker="o", label="val MSE")
-        plt.title("Stage-1 POSSM Reconstruction Loss")
-        plt.xlabel("step")
-        plt.ylabel("MSE")
-        plt.grid(True, alpha=0.3)
-        plt.legend()
+            aggregate_ax.plot(val_df["step"], val_df["loss"], marker="o", label="val MSE")
+        aggregate_ax.set_title("Aggregate reconstruction loss")
+        aggregate_ax.set_xlabel("step")
+        aggregate_ax.set_ylabel("MSE")
+        aggregate_ax.grid(True, alpha=0.3)
+        aggregate_ax.legend()
+
+        if dataset_names:
+            dataset_ax = axes[1]
+            for dataset in dataset_names:
+                train_rows = [
+                    (int(record["step"]), float(record["dataset_mse"][dataset]))
+                    for record in records
+                    if record.get("event") == "train"
+                    and dataset in (record.get("dataset_mse") or {})
+                ]
+                val_rows = [
+                    (int(record["step"]), float(record["dataset_mse"][dataset]))
+                    for record in records
+                    if record.get("event") == "val"
+                    and dataset in (record.get("dataset_mse") or {})
+                ]
+                if train_rows:
+                    dataset_ax.plot(
+                        [row[0] for row in train_rows],
+                        [row[1] for row in train_rows],
+                        label=f"{dataset} train",
+                    )
+                if val_rows:
+                    dataset_ax.plot(
+                        [row[0] for row in val_rows],
+                        [row[1] for row in val_rows],
+                        marker="o",
+                        label=f"{dataset} val",
+                    )
+            dataset_ax.set_title("Per-dataset reconstruction loss")
+            dataset_ax.set_xlabel("step")
+            dataset_ax.set_ylabel("MSE")
+            dataset_ax.grid(True, alpha=0.3)
+            dataset_ax.legend()
+
+        fig.suptitle("Stage-1 POSSM Reconstruction Loss")
+        fig.tight_layout()
         plt.show()
 
     latest_train = train_df.iloc[-1].to_dict() if not train_df.empty else None

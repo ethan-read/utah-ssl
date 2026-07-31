@@ -698,6 +698,7 @@ class POSSMSSLTests(unittest.TestCase):
                 [[1.0, 1.0, 1.0, 1.0, 1.0], [1.0, 1.0, 1.0, 1.0, 0.0]], dtype=torch.float32
             ),
             "session_keys": ["a", "b"],
+            "datasets": ["brain2text24", "brain2text25"],
         }
         objective = PlainReconstructionObjective()
         metrics = compute_reconstruction_metrics(
@@ -706,6 +707,7 @@ class POSSMSSLTests(unittest.TestCase):
             objective,
             {"stage1_objective_type": "plain_mse"},
             device=torch.device("cpu"),
+            include_dataset_metrics=True,
         )
 
         outputs = model(batch["x"], batch["lengths"], session_ids=batch["session_keys"])
@@ -715,6 +717,12 @@ class POSSMSSLTests(unittest.TestCase):
         valid = valid_time.unsqueeze(-1) & valid_features
         manual_loss = (reconstruction - batch["x"]).pow(2).masked_select(valid).mean()
         self.assertAlmostEqual(float(metrics["mse"]), float(manual_loss.item()), places=6)
+        self.assertEqual(set(metrics["dataset_mse"]), {"brain2text24", "brain2text25"})
+        weighted_dataset_mse = sum(
+            metrics["dataset_mse"][dataset] * metrics["dataset_valid_elements"][dataset]
+            for dataset in metrics["dataset_mse"]
+        ) / sum(metrics["dataset_valid_elements"].values())
+        self.assertAlmostEqual(weighted_dataset_mse, float(manual_loss.item()), places=6)
 
     def test_masked_objective_prepare_batch_is_reproducible(self) -> None:
         raw_batch = {
