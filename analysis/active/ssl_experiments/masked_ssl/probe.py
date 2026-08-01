@@ -1534,9 +1534,19 @@ def _make_loader_generator(seed: int) -> torch.Generator:
     return generator
 
 
-def _flatten_targets(labels: torch.Tensor, label_lengths: torch.Tensor) -> torch.Tensor:
+def _flatten_targets(
+    labels: torch.Tensor,
+    label_lengths: torch.Tensor,
+    *,
+    label_length_values: Sequence[int] | None = None,
+) -> torch.Tensor:
+    resolved_lengths = (
+        [int(length) for length in label_length_values]
+        if label_length_values is not None
+        else [int(length) for length in label_lengths.tolist()]
+    )
     pieces = []
-    for row_idx, length in enumerate(label_lengths.tolist()):
+    for row_idx, length in enumerate(resolved_lengths):
         if length > 0:
             pieces.append(labels[row_idx, :length])
     if not pieces:
@@ -1551,12 +1561,29 @@ def compute_ctc_loss_sum(
     label_lengths: torch.Tensor,
     *,
     blank_index: int,
+    target_count: int | None = None,
+    label_length_values: Sequence[int] | None = None,
 ) -> tuple[torch.Tensor, int]:
-    target_count = int(label_lengths.sum().item())
-    if target_count <= 0:
+    resolved_length_values = (
+        [int(length) for length in label_length_values]
+        if label_length_values is not None
+        else [int(length) for length in label_lengths.tolist()]
+    )
+    length_sum = int(sum(resolved_length_values))
+    if target_count is not None and int(target_count) != length_sum:
+        raise ValueError(
+            "target_count must equal the sum of label_length_values: "
+            f"target_count={int(target_count)} length_sum={length_sum}"
+        )
+    resolved_target_count = length_sum
+    if resolved_target_count <= 0:
         return logits.new_zeros(()), 0
     log_probs = F.log_softmax(logits, dim=-1).transpose(0, 1)
-    targets = _flatten_targets(labels, label_lengths)
+    targets = _flatten_targets(
+        labels,
+        label_lengths,
+        label_length_values=resolved_length_values,
+    )
     loss_sum = F.ctc_loss(
         log_probs,
         targets,
@@ -1566,7 +1593,7 @@ def compute_ctc_loss_sum(
         reduction="sum",
         zero_infinity=True,
     )
-    return loss_sum, target_count
+    return loss_sum, resolved_target_count
 
 
 def _ctc_greedy_decode(

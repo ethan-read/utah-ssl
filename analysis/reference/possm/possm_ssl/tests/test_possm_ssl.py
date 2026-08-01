@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import sys
 import tempfile
 import unittest
@@ -21,6 +22,7 @@ for path in (REPO_ROOT, EXPERIMENTS_DIR, POSSM_DIR):
         sys.path.insert(0, path_str)
 
 from masked_ssl.cache import _compute_cache_source_signature
+from masked_ssl.probe import compute_ctc_loss_sum
 from ssl_core.experiment_contract import DatasetPlan, SignalSpec
 from ssl_core.stats import (
     resolve_precomputed_split_stats_path as resolve_canonical_split_stats_path,
@@ -30,6 +32,7 @@ from analysis.active.ssl_experiments.ssl_core.stats_artifact_test_utils import (
 )
 
 from possm_ssl.model import (
+    POSSMEncoder,
     POSSMPhonemeModel,
     POSSMReconstructionModel,
     SessionInputAdapterBank,
@@ -54,8 +57,10 @@ from possm_ssl.reporting import display_possm_stage2_summary, summarize_possm_st
 from possm_ssl.stage1_objectives import (
     MaskedReconstructionObjective,
     PlainReconstructionObjective,
+    Stage1Batch,
     build_stage1_objective,
 )
+from possm_ssl.precision import autocast_context, build_adamw, resolve_precision_runtime
 from possm_ssl.training import (
     POSSMTrainingConfig,
     build_possm_segment_sampler,
@@ -836,6 +841,194 @@ class POSSMSSLTests(unittest.TestCase):
         self.assertEqual(stage1.feature_mode, "sbp_only")
         self.assertEqual(stage2.feature_mode, "sbp_only")
 
+    def test_precision_defaults_to_legacy_float32_and_amp_requires_cuda(self) -> None:
+        stage1 = POSSMTrainingConfig(signal_spec=SignalSpec.sbp_only(sbp_dim=2))
+        stage2 = POSSMFinetuneConfig(signal_spec=SignalSpec.sbp_only(sbp_dim=2))
+        self.assertEqual(stage1.precision, "float32")
+        self.assertEqual(stage2.precision, "float32")
+        runtime = resolve_precision_runtime("float32", device=torch.device("cpu"))
+        self.assertFalse(runtime.amp_enabled)
+        self.assertFalse(runtime.scaler.is_enabled())
+        with self.assertRaisesRegex(RuntimeError, "requires a CUDA device"):
+            resolve_precision_runtime("amp_fp16", device=torch.device("cpu"))
+        if not torch.cuda.is_available():
+            with self.assertRaisesRegex(RuntimeError, "torch.cuda.is_available"):
+                resolve_precision_runtime("amp_fp16", device=torch.device("cuda"))
+
+    def test_stage1_mse_promotes_half_residuals_to_float32(self) -> None:
+        objective = PlainReconstructionObjective()
+        stage1_batch = Stage1Batch(
+            x_input=torch.ones(1, 3, 2, dtype=torch.float16),
+            x_target=torch.ones(1, 3, 2, dtype=torch.float16),
+            lengths=torch.tensor([3]),
+            feature_mask=torch.ones(1, 2),
+        )
+        metrics = objective.compute_loss(
+            {"reconstruction": torch.zeros(1, 3, 2, dtype=torch.float16)},
+            stage1_batch,
+        )
+        self.assertEqual(metrics["loss"].dtype, torch.float32)
+        self.assertTrue(torch.isfinite(metrics["loss"]))
+
+    def test_ctc_accepts_precomputed_cpu_length_metadata(self) -> None:
+        logits = torch.randn(2, 5, 4)
+        token_lengths = torch.tensor([5, 4])
+        labels = torch.tensor([[1, 2, 0], [2, 0, 0]])
+        label_lengths = torch.tensor([2, 1])
+        baseline_loss, baseline_count = compute_ctc_loss_sum(
+            logits,
+            token_lengths,
+            labels,
+            label_lengths,
+            blank_index=0,
+        )
+        optimized_loss, optimized_count = compute_ctc_loss_sum(
+            logits,
+            token_lengths,
+            labels,
+            label_lengths,
+            blank_index=0,
+            target_count=3,
+            label_length_values=[2, 1],
+        )
+        self.assertEqual(optimized_count, baseline_count)
+        self.assertTrue(torch.allclose(optimized_loss, baseline_loss))
+
+    def test_fused_adamw_falls_back_when_backend_rejects_it(self) -> None:
+        parameter = torch.nn.Parameter(torch.tensor([1.0]))
+        original_adamw = torch.optim.AdamW
+
+        def construct(params, **kwargs):
+            if kwargs.get("fused"):
+                raise RuntimeError("fused AdamW unavailable")
+            return original_adamw(params, **kwargs)
+
+        with mock.patch("possm_ssl.precision.torch.optim.AdamW", side_effect=construct):
+            optimizer, fused = build_adamw(
+                [parameter],
+                learning_rate=1e-3,
+                weight_decay=1e-2,
+                device=torch.device("cuda"),
+            )
+        self.assertIsInstance(optimizer, original_adamw)
+        self.assertFalse(fused)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA AMP test")
+    def test_cuda_amp_uses_half_gru_and_conv_with_float32_master_state_and_losses(self) -> None:
+        device = torch.device("cuda")
+        runtime = resolve_precision_runtime("amp_fp16", device=device)
+        reconstruction_model = POSSMReconstructionModel(
+            input_dim=5,
+            model_dim=4,
+            latent_count=2,
+            ffn_hidden_size=16,
+            dropout=0.0,
+            temporal_backbone_type="gru",
+            temporal_gru_hidden_size=8,
+            signal_spec=SignalSpec.tx_sbp(tx_dim=3, sbp_dim=2),
+        ).to(device)
+        reconstruction_batch = {
+            "x": torch.randn(2, 8, 5),
+            "lengths": torch.tensor([8, 6]),
+            "feature_mask": torch.ones(2, 5),
+            "session_keys": ["a", "b"],
+        }
+        reconstruction_objective = PlainReconstructionObjective()
+        fp32_reconstruction = compute_reconstruction_metrics(
+            reconstruction_model,
+            reconstruction_batch,
+            reconstruction_objective,
+            {"precision": "float32"},
+            device=device,
+        )
+        amp_reconstruction = compute_reconstruction_metrics(
+            reconstruction_model,
+            reconstruction_batch,
+            reconstruction_objective,
+            {"precision": "amp_fp16"},
+            device=device,
+            precision_runtime=runtime,
+        )
+        self.assertEqual(amp_reconstruction["reconstruction"].dtype, torch.float16)
+        self.assertEqual(amp_reconstruction["loss"].dtype, torch.float32)
+        self.assertTrue(torch.isfinite(amp_reconstruction["loss"]))
+        self.assertTrue(
+            math.isclose(
+                float(fp32_reconstruction["mse"]),
+                float(amp_reconstruction["mse"]),
+                rel_tol=0.05,
+                abs_tol=0.02,
+            )
+        )
+        encoder = POSSMEncoder(
+            input_dim=5,
+            model_dim=4,
+            latent_count=2,
+            ffn_hidden_size=16,
+            dropout=0.0,
+            signal_spec=SignalSpec.tx_sbp(tx_dim=3, sbp_dim=2),
+        )
+        model = POSSMPhonemeModel(
+            base_encoder=encoder,
+            vocab_size=6,
+            gru_hidden_size=8,
+            gru_num_layers=1,
+            gru_dropout=0.0,
+            conv_kernel_size=3,
+            conv_stride=1,
+            conv_dropout=0.0,
+            session_adapter_enabled=False,
+        ).to(device)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+        x = torch.randn(2, 8, 5, device=device)
+        lengths = torch.tensor([8, 6], device=device)
+        optimizer.zero_grad(set_to_none=True)
+        observed_outputs = None
+        labels = torch.tensor([[1, 2], [2, 0]], device=device)
+        label_lengths = torch.tensor([2, 1], device=device)
+        with torch.no_grad():
+            fp32_outputs = model(x, lengths)
+            fp32_ctc_sum, fp32_target_count = compute_ctc_loss_sum(
+                fp32_outputs["logits"].float(),
+                fp32_outputs["token_lengths"],
+                labels,
+                label_lengths,
+                blank_index=0,
+            )
+        for _ in range(2):
+            with autocast_context(runtime):
+                observed_outputs = model(x, lengths)
+            logits_fp32 = observed_outputs["logits"].float()
+            ctc_sum, target_count = compute_ctc_loss_sum(
+                logits_fp32,
+                observed_outputs["token_lengths"],
+                labels,
+                label_lengths,
+                blank_index=0,
+            )
+            loss = ctc_sum / target_count
+            self.assertEqual(loss.dtype, torch.float32)
+            self.assertTrue(torch.isfinite(loss))
+            runtime.scaler.scale(loss / 2.0).backward()
+        assert observed_outputs is not None
+        self.assertEqual(observed_outputs["gru_hidden"].dtype, torch.float16)
+        self.assertEqual(observed_outputs["conv_hidden"].dtype, torch.float16)
+        self.assertEqual(observed_outputs["logits"].dtype, torch.float16)
+        self.assertTrue(
+            torch.allclose(
+                fp32_ctc_sum / fp32_target_count,
+                ctc_sum / target_count,
+                rtol=0.05,
+                atol=0.05,
+            )
+        )
+        self.assertTrue(all(param.dtype == torch.float32 for param in model.parameters()))
+        runtime.scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        runtime.scaler.step(optimizer)
+        runtime.scaler.update()
+        self.assertTrue(all(torch.isfinite(param).all() for param in model.parameters()))
+
     def test_stage1_signal_is_explicit(self) -> None:
         with self.assertRaises(TypeError):
             POSSMTrainingConfig()
@@ -1019,6 +1212,11 @@ class POSSMSSLTests(unittest.TestCase):
             self.assertIn("rng_state", checkpoint_payload)
             self.assertIn("sampler_state", checkpoint_payload)
             self.assertIn("objective_state", checkpoint_payload)
+            self.assertEqual(
+                checkpoint_payload["precision"]["resolved_precision"],
+                "float32",
+            )
+            self.assertIsNone(checkpoint_payload["grad_scaler_state"])
             recovered = recover_possm_run_state_from_checkpoint(
                 cache_context=cache_context,
                 checkpoint_path=run_state["checkpoint_path"],

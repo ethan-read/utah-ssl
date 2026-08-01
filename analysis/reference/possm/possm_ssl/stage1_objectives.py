@@ -50,7 +50,9 @@ class PlainReconstructionObjective(Stage1Objective):
         config: dict[str, Any],
     ) -> Stage1Batch:
         del config
-        x = raw_batch["x"].to(device)
+        # Cache storage may be FP16, but normalization/model master inputs stay
+        # FP32; autocast selects FP16 kernels for the expensive operations.
+        x = raw_batch["x"].to(device=device, dtype=torch.float32)
         lengths = raw_batch["lengths"].to(device)
         feature_mask = raw_batch["feature_mask"].to(device)
         return Stage1Batch(
@@ -79,7 +81,9 @@ class PlainReconstructionObjective(Stage1Objective):
         )
         valid_features = stage1_batch.feature_mask.bool().unsqueeze(1)
         valid = valid_time.unsqueeze(-1) & valid_features
-        diff_sq = (reconstruction - stage1_batch.x_target).pow(2)
+        # Keep the numerically sensitive reduction in FP32 even when the
+        # reconstruction forward pass runs under CUDA FP16 autocast.
+        diff_sq = (reconstruction.float() - stage1_batch.x_target.float()).pow(2)
         loss = diff_sq.masked_select(valid).mean()
         return {
             "loss": loss,
@@ -230,7 +234,7 @@ class MaskedReconstructionObjective(Stage1Objective):
         config: dict[str, Any],
     ) -> Stage1Batch:
         del config
-        x_target = raw_batch["x"].to(device)
+        x_target = raw_batch["x"].to(device=device, dtype=torch.float32)
         lengths = raw_batch["lengths"].to(device)
         feature_mask = raw_batch["feature_mask"].to(device)
         loss_mask = self._make_mask(x=x_target, lengths=lengths, feature_mask=feature_mask)
@@ -268,7 +272,7 @@ class MaskedReconstructionObjective(Stage1Objective):
         valid = valid & stage1_batch.loss_mask.bool()
         if not bool(valid.any().item()):
             raise ValueError("MaskedReconstructionObjective received an empty effective loss mask.")
-        diff_sq = (reconstruction - stage1_batch.x_target).pow(2)
+        diff_sq = (reconstruction.float() - stage1_batch.x_target.float()).pow(2)
         loss = diff_sq.masked_select(valid).mean()
         masked_fraction = (
             float(stage1_batch.mask_metadata["masked_fraction"])

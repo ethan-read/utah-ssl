@@ -38,6 +38,14 @@ from ssl_core.stats import (
 )
 
 from .model import POSSMEncoder, POSSMPhonemeModel, build_temporal_backbone
+from .precision import (
+    PhaseTimer,
+    PrecisionRuntime,
+    autocast_context,
+    build_adamw,
+    resolve_precision_runtime,
+    validate_precision,
+)
 from .training import (
     find_latest_possm_step_checkpoint,
     prune_possm_resumable_checkpoints,
@@ -55,6 +63,7 @@ class POSSMFinetuneConfig:
     signal_spec: SignalSpec | dict[str, Any] | None = None
     data_mode: str | None = None
     boundary_key_mode: str | None = None
+    precision: str = "float32"
     batch_size: int = 8
     num_steps: int = 5000
     learning_rate: float = 1e-3
@@ -65,6 +74,8 @@ class POSSMFinetuneConfig:
     checkpoint_every_steps: int = 200
     checkpoint_keep_last: int | None = 2
     progress_every_steps: int = 25
+    benchmark_warmup_steps: int = 0
+    benchmark_measure_steps: int = 0
     session_adapter_enabled: bool = True
     input_smoothing_sigma_bins: float = 0.0
     input_smoothing_kernel_size: int = 100
@@ -112,6 +123,7 @@ class POSSMFinetuneConfig:
             raise ValueError(
                 "boundary_key_mode must be one of {'session', 'subject_if_available'} when provided"
             )
+        self.precision = validate_precision(self.precision)
         if int(self.batch_size) <= 0 or int(self.num_steps) <= 0:
             raise ValueError("batch_size and num_steps must be positive")
         if float(self.learning_rate) <= 0.0 or float(self.encoder_learning_rate) <= 0.0:
@@ -128,6 +140,10 @@ class POSSMFinetuneConfig:
             raise ValueError("checkpoint_keep_last must be non-negative when provided")
         if int(self.progress_every_steps) <= 0:
             raise ValueError("progress_every_steps must be positive")
+        if int(self.benchmark_warmup_steps) < 0 or int(self.benchmark_measure_steps) < 0:
+            raise ValueError("benchmark warm-up and measurement steps must be non-negative")
+        if int(self.benchmark_warmup_steps) > 0 and int(self.benchmark_measure_steps) <= 0:
+            raise ValueError("benchmark_measure_steps must be positive when warm-up is requested")
         if float(self.input_smoothing_sigma_bins) < 0.0:
             raise ValueError("input_smoothing_sigma_bins must be non-negative")
         if int(self.input_smoothing_kernel_size) <= 0:
@@ -403,7 +419,13 @@ def evaluate_possm_phoneme_metrics(
     device: torch.device,
     blank_index: int,
     input_transform_config: POSSMFinetuneConfig | None = None,
+    precision_runtime: PrecisionRuntime | None = None,
 ) -> dict[str, Any]:
+    runtime = precision_runtime or resolve_precision_runtime(
+        "float32" if input_transform_config is None else input_transform_config.precision,
+        device=device,
+    )
+    non_blocking = torch.device(device).type == "cuda"
     model.eval()
     total_loss_sum = 0.0
     total_targets = 0
@@ -416,35 +438,47 @@ def evaluate_possm_phoneme_metrics(
     prediction_counter: Counter[int] = Counter()
     with torch.no_grad():
         for batch in loader:
-            x = batch["x"].to(device)
-            input_lengths = batch["input_lengths"].to(device)
-            if input_transform_config is not None:
-                x = _prepare_stage2_inputs(
-                    x,
-                    input_lengths,
-                    config=input_transform_config,
-                    is_training=False,
-                )
-            labels = batch["labels"].to(device)
-            label_lengths = batch["label_lengths"].to(device)
-            outputs = model(x, input_lengths, session_ids=batch["boundary_keys"])
+            input_lengths_cpu = batch["input_lengths"]
+            label_lengths_cpu = batch["label_lengths"]
+            label_length_values = [int(length) for length in label_lengths_cpu.tolist()]
+            target_count_cpu = int(sum(label_length_values))
+            x = batch["x"].to(
+                device=device,
+                dtype=torch.float32,
+                non_blocking=non_blocking,
+            )
+            input_lengths = input_lengths_cpu.to(device, non_blocking=non_blocking)
+            labels = batch["labels"].to(device, non_blocking=non_blocking)
+            label_lengths = label_lengths_cpu.to(device, non_blocking=non_blocking)
+            with autocast_context(runtime):
+                if input_transform_config is not None:
+                    x = _prepare_stage2_inputs(
+                        x,
+                        input_lengths,
+                        config=input_transform_config,
+                        is_training=False,
+                    )
+                outputs = model(x, input_lengths, session_ids=batch["boundary_keys"])
+            logits_fp32 = outputs["logits"].float()
             loss_sum, target_count = compute_ctc_loss_sum(
-                outputs["logits"],
+                logits_fp32,
                 outputs["token_lengths"],
                 labels,
                 label_lengths,
                 blank_index=blank_index,
+                target_count=target_count_cpu,
+                label_length_values=label_length_values,
             )
             total_loss_sum += float(loss_sum.item())
             total_targets += int(target_count)
             predictions = _ctc_greedy_decode(
-                outputs["logits"],
+                logits_fp32,
                 outputs["token_lengths"],
                 blank_index=blank_index,
             )
-            frame_ids = outputs["logits"].argmax(dim=-1)
+            frame_ids = logits_fp32.argmax(dim=-1)
             for row_idx, prediction in enumerate(predictions):
-                reference_length = int(label_lengths[row_idx].item())
+                reference_length = int(label_lengths_cpu[row_idx].item())
                 reference = labels[row_idx, :reference_length].tolist()
                 token_length = int(outputs["token_lengths"][row_idx].item())
                 total_edit_distance += _edit_distance(reference, prediction)
@@ -718,6 +752,8 @@ def _checkpoint_payload(
     elapsed_seconds: float,
     train_iteration_index: int,
     train_batches_consumed: int,
+    precision_runtime: PrecisionRuntime | None = None,
+    optimizer_fused: bool = False,
     batching_diagnostics: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     resolved_batching_diagnostics = dict(batching_diagnostics or {})
@@ -727,6 +763,22 @@ def _checkpoint_payload(
         "stage1_checkpoint_path": str(resolved_checkpoint_path),
         "stage1_checkpoint_config": dict(checkpoint_cfg),
         "config": asdict(resolved_config),
+        "precision": (
+            precision_runtime.metadata()
+            if precision_runtime is not None
+            else {
+                "requested_precision": str(resolved_config.precision),
+                "resolved_precision": str(resolved_config.precision),
+                "amp_enabled": str(resolved_config.precision) == "amp_fp16",
+                "grad_scaler_enabled": False,
+            }
+        ),
+        "grad_scaler_state": (
+            precision_runtime.scaler.state_dict()
+            if precision_runtime is not None and precision_runtime.scaler.is_enabled()
+            else None
+        ),
+        "optimizer_fused": bool(optimizer_fused),
         "feature_mode": str(problem["feature_mode"]),
         "data_mode": str(metrics.get("data_mode", resolved_config.data_mode)),
         "dataset": str(problem["dataset"]),
@@ -956,6 +1008,10 @@ def run_possm_phoneme_finetuning(
             "boundary_key_mode": effective_boundary_key_mode,
         }
     )
+    precision_runtime = resolve_precision_runtime(
+        effective_config.precision,
+        device=resolved_device,
+    )
 
     problem = _build_problem(
         cache_root=resolved_cache_root,
@@ -1134,10 +1190,11 @@ def run_possm_phoneme_finetuning(
             trainable_groups.append(
                 {"params": temporal_backbone_params, "lr": float(effective_config.encoder_learning_rate)}
             )
-    optimizer = torch.optim.AdamW(
+    optimizer, optimizer_fused = build_adamw(
         trainable_groups,
-        lr=float(effective_config.learning_rate),
+        learning_rate=float(effective_config.learning_rate),
         weight_decay=float(effective_config.weight_decay),
+        device=resolved_device,
     )
     clip_params = [param for group in trainable_groups for param in group["params"] if param.requires_grad]
 
@@ -1191,6 +1248,9 @@ def run_possm_phoneme_finetuning(
             optimizer_state = payload.get("optimizer_state")
             if isinstance(optimizer_state, dict):
                 optimizer.load_state_dict(optimizer_state)
+            scaler_state = payload.get("grad_scaler_state")
+            if precision_runtime.scaler.is_enabled() and isinstance(scaler_state, dict):
+                precision_runtime.scaler.load_state_dict(scaler_state)
             steps = int(payload.get("steps", 0))
             last_eval_step = int(steps)
             raw_batch_position = payload.get("train_batch_position")
@@ -1240,11 +1300,27 @@ def run_possm_phoneme_finetuning(
             )
             start_time = time.time() - resume_elapsed_seconds
 
+    benchmark_warmup_steps = int(effective_config.benchmark_warmup_steps)
+    benchmark_measure_steps = int(effective_config.benchmark_measure_steps)
+    # Benchmark a fresh process only. A resumed process has no persisted
+    # per-step timing samples, so restarting or partially continuing the
+    # absolute 1..N window would produce a mislabeled benchmark.
+    benchmark_active = benchmark_measure_steps > 0 and steps == 0
+    benchmark_warmup_end_step = steps + benchmark_warmup_steps
+    benchmark_end_step = benchmark_warmup_end_step + benchmark_measure_steps
+    if benchmark_measure_steps > 0 and not benchmark_active:
+        print(
+            "Skipping Stage-2 benchmark collection on resume; "
+            "run a fresh job for a complete warm-up and measurement window."
+        )
+
     latest_eval_metrics: dict[str, Any] | None = None
 
     def maybe_evaluate(*, force: bool = False) -> dict[str, Any] | None:
         nonlocal last_eval_step, best_metrics, best_payload, best_step, latest_eval_metrics
         if steps <= 0:
+            return None
+        if not force and benchmark_active and steps <= benchmark_end_step:
             return None
         should_run = force or steps == 1 or steps % int(effective_config.val_every_steps) == 0
         if not should_run or steps == last_eval_step:
@@ -1255,6 +1331,7 @@ def run_possm_phoneme_finetuning(
             device=resolved_device,
             blank_index=int(problem["vocab"]["blank_index"]),
             input_transform_config=effective_config,
+            precision_runtime=precision_runtime,
         )
         metrics["model_num_parameters"] = _count_trainable_parameters(model)
         metrics["encoder_num_parameters"] = _count_trainable_sequence_encoder_parameters(model)
@@ -1273,6 +1350,8 @@ def run_possm_phoneme_finetuning(
             feature_mode=effective_feature_mode,
             blank_frame_rate=collapse.get("blank_frame_rate"),
             predicted_to_reference_token_ratio=collapse.get("predicted_to_reference_token_ratio"),
+            optimizer_fused=optimizer_fused,
+            **precision_runtime.metadata(),
             **metrics,
         )
         if best_metrics is None or float(metrics["val_ctc_bpphone"]) < float(best_metrics["val_ctc_bpphone"]):
@@ -1293,6 +1372,8 @@ def run_possm_phoneme_finetuning(
                 elapsed_seconds=round(time.time() - start_time, 3),
                 train_iteration_index=train_iteration_index,
                 train_batches_consumed=train_batches_consumed,
+                precision_runtime=precision_runtime,
+                optimizer_fused=optimizer_fused,
                 batching_diagnostics=batching_diagnostics,
             )
             best_step = int(steps)
@@ -1300,6 +1381,8 @@ def run_possm_phoneme_finetuning(
         return metrics
 
     def maybe_save_resumable_checkpoint() -> None:
+        if benchmark_active and steps <= benchmark_end_step:
+            return
         if checkpoints_dir is not None and steps % int(effective_config.checkpoint_every_steps) == 0:
             checkpoints_dir.mkdir(parents=True, exist_ok=True)
             step_metrics = dict(latest_eval_metrics) if latest_eval_metrics is not None else {}
@@ -1319,6 +1402,8 @@ def run_possm_phoneme_finetuning(
                 elapsed_seconds=round(time.time() - start_time, 3),
                 train_iteration_index=train_iteration_index,
                 train_batches_consumed=train_batches_consumed,
+                precision_runtime=precision_runtime,
+                optimizer_fused=optimizer_fused,
                 batching_diagnostics=batching_diagnostics,
             )
             step_checkpoint_path = checkpoints_dir / f"step_{int(steps):06d}.pt"
@@ -1331,11 +1416,15 @@ def run_possm_phoneme_finetuning(
 
     accumulated_examples = 0
     accumulated_target_count = 0
-    accumulated_loss_sum = 0.0
+    accumulated_loss_sum: torch.Tensor | None = None
     accumulation_microbatches = 0
     accumulated_sample_seconds = 0.0
     accumulated_model_seconds = 0.0
     has_pending_gradients = False
+    optimizer_step_timer: PhaseTimer | None = None
+    optimizer_step_wall_start: float | None = None
+    benchmark_step_seconds: list[float] = []
+    benchmark_examples = 0
 
     def flush_pending_gradients(*, force_report: bool = False) -> None:
         nonlocal steps
@@ -1347,19 +1436,57 @@ def run_possm_phoneme_finetuning(
         nonlocal accumulated_sample_seconds
         nonlocal accumulated_model_seconds
         nonlocal has_pending_gradients
+        nonlocal optimizer_step_timer
+        nonlocal optimizer_step_wall_start
+        nonlocal benchmark_examples
         if not has_pending_gradients:
             return
+        optimizer_token = optimizer_step_timer.start() if optimizer_step_timer is not None else None
+        precision_runtime.scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(clip_params, max_norm=float(effective_config.max_grad_norm))
-        optimizer.step()
+        precision_runtime.scaler.step(optimizer)
+        precision_runtime.scaler.update()
         optimizer.zero_grad(set_to_none=True)
+        if optimizer_step_timer is not None:
+            optimizer_step_timer.stop("optimizer", optimizer_token)
+            phase_seconds = optimizer_step_timer.finish()
+        else:
+            phase_seconds = {}
         steps += 1
         elapsed = time.time() - start_time
         should_report = force_report or steps == 1 or steps % int(effective_config.progress_every_steps) == 0
+        train_ctc_bpphone = float("nan")
+        if (
+            should_report
+            and accumulated_target_count > 0
+            and accumulated_loss_sum is not None
+        ):
+            train_ctc_bpphone = float(
+                accumulated_loss_sum.item()
+                / accumulated_target_count
+                / math.log(2.0)
+            )
+        measured_model_seconds = sum(phase_seconds.values())
+        if phase_seconds:
+            accumulated_model_seconds = measured_model_seconds
+        complete_step_seconds = (
+            time.perf_counter() - optimizer_step_wall_start
+            if optimizer_step_wall_start is not None
+            else accumulated_sample_seconds + accumulated_model_seconds
+        )
+        examples_per_second = (
+            float(accumulated_examples) / complete_step_seconds
+            if complete_step_seconds > 0.0
+            else None
+        )
+        if (
+            benchmark_active
+            and benchmark_warmup_end_step < steps <= benchmark_end_step
+        ):
+            benchmark_step_seconds.append(float(complete_step_seconds))
+            benchmark_examples += int(accumulated_examples)
         if should_report:
             last_report_elapsed = elapsed
-            train_ctc_bpphone = float("nan")
-            if accumulated_target_count > 0:
-                train_ctc_bpphone = float(accumulated_loss_sum / accumulated_target_count / math.log(2.0))
             _emit_progress(
                 progress_log_path,
                 event="phoneme_train_report",
@@ -1370,8 +1497,24 @@ def run_possm_phoneme_finetuning(
                 microbatch_examples=int(accumulated_examples),
                 accumulation_microbatches=int(accumulation_microbatches),
                 optimizer_target_examples=int(effective_config.batch_size),
+                effective_examples_per_step=int(accumulated_examples),
                 sample_seconds=round(accumulated_sample_seconds, 4),
                 model_seconds=round(accumulated_model_seconds, 4),
+                transfer_preprocessing_seconds=round(phase_seconds.get("transfer_preprocessing", 0.0), 4),
+                forward_loss_seconds=round(phase_seconds.get("forward_loss", 0.0), 4),
+                backward_seconds=round(phase_seconds.get("backward", 0.0), 4),
+                optimizer_seconds=round(phase_seconds.get("optimizer", 0.0), 4),
+                complete_optimizer_step_seconds=round(complete_step_seconds, 4),
+                examples_per_second=(
+                    None if examples_per_second is None else round(examples_per_second, 3)
+                ),
+                peak_cuda_memory_bytes=(
+                    int(torch.cuda.max_memory_allocated(resolved_device))
+                    if resolved_device.type == "cuda"
+                    else None
+                ),
+                optimizer_fused=optimizer_fused,
+                **precision_runtime.metadata(),
                 mode=str(effective_config.mode),
                 init_source=str(effective_config.init_source),
                 data_mode=effective_data_mode,
@@ -1379,13 +1522,34 @@ def run_possm_phoneme_finetuning(
                 dynamic_batching_enabled=True,
                 max_padded_time_per_microbatch=int(max_padded_time_per_microbatch),
             )
+        if benchmark_active and steps == benchmark_end_step:
+            measured_seconds = float(sum(benchmark_step_seconds))
+            _emit_progress(
+                progress_log_path,
+                event="phoneme_precision_benchmark",
+                stage="possm_phoneme_finetune",
+                step=int(steps),
+                warmup_steps=benchmark_warmup_steps,
+                measured_steps=len(benchmark_step_seconds),
+                measured_examples=int(benchmark_examples),
+                measured_seconds=round(measured_seconds, 4),
+                examples_per_second=(
+                    None
+                    if measured_seconds <= 0.0
+                    else round(float(benchmark_examples) / measured_seconds, 3)
+                ),
+                optimizer_fused=optimizer_fused,
+                **precision_runtime.metadata(),
+            )
         accumulated_examples = 0
         accumulated_target_count = 0
-        accumulated_loss_sum = 0.0
+        accumulated_loss_sum = None
         accumulation_microbatches = 0
         accumulated_sample_seconds = 0.0
         accumulated_model_seconds = 0.0
         has_pending_gradients = False
+        optimizer_step_timer = None
+        optimizer_step_wall_start = None
 
     resume_iteration_batches = train_batch_sampler.num_batches_for_iteration(
         train_iteration_index
@@ -1432,33 +1596,64 @@ def run_possm_phoneme_finetuning(
             _restore_torch_rng_state(resume_rng_state)
             resume_rng_state = None
         while True:
-            sample_start = time.time()
+            sample_start = time.perf_counter()
             try:
                 batch = next(train_loader_iter)
             except StopIteration:
                 break
             train_batches_consumed += 1
-            accumulated_sample_seconds += time.time() - sample_start
+            accumulated_sample_seconds += time.perf_counter() - sample_start
             elapsed = time.time() - start_time
             if steps >= int(effective_config.num_steps):
                 break
-            model_start = time.time()
             if train_encoder:
                 _set_train_mode(model, train_encoder=True)
             else:
                 _set_train_mode(model, train_encoder=False)
-            x = batch["x"].to(resolved_device)
-            input_lengths = batch["input_lengths"].to(resolved_device)
-            x = _prepare_stage2_inputs(
-                x,
-                input_lengths,
-                config=effective_config,
-                is_training=True,
+            if optimizer_step_timer is None:
+                next_step = steps + 1
+                profile_step = (
+                    next_step == 1
+                    or next_step % int(effective_config.progress_every_steps) == 0
+                    or (benchmark_active and next_step <= benchmark_end_step)
+                )
+                optimizer_step_timer = PhaseTimer(resolved_device, enabled=profile_step)
+                optimizer_step_wall_start = sample_start if profile_step else None
+                if profile_step and resolved_device.type == "cuda":
+                    torch.cuda.reset_peak_memory_stats(resolved_device)
+            transfer_token = (
+                optimizer_step_timer.start() if optimizer_step_timer is not None else None
             )
-            labels = batch["labels"].to(resolved_device)
-            label_lengths = batch["label_lengths"].to(resolved_device)
+            non_blocking = resolved_device.type == "cuda"
+            input_lengths_cpu = batch["input_lengths"]
+            label_lengths_cpu = batch["label_lengths"]
+            label_length_values = [int(length) for length in label_lengths_cpu.tolist()]
+            target_count_cpu = int(sum(label_length_values))
+            microbatch_max_input_length = int(input_lengths_cpu.max().item())
+            x = batch["x"].to(
+                device=resolved_device,
+                dtype=torch.float32,
+                non_blocking=non_blocking,
+            )
+            input_lengths = input_lengths_cpu.to(
+                resolved_device,
+                non_blocking=non_blocking,
+            )
+            labels = batch["labels"].to(resolved_device, non_blocking=non_blocking)
+            label_lengths = label_lengths_cpu.to(
+                resolved_device,
+                non_blocking=non_blocking,
+            )
+            with autocast_context(precision_runtime):
+                x = _prepare_stage2_inputs(
+                    x,
+                    input_lengths,
+                    config=effective_config,
+                    is_training=True,
+                )
+            if optimizer_step_timer is not None:
+                optimizer_step_timer.stop("transfer_preprocessing", transfer_token)
             microbatch_examples = int(x.shape[0])
-            microbatch_max_input_length = int(input_lengths.max().item())
             _update_microbatch_range(
                 batching_diagnostics["train_microbatch_examples_range"],
                 microbatch_examples,
@@ -1468,25 +1663,43 @@ def run_possm_phoneme_finetuning(
                 microbatch_max_input_length,
             )
 
-            outputs = model(x, input_lengths, session_ids=batch["boundary_keys"])
+            forward_token = (
+                optimizer_step_timer.start() if optimizer_step_timer is not None else None
+            )
+            with autocast_context(precision_runtime):
+                outputs = model(x, input_lengths, session_ids=batch["boundary_keys"])
+            logits_fp32 = outputs["logits"].float()
             loss_sum, target_count = compute_ctc_loss_sum(
-                outputs["logits"],
+                logits_fp32,
                 outputs["token_lengths"],
                 labels,
                 label_lengths,
                 blank_index=int(problem["vocab"]["blank_index"]),
+                target_count=target_count_cpu,
+                label_length_values=label_length_values,
             )
-            accumulated_model_seconds += time.time() - model_start
+            if optimizer_step_timer is not None:
+                optimizer_step_timer.stop("forward_loss", forward_token)
             if target_count <= 0:
                 continue
             loss = loss_sum / target_count
             if not has_pending_gradients:
                 optimizer.zero_grad(set_to_none=True)
             scaled_loss = loss * (float(microbatch_examples) / float(effective_config.batch_size))
-            scaled_loss.backward()
+            backward_token = (
+                optimizer_step_timer.start() if optimizer_step_timer is not None else None
+            )
+            precision_runtime.scaler.scale(scaled_loss).backward()
+            if optimizer_step_timer is not None:
+                optimizer_step_timer.stop("backward", backward_token)
             accumulated_examples += microbatch_examples
             accumulated_target_count += int(target_count)
-            accumulated_loss_sum += float(loss_sum.item())
+            detached_loss_sum = loss_sum.detach()
+            accumulated_loss_sum = (
+                detached_loss_sum
+                if accumulated_loss_sum is None
+                else accumulated_loss_sum + detached_loss_sum
+            )
             accumulation_microbatches += 1
             has_pending_gradients = True
             made_progress = True
@@ -1515,6 +1728,7 @@ def run_possm_phoneme_finetuning(
             device=resolved_device,
             blank_index=int(problem["vocab"]["blank_index"]),
             input_transform_config=effective_config,
+            precision_runtime=precision_runtime,
         )
         final_metrics["model_num_parameters"] = _count_trainable_parameters(model)
         final_metrics["encoder_num_parameters"] = _count_trainable_sequence_encoder_parameters(model)
@@ -1538,6 +1752,8 @@ def run_possm_phoneme_finetuning(
             elapsed_seconds=round(time.time() - start_time, 3),
             train_iteration_index=train_iteration_index,
             train_batches_consumed=train_batches_consumed,
+            precision_runtime=precision_runtime,
+            optimizer_fused=optimizer_fused,
             batching_diagnostics=batching_diagnostics,
         ),
         checkpoint_final_path,
@@ -1554,6 +1770,8 @@ def run_possm_phoneme_finetuning(
         "stage1_checkpoint_path": str(resolved_checkpoint_path),
         "stage1_run_dir": str(stage1_run_dir),
         "mode": str(effective_config.mode),
+        **precision_runtime.metadata(),
+        "optimizer_fused": bool(optimizer_fused),
         "init_source": str(effective_config.init_source),
         "feature_mode": effective_feature_mode,
         "data_mode": effective_data_mode,

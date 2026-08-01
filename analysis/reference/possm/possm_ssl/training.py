@@ -27,6 +27,14 @@ from ssl_core.cache import (
 )
 
 from .model import POSSMReconstructionModel, list_registered_temporal_backbones
+from .precision import (
+    PhaseTimer,
+    PrecisionRuntime,
+    autocast_context,
+    build_adamw,
+    resolve_precision_runtime,
+    validate_precision,
+)
 from .stage1_objectives import build_stage1_objective
 
 
@@ -37,6 +45,7 @@ class POSSMTrainingConfig:
     model_family: str = "possm"
     stage: str = "stage1_reconstruction"
     data_mode: str = "normalized"
+    precision: str = "float32"
     boundary_key_mode: str = "session"
     segment_bins: int = 80
     model_dim: int = 64
@@ -78,6 +87,7 @@ class POSSMTrainingConfig:
             raise ValueError("stage must be 'stage1_reconstruction'")
         if self.data_mode not in {"normalized", "raw"}:
             raise ValueError("data_mode must be one of {'normalized', 'raw'}")
+        self.precision = validate_precision(self.precision)
         self.signal_spec = SignalSpec.from_value(self.signal_spec)
         if self.boundary_key_mode not in {"session", "subject_if_available"}:
             raise ValueError(
@@ -346,7 +356,8 @@ def _build_optimizer(
     *,
     learning_rate: float,
     weight_decay: float,
-) -> torch.optim.Optimizer:
+    device: torch.device,
+) -> tuple[torch.optim.Optimizer, bool]:
     decay_params: list[torch.nn.Parameter] = []
     no_decay_params: list[torch.nn.Parameter] = []
     for name, parameter in model.named_parameters():
@@ -362,7 +373,12 @@ def _build_optimizer(
         param_groups.append({"params": decay_params, "weight_decay": float(weight_decay)})
     if no_decay_params:
         param_groups.append({"params": no_decay_params, "weight_decay": 0.0})
-    return torch.optim.AdamW(param_groups, lr=float(learning_rate))
+    return build_adamw(
+        param_groups,
+        learning_rate=float(learning_rate),
+        weight_decay=float(weight_decay),
+        device=device,
+    )
 
 
 def _timestamp_utc() -> str:
@@ -627,6 +643,8 @@ def _build_checkpoint_payload(
     objective: Any,
     train_sampler: Any,
     val_sampler: Any,
+    precision_runtime: PrecisionRuntime,
+    optimizer_fused: bool,
     train_history: list[dict[str, Any]] | None = None,
     val_history: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
@@ -635,6 +653,13 @@ def _build_checkpoint_payload(
         "stage": "stage1_reconstruction",
         "model_state": model.state_dict(),
         "optimizer_state": optimizer.state_dict(),
+        "grad_scaler_state": (
+            precision_runtime.scaler.state_dict()
+            if precision_runtime.scaler.is_enabled()
+            else None
+        ),
+        "precision": precision_runtime.metadata(),
+        "optimizer_fused": bool(optimizer_fused),
         "config": config_payload,
         "step": int(step),
         "best_score": None if best_score is None else float(best_score),
@@ -724,11 +749,31 @@ def compute_reconstruction_metrics(
     *,
     device: torch.device,
     include_dataset_metrics: bool = False,
+    precision_runtime: PrecisionRuntime | None = None,
+    phase_timer: PhaseTimer | None = None,
 ) -> dict[str, Any]:
     resolved_config = dict(config)
-    stage1_batch = objective.prepare_batch(raw_batch, device=device, config=resolved_config)
-    outputs = model(stage1_batch.x_input, stage1_batch.lengths, session_ids=stage1_batch.session_ids)
+    runtime = precision_runtime or resolve_precision_runtime(
+        str(resolved_config.get("precision", "float32")),
+        device=device,
+    )
+    transfer_token = phase_timer.start() if phase_timer is not None else None
+    with autocast_context(runtime):
+        stage1_batch = objective.prepare_batch(raw_batch, device=device, config=resolved_config)
+    if phase_timer is not None:
+        phase_timer.stop("transfer_preprocessing", transfer_token)
+    forward_token = phase_timer.start() if phase_timer is not None else None
+    with autocast_context(runtime):
+        outputs = model(
+            stage1_batch.x_input,
+            stage1_batch.lengths,
+            session_ids=stage1_batch.session_ids,
+        )
+    # Objectives deliberately execute outside autocast and promote residuals
+    # to FP32 before reduction.
     metrics = objective.compute_loss(outputs, stage1_batch)
+    if phase_timer is not None:
+        phase_timer.stop("forward_loss", forward_token)
     if include_dataset_metrics and raw_batch.get("datasets") is not None:
         datasets = [str(dataset) for dataset in raw_batch["datasets"]]
         if len(datasets) != int(stage1_batch.x_target.shape[0]):
@@ -743,7 +788,10 @@ def compute_reconstruction_metrics(
         valid = valid_time.unsqueeze(-1) & stage1_batch.feature_mask.bool().unsqueeze(1)
         if stage1_batch.loss_mask is not None:
             valid = valid & stage1_batch.loss_mask.bool()
-        squared_error = (outputs["reconstruction"].detach() - stage1_batch.x_target).pow(2)
+        squared_error = (
+            outputs["reconstruction"].detach().float()
+            - stage1_batch.x_target.float()
+        ).pow(2)
         dataset_mse: dict[str, float] = {}
         dataset_valid_elements: dict[str, int] = {}
         for dataset in dict.fromkeys(datasets):
@@ -777,6 +825,7 @@ def evaluate_model(
     *,
     num_batches: int,
     device: torch.device,
+    precision_runtime: PrecisionRuntime | None = None,
 ) -> dict[str, Any] | None:
     if sampler is None:
         return None
@@ -795,6 +844,7 @@ def evaluate_model(
                 config,
                 device=device,
                 include_dataset_metrics=True,
+                precision_runtime=precision_runtime,
             )
             losses.append(float(metrics["mse"]))
             for dataset, dataset_mse in metrics.get("dataset_mse", {}).items():
@@ -870,6 +920,8 @@ def _initial_run_state(
     best_checkpoint_path: Path,
     checkpoints_dir: Path,
     config_payload: dict[str, Any],
+    precision_runtime: PrecisionRuntime,
+    optimizer_fused: bool,
 ) -> dict[str, Any]:
     return {
         "model": model,
@@ -884,6 +936,8 @@ def _initial_run_state(
         "best_checkpoint_path": best_checkpoint_path,
         "checkpoints_dir": checkpoints_dir,
         "config": config_payload,
+        "precision_runtime": precision_runtime,
+        "optimizer_fused": bool(optimizer_fused),
         "best_score": None,
         "best_step": None,
         "train_history": [],
@@ -903,6 +957,8 @@ def _train_loop(
 ) -> dict[str, Any]:
     model: POSSMReconstructionModel = run_state["model"]
     optimizer: torch.optim.Optimizer = run_state["optimizer"]
+    precision_runtime: PrecisionRuntime = run_state["precision_runtime"]
+    optimizer_fused = bool(run_state.get("optimizer_fused", False))
     objective = run_state["objective"]
     train_sampler = run_state["train_sampler"]
     val_sampler = run_state["val_sampler"]
@@ -947,8 +1003,10 @@ def _train_loop(
         batch = train_sampler.sample_batch()
         sample_seconds = time.time() - sample_start
         dataset_counter.update(batch["datasets"])
-        model_start = time.time()
         should_log_step = step == 1 or step % log_every == 0
+        phase_timer = PhaseTimer(device, enabled=should_log_step)
+        if should_log_step and device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
         metrics = compute_reconstruction_metrics(
             model,
             batch,
@@ -956,11 +1014,27 @@ def _train_loop(
             config_payload,
             device=device,
             include_dataset_metrics=should_log_step,
+            precision_runtime=precision_runtime,
+            phase_timer=phase_timer,
         )
         loss = metrics["loss"]
-        loss.backward()
-        optimizer.step()
-        model_seconds = time.time() - model_start
+        phase_token = phase_timer.start()
+        precision_runtime.scaler.scale(loss).backward()
+        phase_timer.stop("backward", phase_token)
+        phase_token = phase_timer.start()
+        precision_runtime.scaler.step(optimizer)
+        precision_runtime.scaler.update()
+        phase_timer.stop("optimizer", phase_token)
+        phase_seconds = phase_timer.finish()
+        model_seconds = sum(phase_seconds.values())
+        complete_step_seconds = (
+            sample_seconds + model_seconds if phase_seconds else None
+        )
+        examples_per_second = (
+            float(len(batch["datasets"])) / complete_step_seconds
+            if complete_step_seconds is not None and complete_step_seconds > 0.0
+            else None
+        )
         sampler_cache_context = getattr(train_sampler, "cache_context", None)
         shard_cache_summary = (
             sampler_cache_context.shard_store.summary()
@@ -977,7 +1051,43 @@ def _train_loop(
             "elapsed_seconds": round(time.time() - loop_start, 3),
             "loss": float(metrics["mse"]),
             "sample_seconds": round(sample_seconds, 4),
-            "model_seconds": round(model_seconds, 4),
+            "model_seconds": round(model_seconds, 4) if phase_seconds else None,
+            "complete_optimizer_step_seconds": (
+                round(complete_step_seconds, 4)
+                if complete_step_seconds is not None
+                else None
+            ),
+            "forward_loss_seconds": (
+                round(phase_seconds["forward_loss"], 4)
+                if "forward_loss" in phase_seconds
+                else None
+            ),
+            "transfer_preprocessing_seconds": (
+                round(phase_seconds["transfer_preprocessing"], 4)
+                if "transfer_preprocessing" in phase_seconds
+                else None
+            ),
+            "backward_seconds": (
+                round(phase_seconds["backward"], 4)
+                if "backward" in phase_seconds
+                else None
+            ),
+            "optimizer_seconds": (
+                round(phase_seconds["optimizer"], 4)
+                if "optimizer" in phase_seconds
+                else None
+            ),
+            "effective_examples_per_step": int(len(batch["datasets"])),
+            "examples_per_second": (
+                None if examples_per_second is None else round(examples_per_second, 3)
+            ),
+            "peak_cuda_memory_bytes": (
+                int(torch.cuda.max_memory_allocated(device))
+                if should_log_step and device.type == "cuda"
+                else None
+            ),
+            **precision_runtime.metadata(),
+            "optimizer_fused": optimizer_fused,
             "objective_type": str(metrics.get("objective_type", config_payload.get("stage1_objective_type", "plain_mse"))),
             "masked_fraction": float(metrics.get("masked_fraction", 0.0)),
             "dataset_mix": dict(Counter(batch["datasets"])),
@@ -995,6 +1105,11 @@ def _train_loop(
             print(
                 f"step={step:04d} train_loss={metrics['mse']:.6f} "
                 f"sample_s={sample_seconds:.2f} model_s={model_seconds:.2f}"
+                + (
+                    f" examples_s={examples_per_second:.1f}"
+                    if examples_per_second is not None
+                    else ""
+                )
                 + "".join(
                     f" {dataset}_mse={dataset_mse:.6f}"
                     for dataset, dataset_mse in sorted(metrics.get("dataset_mse", {}).items())
@@ -1017,6 +1132,7 @@ def _train_loop(
                 config_payload,
                 num_batches=val_batches,
                 device=device,
+                precision_runtime=precision_runtime,
             )
             assert val_result is not None
             val_record = {
@@ -1028,6 +1144,8 @@ def _train_loop(
                 "dataset_valid_elements": dict(
                     val_result.get("dataset_valid_elements", {})
                 ),
+                **precision_runtime.metadata(),
+                "optimizer_fused": optimizer_fused,
             }
             val_history.append(val_record)
             _emit_progress(progress_path, val_record)
@@ -1059,6 +1177,8 @@ def _train_loop(
                 objective=objective,
                 train_sampler=train_sampler,
                 val_sampler=val_sampler,
+                precision_runtime=precision_runtime,
+                optimizer_fused=optimizer_fused,
                 train_history=train_history,
                 val_history=val_history,
             )
@@ -1086,6 +1206,8 @@ def _train_loop(
         objective=objective,
         train_sampler=train_sampler,
         val_sampler=val_sampler,
+        precision_runtime=precision_runtime,
+        optimizer_fused=optimizer_fused,
         train_history=train_history,
         val_history=val_history,
     )
@@ -1126,6 +1248,7 @@ def run_possm_training(
     run_name: str | None = None,
 ) -> dict[str, Any]:
     _seed_training_run(int(config.seed))
+    precision_runtime = resolve_precision_runtime(config.precision, device=device)
     if config.signal_spec != cache_context.signal_spec:
         raise ValueError(
             "POSSMTrainingConfig.signal_spec must match CacheAccessConfig.signal_spec. "
@@ -1180,10 +1303,11 @@ def run_possm_training(
         reconstruction_mlp_hidden_size=config.reconstruction_mlp_hidden_size,
         signal_spec=config.signal_spec,
     ).to(device)
-    optimizer = _build_optimizer(
+    optimizer, optimizer_fused = _build_optimizer(
         model,
         learning_rate=float(config.learning_rate),
         weight_decay=float(config.weight_decay),
+        device=device,
     )
 
     config_payload = _serialize_config(config, cache_context=cache_context)
@@ -1213,6 +1337,8 @@ def run_possm_training(
         best_checkpoint_path=best_checkpoint_path,
         checkpoints_dir=checkpoints_dir,
         config_payload=config_payload,
+        precision_runtime=precision_runtime,
+        optimizer_fused=optimizer_fused,
     )
     return _train_loop(run_state=run_state, target_step=int(config.num_steps), device=device)
 
@@ -1226,6 +1352,8 @@ def recover_possm_run_state_from_checkpoint(
     resolved_checkpoint_path = Path(checkpoint_path)
     payload = torch.load(resolved_checkpoint_path, map_location="cpu", weights_only=False)
     recovered_config = dict(payload.get("config", {}))
+    # Checkpoints written before precision support are unambiguously FP32.
+    recovered_config.setdefault("precision", "float32")
     required_config_fields = set(POSSMTrainingConfig.__dataclass_fields__) | {
         "input_dim",
         "cache_use_normalization",
@@ -1281,13 +1409,20 @@ def recover_possm_run_state_from_checkpoint(
     model.load_state_dict(model_state)
     model.eval()
 
-    optimizer = _build_optimizer(
+    precision_runtime = resolve_precision_runtime(
+        str(recovered_config["precision"]),
+        device=device,
+    )
+    optimizer, optimizer_fused = _build_optimizer(
         model,
         learning_rate=float(recovered_config["learning_rate"]),
         weight_decay=float(recovered_config["weight_decay"]),
+        device=device,
     )
     if payload.get("optimizer_state") is not None:
         optimizer.load_state_dict(payload["optimizer_state"])
+    if precision_runtime.scaler.is_enabled() and payload.get("grad_scaler_state") is not None:
+        precision_runtime.scaler.load_state_dict(payload["grad_scaler_state"])
     objective = build_stage1_objective(
         config=recovered_config,
         seed=int(recovered_config["seed"]),
@@ -1336,6 +1471,7 @@ def recover_possm_run_state_from_checkpoint(
     if best_checkpoint_path.exists():
         best_payload = torch.load(best_checkpoint_path, map_location="cpu", weights_only=False)
         best_config = dict(best_payload.get("config", {}))
+        best_config.setdefault("precision", "float32")
         best_compat_config = {key: value for key, value in best_config.items() if key != "num_steps"}
         recovered_compat_config = {
             key: value for key, value in recovered_config.items() if key != "num_steps"
@@ -1376,6 +1512,8 @@ def recover_possm_run_state_from_checkpoint(
     return {
         "model": model,
         "optimizer": optimizer,
+        "precision_runtime": precision_runtime,
+        "optimizer_fused": bool(optimizer_fused),
         "objective": objective,
         "train_sampler": train_sampler,
         "val_sampler": val_sampler,
