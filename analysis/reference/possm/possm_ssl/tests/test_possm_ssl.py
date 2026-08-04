@@ -587,6 +587,15 @@ class POSSMSSLTests(unittest.TestCase):
 
             self.assertEqual(resolve_latest_possm_checkpoint_path(run_dir=run_dir), final)
 
+    def test_resolve_latest_possm_checkpoint_path_rejects_best_only_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "run"
+            run_dir.mkdir()
+            torch.save({"step": 100, "checkpoint_kind": "best"}, run_dir / "checkpoint_best.pt")
+
+            with self.assertRaisesRegex(RuntimeError, "No POSSM checkpoints"):
+                resolve_latest_possm_checkpoint_path(run_dir=run_dir)
+
     def test_prune_possm_resumable_checkpoints_keeps_latest_n(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             checkpoints_dir = Path(tmpdir) / "checkpoints"
@@ -2113,6 +2122,61 @@ class POSSMSSLTests(unittest.TestCase):
             self.assertIn("rng_state", final_payload)
             self.assertIn("train_batch_position", final_payload)
             self.assertTrue(bool(final_payload["dynamic_batching_enabled"]))
+
+    def test_run_possm_phoneme_finetuning_can_extend_num_steps(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            checkpoint_path = _make_stage1_checkpoint(tmp_path, temporal_gru_hidden_size=7)
+            _write_tiny_canonical_probe_cache(tmp_path)
+            output_root = tmp_path / "stage2_runs"
+            config = POSSMFinetuneConfig(
+                seed=7,
+                mode="probe_frozen",
+                dataset="brain2text24",
+                signal_spec=SignalSpec.tx_sbp(tx_dim=3, sbp_dim=2),
+                data_mode="normalized",
+                batch_size=1,
+                num_steps=1,
+                learning_rate=1e-3,
+                encoder_learning_rate=3e-4,
+                checkpoint_every_steps=1,
+                input_smoothing_sigma_bins=2.0,
+                gru_hidden_size=8,
+                gru_num_layers=2,
+                gru_dropout=0.0,
+                conv_kernel_size=3,
+                conv_stride=1,
+            )
+            first_summary = run_possm_phoneme_finetuning(
+                checkpoint_path=checkpoint_path,
+                cache_root=tmp_path,
+                output_root=output_root,
+                run_name="extended_resume_run",
+                config=config,
+                device=torch.device("cpu"),
+            )
+            step_path = Path(first_summary["checkpoints_dir"]) / "step_000001.pt"
+
+            extended_config_payload = asdict(config)
+            extended_config_payload["num_steps"] = 2
+            resumed_summary = run_possm_phoneme_finetuning(
+                checkpoint_path=checkpoint_path,
+                cache_root=tmp_path,
+                output_root=output_root,
+                run_name="extended_resume_run",
+                config=POSSMFinetuneConfig(**extended_config_payload),
+                device=torch.device("cpu"),
+                resume_from_latest=True,
+            )
+
+            self.assertEqual(resumed_summary["resumed_from_checkpoint"], str(step_path))
+            self.assertEqual(int(resumed_summary["steps"]), 2)
+            final_payload = torch.load(
+                resumed_summary["checkpoint_final_path"],
+                map_location="cpu",
+                weights_only=False,
+            )
+            self.assertEqual(int(final_payload["config"]["num_steps"]), 2)
 
     def test_stage2_resume_reproduces_uninterrupted_next_step(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

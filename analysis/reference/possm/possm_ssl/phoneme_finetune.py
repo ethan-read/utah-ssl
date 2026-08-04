@@ -940,10 +940,22 @@ def _validate_stage2_resume_payload(
         raise TypeError("Resume checkpoint is missing a valid stage-2 config payload.")
     payload_config = asdict(POSSMFinetuneConfig(**raw_payload_config))
     expected_config = asdict(resolved_config)
+    # The training horizon is a continuation target, not a model or optimizer
+    # compatibility field. Permit extending (or shortening an interrupted run
+    # to any target at/after its saved step) while keeping every other setting
+    # identical.
+    payload_config.pop("num_steps", None)
+    expected_config.pop("num_steps", None)
     if payload_config != expected_config:
         raise ValueError(
             "Resume checkpoint config does not match the requested stage-2 config. "
             "Use a new run directory or the exact same sweep settings to resume."
+        )
+    checkpoint_steps = int(payload.get("steps", 0) or 0)
+    if int(resolved_config.num_steps) < checkpoint_steps:
+        raise ValueError(
+            "Requested Stage-2 target is behind the resume checkpoint: "
+            f"target={int(resolved_config.num_steps)} checkpoint_step={checkpoint_steps}."
         )
 
 

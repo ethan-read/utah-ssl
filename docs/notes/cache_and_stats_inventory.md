@@ -98,6 +98,26 @@ Validation requires every destination array to preserve the corresponding
 projected source dtype and values exactly. Brain2Text24 retains exactly the
 baseline cache representation and shard topology.
 
+### Clipped-FP16 POSSM caches
+
+Drive audit on 2026-08-04 found that
+`cache_v1_sbpclip12500_fp16_smoothed/brain2text25` is not actually an FP16
+area-6v cache: it retains the original 69-shard, 256-SBP-channel layout and its
+`sbp.npy` arrays are FP32. Do not use that dataset folder for pooled FP16
+pretraining despite the parent root's name. The Brain2Text24 dataset under the
+same parent root is the valid clipped-FP16 cache.
+
+The active pooled FP16 workflow instead creates and uses this separate
+Brain2Text25 override root:
+
+- `utah_ssl/data/cache_v1_possm_b2t25_area6v_sbpclip12500_fp16_smoothed_v1`
+
+It is transformed non-destructively from
+`cache_v1_possm_b2t25_area6v_sigma2p0_v1`, retaining the exact 147-shard
+manifest topology and 128-channel area-6v representation used by the original
+pooled session-stat artifact. This permits a strict algebraic FP32-to-FP16
+moment update without row remapping or provenance exceptions.
+
 ## Precomputed Session Stats
 
 Reusable normalization statistics should now live with the data artifacts under

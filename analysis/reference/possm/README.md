@@ -17,6 +17,8 @@ separate from the active generic SSL experiments.
   pooled stats and sampling benchmarks.
 - `EXPERIMENT_NOTES.md`: current experiment question, Colab recovery guidance,
   cache workflow, pitfalls, and the planned Stage-2 speedup idea.
+- `RESULTS.md`: concise historical synthesis and the current exact pooled-SBP
+  Stage-1/Stage-2 results.
 - `SIGNAL_AND_DATA_CONTRACTS.md`: the explicit dataset/signal interface shared
   by raw access, analysis, statistics, and model workflows.
 

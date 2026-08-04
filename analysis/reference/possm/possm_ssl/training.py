@@ -501,8 +501,11 @@ def resolve_latest_possm_checkpoint_path(
         candidates: list[tuple[int, int, int, Path]] = []
         latest_step = find_latest_possm_step_checkpoint(candidate_run_dir / "checkpoints")
         final = candidate_run_dir / "checkpoint_final.pt"
-        best = candidate_run_dir / "checkpoint_best.pt"
-        for priority, candidate_path in ((2, latest_step), (1, final), (0, best)):
+        # checkpoint_best.pt intentionally omits resumable optimizer/RNG/sampler
+        # state. This resolver is used by continuation/recovery workflows, so an
+        # evaluation-only best checkpoint must never win merely because its
+        # validation step or mtime is newer.
+        for priority, candidate_path in ((2, latest_step), (1, final)):
             if candidate_path is None or not candidate_path.exists():
                 continue
             step = _checkpoint_payload_step(candidate_path)
