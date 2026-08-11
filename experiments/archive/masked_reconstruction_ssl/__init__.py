@@ -1,0 +1,113 @@
+"""Reusable causal masked-reconstruction SSL helpers for Colab notebooks."""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+
+def _ensure_repo_import_paths() -> None:
+    package_dir = Path(__file__).resolve().parent
+    repo_root = package_dir.parents[3]
+    experiments_dir = repo_root / "analysis" / "active" / "ssl_experiments"
+    benchmark_dir = repo_root / "analysis" / "active" / "transfer_benchmark" / "ssl_autoresearch"
+    for path in (repo_root, experiments_dir, benchmark_dir):
+        path_str = str(path)
+        if path_str not in sys.path:
+            sys.path.insert(0, path_str)
+
+
+_ensure_repo_import_paths()
+
+from utah_ssl.cache import (
+    CacheAccessConfig,
+    CacheContext,
+    build_segment_sampler,
+    load_precomputed_session_feature_stats_into_cache_context,
+    resolve_precomputed_session_stats_path,
+    prepare_cache_context,
+)
+from experiments.archive.masked_reconstruction_ssl.probe import (
+    DownstreamProbeConfig,
+    build_random_init_probe_state,
+    recover_downstream_probe_state,
+    run_checkpoint_probe_suite,
+    run_downstream_probe,
+    run_probe_head_sweep,
+)
+from .phoneme_finetune import (
+    PhonemeFinetuneConfig,
+    run_phoneme_finetuning,
+)
+from .training import (
+    SSLTrainingConfig,
+    list_ssl_checkpoints,
+    plot_ssl_training_history,
+    recover_ssl_run_state_from_checkpoint,
+    resolve_ssl_checkpoint_path,
+    resume_ssl_training,
+    run_ssl_training,
+)
+from .reporting import (
+    PROBE_VITAL_COLUMNS,
+    SSL_RECON_SCORECARD_COLUMNS,
+    display_probe_summaries,
+    display_ssl_reconstruction_report,
+)
+from .sweeps import (
+    SWEEP_VITAL_COLUMNS,
+    apply_two_session_split,
+    load_single_session_probe_problem,
+    resolve_smoothed_stats_path,
+    run_sigma_mask_probe_sweep,
+    sigma_tag,
+)
+from .training_mae import (
+    SSLTrainingConfig as SSLTrainingConfigMAE,
+    list_ssl_checkpoints as list_ssl_checkpoints_mae,
+    plot_ssl_training_history as plot_ssl_training_history_mae,
+    recover_ssl_run_state_from_checkpoint as recover_ssl_run_state_from_checkpoint_mae,
+    resolve_ssl_checkpoint_path as resolve_ssl_checkpoint_path_mae,
+    run_ssl_training as run_ssl_training_mae,
+)
+
+
+__all__ = [
+    "CacheAccessConfig",
+    "CacheContext",
+    "DownstreamProbeConfig",
+    "PhonemeFinetuneConfig",
+    "SSLTrainingConfig",
+    "build_random_init_probe_state",
+    "build_segment_sampler",
+    "list_ssl_checkpoints",
+    "load_precomputed_session_feature_stats_into_cache_context",
+    "resolve_precomputed_session_stats_path",
+    "plot_ssl_training_history",
+    "prepare_cache_context",
+    "recover_downstream_probe_state",
+    "run_checkpoint_probe_suite",
+    "recover_ssl_run_state_from_checkpoint",
+    "resolve_ssl_checkpoint_path",
+    "resume_ssl_training",
+    "run_downstream_probe",
+    "run_phoneme_finetuning",
+    "run_probe_head_sweep",
+    "run_ssl_training",
+    "PROBE_VITAL_COLUMNS",
+    "SSL_RECON_SCORECARD_COLUMNS",
+    "SWEEP_VITAL_COLUMNS",
+    "apply_two_session_split",
+    "display_probe_summaries",
+    "display_ssl_reconstruction_report",
+    "load_single_session_probe_problem",
+    "resolve_smoothed_stats_path",
+    "run_sigma_mask_probe_sweep",
+    "sigma_tag",
+    "SSLTrainingConfigMAE",
+    "list_ssl_checkpoints_mae",
+    "plot_ssl_training_history_mae",
+    "recover_ssl_run_state_from_checkpoint_mae",
+    "resolve_ssl_checkpoint_path_mae",
+    "run_ssl_training_mae",
+]

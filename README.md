@@ -1,58 +1,47 @@
-# utah-ssl
+# Utah SSL
 
-Subset repository for the Utah-array SSL / transfer benchmark work.
+Research code for improving Utah-array speech decoding across Brain-to-Text
+datasets. The repository is organized around reusable infrastructure and
+specific experiment ideas rather than the order in which work was attempted.
 
-For the current interpretation of experiment results, start with
-[`docs/notes/experiment_synthesis.md`](docs/notes/experiment_synthesis.md).
+## Start Here
 
-## Included
+- [Research status](docs/research_status.md): current high-level findings.
+- [Setup and verification](docs/setup.md): supported environments,
+  dependencies, and test commands.
+- [Data documentation](docs/data/cache_and_stats_inventory.md): canonical cache
+  roots, signal layouts, and normalization artifacts.
+- [Colab workflow](workflows/colab/README.md): the default execution workflow.
+- [Experiments](experiments/README.md): active and archived branches.
 
-- `analysis/active/transfer_benchmark/ssl_autoresearch`
-  - full benchmark scaffold
-  - canonical pure-PyTorch `s5` reference backbone
-  - held-out-session phoneme probe benchmark
-- `analysis/active/transfer_benchmark/ssl_autoresearch_local`
-  - small local smoke-test harness
-- `docs/notes/experiment_synthesis.md`
-  - current canonical synthesis of experiment results and active conclusions
-- `docs/notes/ssl_architecture_choices.md`
-  - current architecture decision log
-- `analysis/active/ssl_experiments/ssl_core`
-  - shared cache, normalization-stat, CTC, temporal patching, and reporting helpers
-- `analysis/active/ssl_experiments/ssm_ssl`
-  - active generic `S5`/`Mamba` SSL experiments with downstream CTC controls
-- `analysis/reference/possm/possm_ssl`
-  - POSSM reconstruction and phoneme fine-tuning reference implementation
-- `docs/paper_notes/`
-  - paper architecture notes that informed the benchmark design
+## Layout
 
-## Not Included
+- `utah_ssl/`: reusable cache, dataset, model, normalization, CTC, patching,
+  reporting, and data-maintenance code.
+- `experiments/supervised_baselines/`: Willett-derived GRU and supervised S5/S4D
+  comparisons.
+- `experiments/bit_style/`: active BIT-style pretraining and transfer work.
+- `experiments/possm_style/`: paper-derived POSSM-style experiments.
+- `experiments/manifolds/`: exploratory representation and trajectory analyses.
+- `experiments/archive/`: inactive branches retained in restartable form.
+- `workflows/`: shared Colab, Modal, and RunPod execution infrastructure.
+- `docs/`: cross-cutting data, paper, and research-status documentation.
 
-- raw datasets
-- cached neural features
-- generated outputs, checkpoints, or logs
-- unrelated thesis material outside the SSL / autoresearch work
+Run Python commands from the repository root. Canonical imports use
+`utah_ssl.*` and `experiments.<branch>.*`; the old `analysis.*` import paths are
+not supported.
 
-## Data / Outputs
+## Data and Outputs
 
-The full scaffold expects data and outputs to live outside the repo and be routed through environment variables.
+Datasets, reusable caches, normalization statistics, checkpoints, and generated
+outputs are not stored in the repository. Colab uses
+`/content/drive/MyDrive/utah_ssl`; the canonical local cache is normally
+`/Users/home/thesis/data/cache_v1`.
 
-For active SSL experiment notebooks and scripts, reusable Drive artifacts are organized under:
-
-- `/content/drive/MyDrive/utah_ssl/data/`
-  - cache roots such as `cache_v1` and `cache_v1_smoothed_sigma2p0`
-  - reusable normalization stats under `data/stats`
-- `/content/drive/MyDrive/utah_ssl/outputs/ssl_experiments/`
-  - experiment runs, checkpoints, logs, and plots
-
-See [`docs/notes/cache_and_stats_inventory.md`](docs/notes/cache_and_stats_inventory.md) before changing cache roots or normalization-stat paths.
-
-The main ones are:
-
-- `SSL_AUTORESEARCH_OUTPUT_ROOT`
-- `SSL_AUTORESEARCH_TX_CACHE_DIR`
-- `SSL_AUTORESEARCH_SBP_CACHE_DIR`
-- `SSL_AUTORESEARCH_B2T25_ROOT`
-- `SSL_AUTORESEARCH_B2T25_HDF5_ROOT`
-
-See [`analysis/active/transfer_benchmark/ssl_autoresearch/README.md`](analysis/active/transfer_benchmark/ssl_autoresearch/README.md) for the current benchmark contract.
+Existing Drive artifact paths remain stable across this source-code
+reorganization. New runs use the documented
+[artifact layout](docs/run_artifact_layout.md); existing outputs are not moved
+or renamed to conform to it. Generated configurations, logs, metrics,
+checkpoints, and plots remain in persistent artifact storage rather than being
+committed here. Google Drive is the permanent source of record for new run
+artifacts; public artifact hosting is not required.

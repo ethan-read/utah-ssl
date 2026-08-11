@@ -1,4 +1,4 @@
-# POSSM Architecture Notes
+# POSSM Paper and Architecture Notes
 
 Paper:
 
@@ -14,6 +14,7 @@ These notes summarize the model architecture described in the paper, with emphas
 - how POSSM supports causal decoding
 - how pretraining and finetuning are handled
 - task-specific architecture variations
+- datasets, reported results, and efficiency
 - architectural choices that are useful for later comparison
 
 These are descriptive notes, not recommendations.
@@ -395,7 +396,15 @@ This differs slightly from pure UI because the handwriting task required a task-
 
 ## Human Speech Configuration
 
-This is one of the most important sections for your purposes.
+The speech evaluation uses attempted-speech phoneme decoding:
+
+- `24` sessions from one participant with speech deficits
+- four `64`-channel microelectrode arrays in premotor cortex and Broca's area
+- multi-unit activity at `20 ms` resolution
+- variable trial lengths of approximately `2` to `18 s`
+
+The long sequences make the recurrent, constant-update-cost design especially
+relevant to the paper's real-time argument.
 
 ### Input Format Difference
 
@@ -466,6 +475,36 @@ These are still substantially smaller than the corresponding baseline GRUs in th
 - uni-directional GRU baseline: `55M`
 - bi-directional GRU baseline: `133M`
 
+## Reported Results and Efficiency
+
+The reported speech phoneme error rates are:
+
+| Model | PER |
+|---|---:|
+| GRU, no augmentation | `39.16` |
+| POSSM-GRU, no augmentation | `29.70` |
+| GRU | `30.06` |
+| S4D | `35.99` |
+| Mamba | `32.19` |
+| POSSM-GRU | `27.32` |
+| GRU, multiplicative augmentation | `21.74` |
+| POSSM-GRU, multiplicative augmentation | `19.80` |
+
+The comparison supports the paper's claim that the POSSM front end improves
+the tested GRU speech decoder, including under multiplicative augmentation.
+The reaching experiments provide the strongest evidence for cross-session and
+cross-subject pretraining, while the handwriting experiment demonstrates
+cross-species transfer from NHP motor-cortex pretraining.
+
+Reported CPU inference times are approximately:
+
+- single-session POSSM: `2.44 ms` per chunk
+- pretrained o-POSSM: `5.65 ms` per chunk
+
+The paper compares these values with a rough real-time BCI target of at most
+`10 ms` decoding latency. Together with the speech parameter counts above,
+these measurements form the main empirical support for the efficiency claim.
+
 ## Evidence For The Architecture’s Claimed Advantages
 
 The paper presents several targeted experiments that support the architecture:
@@ -532,9 +571,10 @@ The paper exposes several important design tradeoffs:
 
 These are likely the most reusable takeaways for later architecture comparison.
 
-## Concrete Architectural Choices To Carry Forward
+## Architecture Comparison Axes
 
-Without endorsing them, the paper defines a useful set of design axes:
+The paper defines a useful set of design axes without establishing that every
+choice transfers to a different dataset:
 
 - individual spike tokenization versus binned population vectors
 - learnable unit embeddings
@@ -548,7 +588,23 @@ Without endorsing them, the paper defines a useful set of design axes:
 - exact spike timing versus bin-level timing
 - recurrent online decoding versus full-context transformer decoding
 
-These are especially relevant because they are orthogonal to many of the design choices in BIT and Cortical-SSM.
+These axes are distinct from many of the design choices in BIT and
+Cortical-SSM.
+
+## Limits and Caveats
+
+- The speech experiment cannot use the paper's full precise-spike-time
+  tokenization because the released speech representation contains binned
+  normalized counts.
+- The strongest transfer evidence comes from reaching and handwriting rather
+  than attempted speech.
+- Speech uses a reconstruction pretraining phase, but the paper does not
+  establish a general standalone self-supervised framework for speech.
+- The real-time architecture is motivated and benchmarked for low inference
+  cost, but the reported task evaluations remain offline.
+- Several speech implementation details are underspecified in the paper.
+  Repository choices inferred around those gaps belong in
+  `experiments/possm_style/design/`, not in this source summary.
 
 ## Short Summary
 
