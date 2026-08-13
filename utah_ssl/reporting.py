@@ -16,7 +16,14 @@ def append_jsonl(path: str | Path, payload: dict[str, Any]) -> None:
         handle.write(json.dumps(payload, default=str) + "\n")
 
 
-def load_jsonl(path: str | Path) -> list[dict[str, Any]]:
+def append_optional_jsonl(path: str | Path | None, **payload: Any) -> None:
+    if path is not None:
+        append_jsonl(path, payload)
+
+
+def load_jsonl(path: str | Path | None) -> list[dict[str, Any]]:
+    if path is None:
+        return []
     resolved = Path(path)
     if not resolved.exists():
         return []
@@ -71,6 +78,7 @@ class ProgressPrinter:
 __all__ = [
     "ProgressPrinter",
     "append_jsonl",
+    "append_optional_jsonl",
     "load_jsonl",
     "write_metrics_csv",
 ]

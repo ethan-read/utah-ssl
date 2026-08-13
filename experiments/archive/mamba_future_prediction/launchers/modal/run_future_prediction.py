@@ -529,9 +529,7 @@ def recompute_remote_session_stats(
 ) -> dict[str, object]:
     _ensure_import_paths()
 
-    from utah_ssl.scripts.recompute_session_feature_stats import (
-        recompute_session_feature_stats,
-    )
+    from utah_ssl.stats import recompute_session_feature_stats
     from utah_ssl.experiment_contract import (
         DatasetPlan,
         SignalSpec,

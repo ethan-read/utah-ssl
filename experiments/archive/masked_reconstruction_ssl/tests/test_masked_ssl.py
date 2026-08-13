@@ -19,13 +19,14 @@ if str(REPO_ROOT) not in sys.path:
 
 from utah_ssl.cache import (
     CacheAccessConfig,
-    _apply_gaussian_smoothing,
-    _compute_session_feature_stats,
-    _compute_cache_source_signature,
-    load_precomputed_session_feature_stats_into_cache_context,
     prepare_cache_context,
+)
+from utah_ssl.sampling import sample_base_segment
+from utah_ssl.signal_processing import apply_gaussian_smoothing
+from utah_ssl.stats import (
+    compute_session_feature_stats,
+    load_precomputed_session_feature_stats_into_cache_context,
     resolve_precomputed_session_stats_path,
-    sample_base_segment,
 )
 from experiments.archive.masked_reconstruction_ssl.model import MaskedSSLModel, SessionLinearBank
 from experiments.archive.masked_reconstruction_ssl.objectives import (
@@ -791,7 +792,7 @@ class MaskedSSLTests(unittest.TestCase):
             gaussian_smoothing_sigma_bins=0.0,
         )
 
-        stats = _compute_session_feature_stats(
+        stats = compute_session_feature_stats(
             _DummyShardStore(),
             rows_by_dataset={"toy": [row]},
             config=config,
@@ -835,7 +836,7 @@ class MaskedSSLTests(unittest.TestCase):
             )
 
             with mock.patch(
-                "utah_ssl.cache._compute_session_feature_stats",
+                "utah_ssl.stats.compute_session_feature_stats",
                 side_effect=AssertionError("should not recompute stats"),
             ):
                 context = prepare_cache_context(
@@ -883,7 +884,7 @@ class MaskedSSLTests(unittest.TestCase):
             )
 
             with mock.patch(
-                "utah_ssl.cache._compute_session_feature_stats",
+                "utah_ssl.stats.compute_session_feature_stats",
                 side_effect=AssertionError("should not recompute stats"),
             ):
                 context = prepare_cache_context(
@@ -1035,7 +1036,7 @@ class MaskedSSLTests(unittest.TestCase):
             self.assertEqual(summary["datasets"]["toyset"]["shard_count"], 1)
             src_tx = np.load(src_root / "toyset" / "shards" / "toy_shard" / "tx.npy")
             dst_tx = np.load(dst_root / "toyset" / "shards" / "toy_shard" / "tx.npy")
-            expected_tx = _apply_gaussian_smoothing(
+            expected_tx = apply_gaussian_smoothing(
                 torch.from_numpy(src_tx.copy()),
                 torch.ones(src_tx.shape[1], dtype=torch.float32),
                 sigma_bins=1.5,

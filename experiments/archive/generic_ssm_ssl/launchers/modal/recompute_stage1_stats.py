@@ -17,9 +17,7 @@ from utah_ssl.experiment_contract import (
     DatasetPlan,
     SignalSpec,
 )
-from utah_ssl.cache import (
-    resolve_precomputed_session_stats_path,
-)
+from utah_ssl.stats import resolve_precomputed_session_stats_path
 
 APP_NAME = "utah-ssl-recompute-bit-stage1-stats"
 CACHE_VOLUME_NAME = "utah-ssl-cache"
@@ -81,7 +79,9 @@ def recompute_stats() -> dict[str, str]:
 
     command = [
         sys.executable,
-        "utah_ssl/scripts/recompute_session_feature_stats.py",
+        "utah_ssl/scripts/recompute_feature_stats.py",
+        "--scope",
+        "session",
         "--cache-root",
         str(cache_root),
         "--output-path",

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Audit Decoding Data"
+  short_description: "Audit caches, splits, signals, and statistics"
+  default_prompt: "Use $audit-decoding-data to verify this experiment data contract before training."

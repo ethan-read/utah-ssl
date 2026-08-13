@@ -1,10 +1,9 @@
-"""Training entrypoints for generic SSM SSL experiments."""
+"""Training entrypoints for BIT-style S5 pretraining and CTC transfer."""
 
 from __future__ import annotations
 
 import json
 import math
-import random
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -15,30 +14,39 @@ import torch
 from torch.utils.data import DataLoader
 
 from experiments.supervised_baselines.data import (
-    WillettInputTransformConfig,
     compute_willett_normalization_stats,
-    prepare_willett_inputs,
 )
-from utah_ssl.cache import CacheAccessConfig, build_segment_sampler, prepare_cache_context
+from utah_ssl.cache import (
+    CacheAccessConfig,
+    prepare_cache_context,
+)
+from utah_ssl.sampling import build_segment_sampler
 from utah_ssl.ctc import (
-    CanonicalSequenceDataset,
-    LengthAwareBatchSampler,
-    build_competition_split_problem,
-    canonical_rows_padded_time_percentile,
-    collate_sequence_batch,
     compute_ctc_loss_sum,
     ctc_bits_per_target,
     ctc_greedy_decode,
     edit_counts,
 )
+from utah_ssl.dataset_splits import build_competition_split_problem
+from utah_ssl.sequence_data import (
+    CanonicalSequenceDataset,
+    LengthAwareBatchSampler,
+    canonical_rows_padded_time_percentile,
+    collate_sequence_batch,
+)
+from utah_ssl.decoding_preprocessing import (
+    WillettInputTransformConfig,
+    prepare_willett_inputs,
+)
 from utah_ssl.reporting import ProgressPrinter, append_jsonl, write_metrics_csv
+from utah_ssl.runtime import resolve_device, seed_everything
 from utah_ssl.stats import (
     load_precomputed_split_feature_stats,
     resolve_precomputed_split_stats_path,
 )
 
-from .config import GenericSSMSSLConfig
-from .model import GenericMaskedSSMModel, GenericSSMCTCModel, make_encoder_from_config
+from .config import BITStyleConfig
+from .model import BITStyleCTCModel, BITStylePretrainingModel, make_encoder_from_config
 from .objectives import masked_reconstruction_loss
 
 
@@ -46,43 +54,20 @@ def _timestamp_utc() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
 
-def _seed_all(seed: int) -> None:
-    random.seed(int(seed))
-    np.random.seed(int(seed))
-    torch.manual_seed(int(seed))
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(int(seed))
-
-
-def _detect_device() -> torch.device:
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
-
-
-def _resolve_run_dir(config: GenericSSMSSLConfig) -> Path:
+def _resolve_run_dir(config: BITStyleConfig) -> Path:
     name = (
         str(config.run_name)
         if config.run_name is not None
-        else f"ssm_ssl_{config.backbone_type}_{config.input_mode}_{_timestamp_utc()}"
+        else f"bit_style_s5_{config.input_mode}_{_timestamp_utc()}"
     )
     return Path(config.output_root) / name
-
-
-def _feature_dim_from_rows(rows: tuple[Any, ...], *, feature_mode: str) -> int:
-    first = rows[0]
-    tx_dim = int(first.n_tx_features)
-    sbp_dim = int(first.n_sbp_features)
-    return tx_dim if feature_mode == "tx_only" else tx_dim + sbp_dim
 
 
 def _optimizer(parameters: Any, *, learning_rate: float, weight_decay: float) -> torch.optim.Optimizer:
     return torch.optim.AdamW(parameters, lr=float(learning_rate), weight_decay=float(weight_decay))
 
 
-def _ctc_input_transform_config(config: GenericSSMSSLConfig) -> WillettInputTransformConfig:
+def _ctc_input_transform_config(config: BITStyleConfig) -> WillettInputTransformConfig:
     return WillettInputTransformConfig(
         input_smoothing_sigma_bins=float(config.ctc_input_smoothing_sigma_bins),
         input_smoothing_kernel_size=int(config.ctc_input_smoothing_kernel_size),
@@ -95,9 +80,9 @@ def _ctc_input_transform_config(config: GenericSSMSSLConfig) -> WillettInputTran
 def _save_ssl_checkpoint(
     path: Path,
     *,
-    model: GenericMaskedSSMModel,
+    model: BITStylePretrainingModel,
     optimizer: torch.optim.Optimizer,
-    config: GenericSSMSSLConfig,
+    config: BITStyleConfig,
     step: int,
     metrics: dict[str, Any],
 ) -> None:
@@ -135,12 +120,12 @@ def load_encoder_checkpoint(encoder: torch.nn.Module, checkpoint_path: str | Pat
 
 
 def run_ssl_pretraining(
-    config: GenericSSMSSLConfig,
+    config: BITStyleConfig,
     *,
     run_dir: str | Path | None = None,
 ) -> dict[str, Any]:
-    _seed_all(int(config.seed))
-    device = _detect_device()
+    seed_everything(int(config.seed))
+    device = resolve_device()
     resolved_run_dir = Path(run_dir) if run_dir is not None else _resolve_run_dir(config)
     resolved_run_dir.mkdir(parents=True, exist_ok=True)
     progress_log_path = resolved_run_dir / "progress.jsonl"
@@ -182,7 +167,7 @@ def run_ssl_pretraining(
         if cache_context.has_val_datasets
         else None
     )
-    model = GenericMaskedSSMModel(
+    model = BITStylePretrainingModel(
         make_encoder_from_config(config, input_dim=int(cache_context.full_dim))
     ).to(device)
     optimizer = _optimizer(
@@ -356,7 +341,7 @@ def _make_ctc_loader(
     )
 
 
-def _load_or_compute_ctc_stats(config: GenericSSMSSLConfig, problem: dict[str, Any], sample_dim: int) -> Any:
+def _load_or_compute_ctc_stats(config: BITStyleConfig, problem: dict[str, Any], sample_dim: int) -> Any:
     if str(config.normalization_mode) == "none":
         return None
     if str(config.normalization_mode) == "global":
@@ -378,7 +363,7 @@ def _load_or_compute_ctc_stats(config: GenericSSMSSLConfig, problem: dict[str, A
                 val_split_name=str(problem["val_split_name"]),
                 split_policy=str(problem["split_policy"]),
             )
-            print(f"loaded precomputed generic SSM CTC split stats: {loaded_path}", flush=True)
+            print(f"loaded precomputed BIT-style CTC split stats: {loaded_path}", flush=True)
             return (
                 mean_t.numpy().astype(np.float32, copy=False),
                 std_t.numpy().astype(np.float32, copy=False),
@@ -395,7 +380,7 @@ def _load_or_compute_ctc_stats(config: GenericSSMSSLConfig, problem: dict[str, A
 
 def _evaluate_ctc(
     *,
-    model: GenericSSMCTCModel,
+    model: BITStyleCTCModel,
     loader: DataLoader,
     device: torch.device,
     blank_index: int,
@@ -459,14 +444,14 @@ def _evaluate_ctc(
 
 
 def run_ctc_finetuning(
-    config: GenericSSMSSLConfig,
+    config: BITStyleConfig,
     *,
     run_dir: str | Path | None = None,
     encoder_checkpoint_path: str | Path | None = None,
     label: str = "pretrained",
 ) -> dict[str, Any]:
-    _seed_all(int(config.seed) + (0 if label == "pretrained" else 1009))
-    device = _detect_device()
+    seed_everything(int(config.seed) + (0 if label == "pretrained" else 1009))
+    device = resolve_device()
     resolved_run_dir = Path(run_dir) if run_dir is not None else _resolve_run_dir(config)
     ctc_dir = resolved_run_dir / f"ctc_{label}"
     ctc_dir.mkdir(parents=True, exist_ok=True)
@@ -507,7 +492,7 @@ def run_ctc_finetuning(
         seed=int(config.seed) + 1,
         device=device,
     )
-    model = GenericSSMCTCModel(
+    model = BITStyleCTCModel(
         encoder=make_encoder_from_config(config, input_dim=sample_dim),
         vocab_size=int(problem["vocab"]["num_classes"]),
     ).to(device)
@@ -643,7 +628,7 @@ def run_ctc_finetuning(
     }
 
 
-def run_generic_ssm_ssl(config: GenericSSMSSLConfig) -> dict[str, Any]:
+def run_bit_style_experiment(config: BITStyleConfig) -> dict[str, Any]:
     run_dir = _resolve_run_dir(config)
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "config.json").write_text(json.dumps(config.to_dict(), indent=2, sort_keys=True))
@@ -682,6 +667,6 @@ def run_generic_ssm_ssl(config: GenericSSMSSLConfig) -> dict[str, Any]:
 __all__ = [
     "load_encoder_checkpoint",
     "run_ctc_finetuning",
-    "run_generic_ssm_ssl",
+    "run_bit_style_experiment",
     "run_ssl_pretraining",
 ]

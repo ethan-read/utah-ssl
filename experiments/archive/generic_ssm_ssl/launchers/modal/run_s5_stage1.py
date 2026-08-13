@@ -217,7 +217,7 @@ def train_bit_s5_stage1(
 
     command = [
         sys.executable,
-        "experiments/bit_style/scripts/run_generic_ssm_ssl.py",
+        "experiments/archive/generic_ssm_ssl/scripts/run_generic_ssm_ssl.py",
         "--config-json",
         str(config_json_path),
     ]

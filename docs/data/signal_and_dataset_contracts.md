@@ -53,6 +53,14 @@ the accessor opens only the arrays requested by `SignalSpec`. Cache-preparation
 scripts may create versioned physical layouts for I/O performance, but they do
 not decide which datasets or modalities an experiment uses.
 
+Reusable code follows the same boundary:
+
+- `utah_ssl.canonical_data` owns manifest records and memory-mapped shards;
+- `utah_ssl.dataset_splits` builds labeled train/validation problems;
+- `utah_ssl.feature_stats` computes and applies normalization;
+- `utah_ssl.sequence_data` owns PyTorch datasets, collation, and batching;
+- `utah_ssl.cache` prepares multi-dataset cache contexts for segment sampling.
+
 ## Loading and normalization guarantees
 
 - Cache access opens only the modalities requested by `SignalSpec`.

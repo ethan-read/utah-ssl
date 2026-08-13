@@ -12,22 +12,22 @@ import numpy as np
 import torch
 
 try:
-    from utah_ssl.datasets import (
+    from utah_ssl.feature_stats import apply_feature_stats
+    from utah_ssl.sequence_data import (
         CanonicalSequenceDataset,
-        apply_feature_stats,
+        LengthAwareBatchSampler,
         collate_sequence_batch,
     )
-    from utah_ssl.cache import resolve_boundary_key
-    from utah_ssl.ctc import LengthAwareBatchSampler
+    from utah_ssl.session_keys import resolve_boundary_key
     from utah_ssl.experiment_contract import SignalSpec
 except ModuleNotFoundError:  # pragma: no cover - repo-root unittest fallback
-    from utah_ssl.datasets import (
+    from utah_ssl.feature_stats import apply_feature_stats
+    from utah_ssl.sequence_data import (
         CanonicalSequenceDataset,
-        apply_feature_stats,
+        LengthAwareBatchSampler,
         collate_sequence_batch,
     )
-    from utah_ssl.cache import resolve_boundary_key
-    from utah_ssl.ctc import LengthAwareBatchSampler
+    from utah_ssl.session_keys import resolve_boundary_key
     from utah_ssl.experiment_contract import SignalSpec
 
 from experiments.supervised_baselines.data import (

@@ -7,8 +7,6 @@ reproduction; architectural details were inferred from the paper descriptions.
 
 ## Colab Notebooks
 
-- [Brain-to-Text 2024 reconstruction and transfer](notebooks/brain2text24_masked_reconstruction_transfer.ipynb)
-- [Brain-to-Text 2025 long pretraining](notebooks/brain2text25_long_pretraining.ipynb)
 - [Pooled Brain-to-Text 2024/2025 pretraining](notebooks/pooled_brain2text24_brain2text25_pretraining.ipynb)
 - [Pooled cache preparation](notebooks/pooled_cache_preparation.ipynb)
 

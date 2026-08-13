@@ -88,7 +88,7 @@ def run_stage2_ctc(
 ) -> dict[str, object]:
     _ensure_import_paths()
 
-    from experiments.bit_style.config import GenericSSMSSLConfig
+    from experiments.bit_style.config import BITStyleConfig
     from experiments.bit_style.training import run_ctc_finetuning
     from utah_ssl.experiment_contract import (
         DatasetPlan,
@@ -101,9 +101,8 @@ def run_stage2_ctc(
         raise FileNotFoundError(f"Stage-1 checkpoint not found: {checkpoint_path}")
 
     cache_root = REMOTE_CACHE_VOLUME_ROOT / cache_subdir
-    config = GenericSSMSSLConfig(
+    config = BITStyleConfig(
         seed=int(seed),
-        backbone_type="s5",
         input_mode="temporal_patch",
         dataset="brain2text24",
         dataset_plan=DatasetPlan.from_mapping(

@@ -1,4 +1,4 @@
-"""Generic S5/Mamba encoder models for SSL and CTC experiments."""
+"""S5 encoder models for BIT-style pretraining and CTC transfer."""
 
 from __future__ import annotations
 
@@ -9,21 +9,8 @@ import torch
 import torch.nn as nn
 
 from utah_ssl.patching import PatchPolicy, causal_conv_lengths, patch_batch
-
+from utah_ssl.models.sequence import apply_sequence_mask
 from utah_ssl.models.s5 import BidirectionalS5SequenceBackbone, S5SequenceBackbone
-
-
-def _sequence_mask(lengths: torch.Tensor, max_len: int) -> torch.Tensor:
-    positions = torch.arange(max_len, device=lengths.device).unsqueeze(0)
-    return positions < lengths.unsqueeze(1)
-
-
-def _zero_invalid(x: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
-    if int(x.shape[1]) == 0:
-        return x
-    mask = _sequence_mask(lengths.to(x.device), int(x.shape[1])).unsqueeze(-1).to(x.dtype)
-    return x * mask
-
 
 class CausalConvStem(nn.Module):
     def __init__(self, *, input_dim: int, hidden_size: int, kernel_size: int, stride: int) -> None:
@@ -45,76 +32,15 @@ class CausalConvStem(nn.Module):
         conv_input = torch.nn.functional.pad(x.transpose(1, 2), (self.kernel_size - 1, 0))
         tokens = self.conv(conv_input).transpose(1, 2)
         token_lengths = causal_conv_lengths(lengths.to(x.device), stride=self.stride)
-        return _zero_invalid(self.norm(self.activation(tokens)), token_lengths), token_lengths
+        return apply_sequence_mask(self.norm(self.activation(tokens)), token_lengths), token_lengths
 
 
-class MambaSequenceBackbone(nn.Module):
-    def __init__(self, *, hidden_size: int, state_size: int, num_layers: int, dropout: float) -> None:
-        super().__init__()
-        try:
-            from transformers import MambaConfig, MambaModel
-        except ImportError as exc:  # pragma: no cover - optional Colab dependency
-            raise ImportError(
-                "Mamba backbone requires transformers with MambaModel available. "
-                "Install/upgrade transformers in the runtime before using backbone_type='mamba'."
-            ) from exc
-
-        config = MambaConfig(
-            # This encoder always feeds `inputs_embeds`, so the default 50k token
-            # embedding table is dead weight unless we shrink the vocabulary.
-            vocab_size=1,
-            hidden_size=int(hidden_size),
-            state_size=int(state_size),
-            num_hidden_layers=int(num_layers),
-            intermediate_size=max(int(hidden_size) * 2, 1),
-            hidden_dropout_prob=float(dropout),
-        )
-        self.model = MambaModel(config)
-
-    def forward(self, x: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
-        outputs = self.model(inputs_embeds=x)
-        hidden = getattr(outputs, "last_hidden_state", outputs[0])
-        return _zero_invalid(hidden, lengths)
-
-
-def build_sequence_backbone(
-    *,
-    backbone_type: str,
-    hidden_size: int,
-    state_size: int,
-    num_layers: int,
-    dropout: float,
-    direction: str,
-    ffn_multiplier: float,
-) -> nn.Module:
-    if backbone_type == "s5":
-        backbone_cls = S5SequenceBackbone if direction == "causal" else BidirectionalS5SequenceBackbone
-        return backbone_cls(
-            d_model=int(hidden_size),
-            d_state=int(state_size),
-            num_layers=int(num_layers),
-            dropout=float(dropout),
-            ffn_multiplier=float(ffn_multiplier),
-        )
-    if backbone_type == "mamba":
-        if direction != "causal":
-            raise ValueError("Mamba backbone currently supports only direction='causal'")
-        return MambaSequenceBackbone(
-            hidden_size=int(hidden_size),
-            state_size=int(state_size),
-            num_layers=int(num_layers),
-            dropout=float(dropout),
-        )
-    raise ValueError("backbone_type must be one of {'s5', 'mamba'}")
-
-
-class GenericSSMEncoder(nn.Module):
+class BITStyleEncoder(nn.Module):
     def __init__(
         self,
         *,
         input_dim: int,
         hidden_size: int,
-        backbone_type: str = "s5",
         state_size: int = 64,
         num_layers: int = 4,
         dropout: float = 0.1,
@@ -132,7 +58,6 @@ class GenericSSMEncoder(nn.Module):
             raise ValueError("input_mode must be one of {'raw_bin', 'temporal_patch', 'causal_conv_stem'}")
         self.input_dim = int(input_dim)
         self.hidden_size = int(hidden_size)
-        self.backbone_type = str(backbone_type)
         self.state_size = int(state_size)
         self.num_layers = int(num_layers)
         self.input_mode = str(input_mode)
@@ -166,13 +91,14 @@ class GenericSSMEncoder(nn.Module):
                 nn.LayerNorm(self.hidden_size),
             )
         )
-        self.backbone = build_sequence_backbone(
-            backbone_type=str(backbone_type),
-            hidden_size=self.hidden_size,
-            state_size=self.state_size,
-            num_layers=int(num_layers),
+        backbone_cls = (
+            S5SequenceBackbone if direction == "causal" else BidirectionalS5SequenceBackbone
+        )
+        self.backbone = backbone_cls(
+            d_model=self.hidden_size,
+            d_state=self.state_size,
+            num_layers=self.num_layers,
             dropout=float(dropout),
-            direction=str(direction),
             ffn_multiplier=float(ffn_multiplier),
         )
 
@@ -182,7 +108,7 @@ class GenericSSMEncoder(nn.Module):
         if int(x.shape[-1]) != self.input_dim:
             raise ValueError(f"Expected input_dim={self.input_dim}, got {int(x.shape[-1])}")
         if self.input_mode == "raw_bin":
-            return _zero_invalid(x, lengths), lengths.to(device=x.device, dtype=torch.long)
+            return apply_sequence_mask(x, lengths), lengths.to(device=x.device, dtype=torch.long)
         if self.input_mode == "temporal_patch":
             return patch_batch(
                 x,
@@ -198,7 +124,7 @@ class GenericSSMEncoder(nn.Module):
     def encode_tokens(self, tokens: torch.Tensor, token_lengths: torch.Tensor) -> torch.Tensor:
         hidden_input = self.input_projection(tokens)
         hidden = self.backbone(hidden_input, token_lengths)
-        return _zero_invalid(hidden, token_lengths)
+        return apply_sequence_mask(hidden, token_lengths)
 
     def encode(self, x: torch.Tensor, lengths: torch.Tensor) -> SimpleNamespace:
         tokens, token_lengths = self.tokenize(x, lengths)
@@ -209,8 +135,8 @@ class GenericSSMEncoder(nn.Module):
         return self.encode(x, lengths).hidden
 
 
-class GenericMaskedSSMModel(nn.Module):
-    def __init__(self, encoder: GenericSSMEncoder) -> None:
+class BITStylePretrainingModel(nn.Module):
+    def __init__(self, encoder: BITStyleEncoder) -> None:
         super().__init__()
         self.encoder = encoder
         self.raw_mask_token = nn.Parameter(torch.zeros(int(encoder.token_dim)))
@@ -248,8 +174,8 @@ class GenericMaskedSSMModel(nn.Module):
         return self.forward_tokens(tokens, token_lengths, corruption_mask=corruption_mask)
 
 
-class GenericSSMCTCModel(nn.Module):
-    def __init__(self, *, encoder: GenericSSMEncoder, vocab_size: int) -> None:
+class BITStyleCTCModel(nn.Module):
+    def __init__(self, *, encoder: BITStyleEncoder, vocab_size: int) -> None:
         super().__init__()
         self.encoder = encoder
         self.classifier = nn.Linear(int(encoder.hidden_size), int(vocab_size))
@@ -272,11 +198,10 @@ class GenericSSMCTCModel(nn.Module):
         }
 
 
-def make_encoder_from_config(config: Any, *, input_dim: int | None = None) -> GenericSSMEncoder:
-    return GenericSSMEncoder(
+def make_encoder_from_config(config: Any, *, input_dim: int | None = None) -> BITStyleEncoder:
+    return BITStyleEncoder(
         input_dim=int(input_dim if input_dim is not None else config.input_dim),
         hidden_size=int(config.hidden_size),
-        backbone_type=str(config.backbone_type),
         state_size=int(config.state_size),
         num_layers=int(config.num_layers),
         dropout=float(config.dropout),
@@ -293,10 +218,8 @@ def make_encoder_from_config(config: Any, *, input_dim: int | None = None) -> Ge
 
 __all__ = [
     "CausalConvStem",
-    "GenericMaskedSSMModel",
-    "GenericSSMCTCModel",
-    "GenericSSMEncoder",
-    "MambaSequenceBackbone",
-    "build_sequence_backbone",
+    "BITStyleCTCModel",
+    "BITStyleEncoder",
+    "BITStylePretrainingModel",
     "make_encoder_from_config",
 ]

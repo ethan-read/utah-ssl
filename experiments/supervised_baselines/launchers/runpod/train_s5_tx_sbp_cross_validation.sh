@@ -62,7 +62,7 @@ for fold_index in $(seq "${CV_START_FOLD}" "${CV_STOP_FOLD}"); do
   CV_FOLD_INDEX="${fold_index}" \
   SEED="${SEED}" \
   RUN_NAME="${fold_run_name}" \
-  "${SCRIPT_DIR}/launch_willett_s5_tx_sbp.sh"
+  "${SCRIPT_DIR}/train_s5_tx_sbp.sh"
   fold_status=$?
   set -e
 

@@ -12,7 +12,7 @@ in `utah_ssl`; branch-specific objectives and training remain here.
 - Detailed BIT-to-S5 fidelity guide:
   [design/faithful_bit_to_s5_adaptation.md](design/faithful_bit_to_s5_adaptation.md)
 - Modal launchers: `launchers/modal/`
-- Scripted entry point: `python -m experiments.bit_style.scripts.run_generic_ssm_ssl`
+- Scripted entry point: `python -m experiments.bit_style.scripts.run_bit_style_experiment`
 - Results: [results/README.md](results/README.md)
 
 Colab remains the default interactive workflow. Substantial existing BIT runs

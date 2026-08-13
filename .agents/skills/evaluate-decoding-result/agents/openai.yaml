@@ -1,0 +1,4 @@
+interface:
+  display_name: "Evaluate Decoding Result"
+  short_description: "Audit completed runs and scientific claims"
+  default_prompt: "Use $evaluate-decoding-result to audit this completed run and state what the evidence supports."

@@ -1,27 +1,15 @@
-"""Shared CTC data and phoneme metric helpers."""
+"""Shared operations around PyTorch CTC loss and phoneme decoding."""
 
 from __future__ import annotations
 
 import math
-from collections import Counter
-from typing import Any, Sequence
+from typing import Sequence
 
 import torch
 import torch.nn.functional as F
 
-from .datasets import (
-    DEFAULT_PHONEME_VOCABULARY,
-    CanonicalProbeManifestRow,
-    CanonicalSequenceDataset,
-    LengthAwareBatchSampler,
-    build_competition_split_problem,
-    build_source_split_problem,
-    canonical_rows_padded_time_percentile,
-    collate_sequence_batch,
-)
 
-
-def flatten_ctc_targets(
+def _flatten_ctc_targets(
     labels: torch.Tensor,
     label_lengths: torch.Tensor,
     *,
@@ -52,6 +40,7 @@ def compute_ctc_loss_sum(
     target_count: int | None = None,
     label_length_values: Sequence[int] | None = None,
 ) -> tuple[torch.Tensor, int]:
+    """Return PyTorch's summed CTC loss and the validated target count."""
     resolved_lengths = (
         [int(length) for length in label_length_values]
         if label_length_values is not None
@@ -68,7 +57,7 @@ def compute_ctc_loss_sum(
     log_probs = F.log_softmax(logits, dim=-1).transpose(0, 1)
     loss_sum = F.ctc_loss(
         log_probs,
-        flatten_ctc_targets(
+        _flatten_ctc_targets(
             labels,
             label_lengths,
             label_length_values=resolved_lengths,
@@ -83,6 +72,7 @@ def compute_ctc_loss_sum(
 
 
 def ctc_bits_per_target(loss_sum: torch.Tensor | float, target_count: int) -> float:
+    """Convert summed natural-log CTC loss to bits per target phoneme."""
     if int(target_count) <= 0:
         raise ValueError("target_count must be positive")
     value = float(loss_sum.item()) if isinstance(loss_sum, torch.Tensor) else float(loss_sum)
@@ -95,6 +85,7 @@ def ctc_greedy_decode(
     *,
     blank_index: int,
 ) -> list[list[int]]:
+    """Collapse argmax paths into token sequences using standard CTC rules."""
     token_ids = logits.argmax(dim=-1)
     decoded: list[list[int]] = []
     for batch_idx, length in enumerate(token_lengths.tolist()):
@@ -113,6 +104,7 @@ def ctc_greedy_decode(
 
 
 def edit_counts(reference: list[int], hypothesis: list[int]) -> tuple[int, int, int]:
+    """Return insertion, deletion, and substitution counts."""
     rows = len(reference) + 1
     cols = len(hypothesis) + 1
     distances = [[0] * cols for _ in range(rows)]
@@ -146,61 +138,9 @@ def edit_counts(reference: list[int], hypothesis: list[int]) -> tuple[int, int, 
     return ops[-1][-1]
 
 
-def phoneme_error_diagnostics(
-    *,
-    logits: torch.Tensor,
-    token_lengths: torch.Tensor,
-    labels: torch.Tensor,
-    label_lengths: torch.Tensor,
-    blank_index: int,
-    top_k: int = 10,
-) -> dict[str, Any]:
-    predictions = ctc_greedy_decode(logits, token_lengths, blank_index=int(blank_index))
-    total_insertions = 0
-    total_deletions = 0
-    total_substitutions = 0
-    total_reference_tokens = 0
-    total_predicted_tokens = 0
-    reference_counter: Counter[int] = Counter()
-    prediction_counter: Counter[int] = Counter()
-    for row_idx, prediction in enumerate(predictions):
-        reference = labels[row_idx, : int(label_lengths[row_idx].item())].tolist()
-        insertions, deletions, substitutions = edit_counts(reference, prediction)
-        total_insertions += int(insertions)
-        total_deletions += int(deletions)
-        total_substitutions += int(substitutions)
-        total_reference_tokens += len(reference)
-        total_predicted_tokens += len(prediction)
-        reference_counter.update(int(token) for token in reference)
-        prediction_counter.update(int(token) for token in prediction)
-    if total_reference_tokens <= 0:
-        raise ValueError("Reference token count is zero; cannot compute PER.")
-    total_errors = total_insertions + total_deletions + total_substitutions
-    return {
-        "phoneme_error_rate": float(total_errors / total_reference_tokens),
-        "total_reference_tokens": int(total_reference_tokens),
-        "total_predicted_tokens": int(total_predicted_tokens),
-        "insertions": int(total_insertions),
-        "deletions": int(total_deletions),
-        "substitutions": int(total_substitutions),
-        "reference_top_ids": [[int(k), int(v)] for k, v in reference_counter.most_common(top_k)],
-        "prediction_top_ids": [[int(k), int(v)] for k, v in prediction_counter.most_common(top_k)],
-    }
-
-
 __all__ = [
-    "DEFAULT_PHONEME_VOCABULARY",
-    "CanonicalProbeManifestRow",
-    "CanonicalSequenceDataset",
-    "LengthAwareBatchSampler",
-    "build_competition_split_problem",
-    "build_source_split_problem",
-    "canonical_rows_padded_time_percentile",
-    "collate_sequence_batch",
     "compute_ctc_loss_sum",
     "ctc_bits_per_target",
     "ctc_greedy_decode",
     "edit_counts",
-    "flatten_ctc_targets",
-    "phoneme_error_diagnostics",
 ]

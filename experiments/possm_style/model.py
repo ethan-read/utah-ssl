@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
-from types import SimpleNamespace
 from typing import Any
 
 import torch

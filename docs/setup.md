@@ -17,7 +17,7 @@ manager, then install the libraries needed by the reusable package and active
 test suites:
 
 ```bash
-python -m pip install numpy pandas torch matplotlib scikit-learn transformers
+python -m pip install numpy pandas torch matplotlib scikit-learn
 ```
 
 This is a lightweight compatibility set, not a lockfile for GPU training.
@@ -28,14 +28,11 @@ Additional optional dependencies are scoped to the functionality that uses
 them:
 
 - `modal` for Modal launchers;
-- `optuna` for POSSM-style hyperparameter searches;
 - `tensorflow-cpu`, `pyyaml`, and `tfrecord` for released Willett checkpoint
-  conversion and TFRecord evaluation;
-- `mamba-ssm` and `causal-conv1d` for optimized Mamba GPU kernels.
+  conversion and TFRecord evaluation.
 
-Do not install optional GPU kernels merely to run the ordinary S5, GRU, POSSM,
-or manifold tests. Exact remote package versions and CUDA-image requirements
-belong in the owning experiment's launcher documentation.
+Exact remote package versions and CUDA-image requirements belong in the owning
+experiment's launcher documentation.
 
 ## Active test suites
 

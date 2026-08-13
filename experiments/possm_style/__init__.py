@@ -13,9 +13,9 @@ from utah_ssl.feature_contract import (
 from utah_ssl.cache import (
     CacheAccessConfig,
     CacheContext,
-    load_precomputed_session_feature_stats_into_cache_context,
     prepare_cache_context,
 )
+from utah_ssl.stats import load_precomputed_session_feature_stats_into_cache_context
 
 from .model import (
     POSSMEncoder,

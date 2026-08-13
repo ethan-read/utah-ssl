@@ -14,10 +14,12 @@ from utah_ssl.experiment_contract import SignalSpec
 
 from utah_ssl.cache import (
     CacheAccessConfig,
-    SESSION_STATS_BIN_STRIDE,
     load_cache_smoothing_provenance,
-    load_precomputed_session_feature_stats_into_cache_context,
     prepare_cache_context,
+)
+from utah_ssl.stats import (
+    SESSION_STATS_BIN_STRIDE,
+    load_precomputed_session_feature_stats_into_cache_context,
 )
 from .probe import (
     CanonicalProbeManifestRow,

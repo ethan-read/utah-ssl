@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from utah_ssl.models.s5 import _apply_sequence_mask, reverse_padded_sequence
+from .sequence import apply_sequence_mask, reverse_padded_sequence
 
 
 class DiagonalS4DSSM(nn.Module):
@@ -54,7 +54,7 @@ class DiagonalS4DSSM(nn.Module):
         if seq_len <= 0:
             return x.new_zeros((*x.shape[:-1], self.d_model))
 
-        x = _apply_sequence_mask(x, lengths)
+        x = apply_sequence_mask(x, lengths)
         kernel = self._kernel(seq_len, device=x.device).to(dtype=x.dtype)
         fft_len = 1 << (2 * seq_len - 1).bit_length()
 
@@ -62,7 +62,7 @@ class DiagonalS4DSSM(nn.Module):
         kernel_fft = torch.fft.rfft(kernel, n=fft_len, dim=-1).unsqueeze(0)
         y = torch.fft.irfft(x_fft * kernel_fft, n=fft_len, dim=-1)[..., :seq_len]
         y = y.transpose(1, 2) + x * self.D.to(device=x.device, dtype=x.dtype)
-        return _apply_sequence_mask(y, lengths)
+        return apply_sequence_mask(y, lengths)
 
 
 class S4DBlock(nn.Module):
@@ -93,9 +93,9 @@ class S4DBlock(nn.Module):
 
     def forward(self, x: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
         x = x + self.dropout1(self.ssm(self.norm1(x), lengths))
-        x = _apply_sequence_mask(x, lengths)
+        x = apply_sequence_mask(x, lengths)
         x = x + self.ffn(self.norm2(x))
-        return _apply_sequence_mask(x, lengths)
+        return apply_sequence_mask(x, lengths)
 
 
 class S4DSequenceBackbone(nn.Module):
@@ -126,7 +126,7 @@ class S4DSequenceBackbone(nn.Module):
     def forward(self, x: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
         for block in self.blocks:
             x = block(x, lengths)
-        return _apply_sequence_mask(x, lengths)
+        return apply_sequence_mask(x, lengths)
 
 
 class BidirectionalS4DSequenceBackbone(nn.Module):
@@ -164,4 +164,4 @@ class BidirectionalS4DSequenceBackbone(nn.Module):
         backward_hidden_reversed = self.backward_backbone(reversed_x, lengths)
         backward_hidden = reverse_padded_sequence(backward_hidden_reversed, lengths)
         fused = self.fusion(torch.cat([forward_hidden, backward_hidden], dim=-1))
-        return _apply_sequence_mask(fused, lengths)
+        return apply_sequence_mask(fused, lengths)

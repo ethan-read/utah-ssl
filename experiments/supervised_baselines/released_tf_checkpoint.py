@@ -11,10 +11,9 @@ from typing import Any
 import numpy as np
 import torch
 
-from .data import adapter_keys_from_rows, build_willett_problem
-from .model import WillettPhonemeModel
-from .train import WillettReconstructionConfig
-
+from .checkpointing import adapter_keys_from_problem, build_willett_model
+from .config import WillettReconstructionConfig
+from .data import build_willett_problem
 
 RELEASED_SESSIONS: tuple[str, ...] = (
     "t12.2022.04.28",
@@ -191,30 +190,12 @@ def convert_released_tf_checkpoint_to_pytorch(
         cv_num_folds=int(config.cv_num_folds),
         cv_fold_index=int(config.cv_fold_index),
     )
-    train_adapter_keys = adapter_keys_from_rows(
-        problem["train_rows"],
-        dataset=str(problem["dataset"]),
-        boundary_key_mode=str(problem["boundary_key_mode"]),
-    )
-    val_adapter_keys = adapter_keys_from_rows(
-        problem["val_rows"],
-        dataset=str(problem["dataset"]),
-        boundary_key_mode=str(problem["boundary_key_mode"]),
-    )
-    session_adapter_keys = tuple(dict.fromkeys(train_adapter_keys + val_adapter_keys))
-    model = WillettPhonemeModel(
+    session_adapter_keys = adapter_keys_from_problem(problem)
+    model = build_willett_model(
+        config=config,
         input_dim=256,
         vocab_size=int(problem["vocab"]["num_classes"]),
-        patch_size=int(config.patch_size),
-        patch_stride=int(config.patch_stride),
-        input_projection_size=int(config.input_projection_size),
-        input_projection_dropout=float(config.input_projection_dropout),
-        decoder_backbone_type="gru",
-        gru_hidden_size=int(config.gru_hidden_size),
-        gru_num_layers=int(config.gru_num_layers),
-        gru_dropout=float(config.gru_dropout),
         session_adapter_keys=session_adapter_keys,
-        session_adapter_enabled=True,
     )
     state = model.state_dict()
 

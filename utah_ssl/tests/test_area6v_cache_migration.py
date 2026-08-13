@@ -1,20 +1,16 @@
 from __future__ import annotations
 
 import json
-import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 import numpy as np
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
-
 from utah_ssl.scripts.trim_area6v_cache import trim_area6v_cache
 from utah_ssl.experiment_contract import SignalSpec
-from utah_ssl.datasets import CanonicalShardAccessor, build_competition_split_problem
+from utah_ssl.canonical_data import CanonicalShardAccessor
+from utah_ssl.dataset_splits import build_competition_split_problem
 
 
 def _write_full_width_cache(cache_root: Path) -> None:

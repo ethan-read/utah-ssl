@@ -12,11 +12,9 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from utah_ssl.datasets import (
-    CanonicalSequenceDataset,
-    apply_feature_stats,
-)
-from utah_ssl.cache import resolve_boundary_key
+from utah_ssl.feature_stats import apply_feature_stats
+from utah_ssl.sequence_data import CanonicalSequenceDataset
+from utah_ssl.session_keys import resolve_boundary_key
 
 from .data import (
     CANONICAL_BIN_SIZE_MS,

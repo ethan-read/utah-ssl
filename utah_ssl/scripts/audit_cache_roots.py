@@ -24,12 +24,12 @@ from utah_ssl.normalization_stats import extract_feature_stats_entries
 
 from utah_ssl.cache import (
     CacheAccessConfig,
-    _compute_cache_source_signature,
-    get_sampling_plan,
     load_cache_smoothing_provenance,
     load_dataset_metadata,
     prepare_cache_context,
 )
+from utah_ssl.cache_identity import compute_cache_source_signature
+from utah_ssl.sampling import get_sampling_plan
 
 
 DEFAULT_DATASET = "brain2text24"
@@ -424,7 +424,7 @@ def audit_cache_root(spec: RootAuditInput) -> dict[str, Any]:
     }
     if root.exists():
         try:
-            root_report["source_signature"] = _compute_cache_source_signature(root)
+            root_report["source_signature"] = compute_cache_source_signature(root)
             root_report["structural_signature"] = _compute_structural_root_signature(root)
         except Exception as exc:
             root_report["source_signature_error"] = f"{type(exc).__name__}: {exc}"

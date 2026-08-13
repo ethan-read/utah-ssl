@@ -11,9 +11,11 @@ import numpy as np
 import torch
 
 try:
-    from utah_ssl.cache import CacheContext, resolve_boundary_key
+    from utah_ssl.cache import CacheContext
+    from utah_ssl.session_keys import resolve_boundary_key
 except ModuleNotFoundError:  # pragma: no cover - repo-root unittest fallback
-    from utah_ssl.cache import CacheContext, resolve_boundary_key
+    from utah_ssl.cache import CacheContext
+    from utah_ssl.session_keys import resolve_boundary_key
 
 from .config import FuturePredictionSSLConfig
 from .model import make_future_prediction_model

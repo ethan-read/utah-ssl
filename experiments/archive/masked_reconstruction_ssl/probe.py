@@ -21,7 +21,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from utah_ssl.experiment_contract import SignalSpec
-from utah_ssl.cache import resolve_boundary_key
+from utah_ssl.session_keys import resolve_boundary_key
 from .model import ContrastiveSSLModel, S5ContrastiveEncoder, SessionLinearBank
 from .model_mae import MAX_PATCH_COUNT as MAE_MAX_PATCH_COUNT
 from .model_mae import S5ContrastiveEncoder as MAES5ContrastiveEncoder

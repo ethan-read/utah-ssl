@@ -1,25 +1,20 @@
 from __future__ import annotations
 
 import json
-import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 import numpy as np
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
-
-from utah_ssl.cache import (  # noqa: E402
+from utah_ssl.cache import (
     CacheAccessConfig,
     ShardStore,
-    _compute_dataset_cache_source_signature,
     prepare_cache_context,
 )
-from utah_ssl.experiment_contract import DatasetPlan, SignalSpec  # noqa: E402
-from utah_ssl.scripts.prepare_possm_pooled_cache import (  # noqa: E402
+from utah_ssl.cache_identity import compute_dataset_cache_source_signature
+from utah_ssl.experiment_contract import DatasetPlan, SignalSpec
+from utah_ssl.scripts.prepare_possm_pooled_cache import (
     SUMMARY_NAME,
     prepare_possm_pooled_caches,
 )
@@ -453,7 +448,7 @@ class ShardStoreModalityTests(unittest.TestCase):
             self.assertGreater(float(np.asarray(b2t25_shard["tx"])[0, 0]), 999.0)
             self.assertEqual(
                 context.source_cache_signature,
-                _compute_dataset_cache_source_signature(
+                compute_dataset_cache_source_signature(
                     {
                         "brain2text24": primary,
                         "brain2text25": optimized,

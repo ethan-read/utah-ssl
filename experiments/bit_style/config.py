@@ -1,4 +1,4 @@
-"""Configuration for generic S5/Mamba SSL experiments."""
+"""Configuration for BIT-style S5 pretraining and CTC transfer."""
 
 from __future__ import annotations
 
@@ -11,9 +11,8 @@ from utah_ssl.experiment_contract import DatasetPlan, SignalSpec
 
 
 @dataclass
-class GenericSSMSSLConfig:
+class BITStyleConfig:
     seed: int = 7
-    backbone_type: str = "s5"
     input_mode: str = "temporal_patch"
     objective: str = "masked_time_channel_reconstruction"
     dataset: str = "brain2text24"
@@ -71,8 +70,6 @@ class GenericSSMSSLConfig:
     run_name: str | None = None
 
     def __post_init__(self) -> None:
-        if self.backbone_type not in {"s5", "mamba"}:
-            raise ValueError("backbone_type must be one of {'s5', 'mamba'}")
         if self.input_mode not in {"raw_bin", "temporal_patch", "causal_conv_stem"}:
             raise ValueError("input_mode must be one of {'raw_bin', 'temporal_patch', 'causal_conv_stem'}")
         if self.objective != "masked_time_channel_reconstruction":
@@ -97,8 +94,6 @@ class GenericSSMSSLConfig:
             raise ValueError("hidden_size, state_size, and num_layers must be positive")
         if self.direction not in {"causal", "bidirectional"}:
             raise ValueError("direction must be one of {'causal', 'bidirectional'}")
-        if self.backbone_type == "mamba" and self.direction != "causal":
-            raise ValueError("Mamba experiments currently require direction='causal'")
         if int(self.patch_size) <= 0 or int(self.patch_stride) <= 0:
             raise ValueError("patch_size and patch_stride must be positive")
         if self.patch_policy not in {"floor", "cover_tail"}:
@@ -154,7 +149,7 @@ class GenericSSMSSLConfig:
         return payload
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "GenericSSMSSLConfig":
+    def from_dict(cls, payload: dict[str, Any]) -> "BITStyleConfig":
         values = dict(payload)
         if "dataset_plan" in values:
             values["dataset_plan"] = DatasetPlan.from_value(values["dataset_plan"])
@@ -163,4 +158,4 @@ class GenericSSMSSLConfig:
         return cls(**values)
 
 
-__all__ = ["GenericSSMSSLConfig"]
+__all__ = ["BITStyleConfig"]

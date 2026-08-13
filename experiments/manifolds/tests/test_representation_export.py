@@ -9,20 +9,6 @@ import numpy as np
 import pandas as pd
 import torch
 
-from utah_ssl.stats_artifact_test_utils import (
-    write_valid_split_stats_artifact as _write_valid_split_stats_artifact,
-)
-from utah_ssl.stats import (
-    resolve_precomputed_split_stats_path,
-)
-from utah_ssl.experiment_contract import SignalSpec
-from experiments.supervised_baselines.data import (
-    adapter_keys_from_rows,
-    build_willett_problem,
-)
-from experiments.supervised_baselines.model import (
-    WillettPhonemeModel,
-)
 from experiments.manifolds.representation_export import (
     CONSONANT_CATEGORIES,
     PHONEME_CATEGORY_ORDER,
@@ -32,6 +18,14 @@ from experiments.manifolds.representation_export import (
     export_willett_representations,
     patch_timing_for_token,
 )
+from experiments.supervised_baselines.config import WillettReconstructionConfig
+from experiments.supervised_baselines.data import (
+    adapter_keys_from_rows,
+    build_willett_problem,
+)
+from experiments.supervised_baselines.model import (
+    WillettPhonemeModel,
+)
 from experiments.supervised_baselines.released_tf_checkpoint import (
     _reorder_keras_gru_gates,
     _reorder_stanford_logits_to_local_vocab,
@@ -39,8 +33,12 @@ from experiments.supervised_baselines.released_tf_checkpoint import (
 from experiments.supervised_baselines.tests.test_willett_reconstruction import (
     _write_tiny_competition_probe_cache,
 )
-from experiments.supervised_baselines.train import (
-    WillettReconstructionConfig,
+from utah_ssl.experiment_contract import SignalSpec
+from utah_ssl.stats import (
+    resolve_precomputed_split_stats_path,
+)
+from utah_ssl.stats_artifact_test_utils import (
+    write_valid_split_stats_artifact as _write_valid_split_stats_artifact,
 )
 
 

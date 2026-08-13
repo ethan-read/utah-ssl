@@ -16,8 +16,9 @@ import torch
 
 from utah_ssl.experiment_contract import SignalSpec
 
-from utah_ssl.cache import CacheContext, build_segment_sampler, runtime_smoothing_requested
-from utah_ssl.cache import resolve_boundary_key
+from utah_ssl.cache import CacheContext, runtime_smoothing_requested
+from utah_ssl.sampling import build_segment_sampler
+from utah_ssl.session_keys import resolve_boundary_key
 from .model import MaskedSSLModel, sync_device
 from .objectives import compute_objective_metrics, summarize_metrics
 

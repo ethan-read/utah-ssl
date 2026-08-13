@@ -141,6 +141,17 @@ Generate or validate statistics with:
 python utah_ssl/scripts/recompute_feature_stats.py --help
 ```
 
+Reusable computation, canonical paths, and artifact-loading APIs live in
+`utah_ssl.stats`; the script above is the sole command-line entry point.
+Stable cache variants and source signatures live in `utah_ssl.cache_identity`
+because both cache copying and statistics validation consume them. Physical
+cache access in `utah_ssl.cache` does not define normalization artifacts.
+Prepared cache contexts are consumed by `utah_ssl.sampling` for segment
+selection, normalization, and batching. Model-independent smoothing used to
+construct physical cache views lives in `utah_ssl.signal_processing`; the
+Willett decoder's distinct adapted smoothing recipe remains in
+`utah_ssl.decoding_preprocessing`.
+
 Use `--scope session` for pretraining normalization and `--scope global` for
 train-split downstream normalization. Generate only artifacts required by an
 actual pipeline; do not materialize every combination of cache, signal, scope,

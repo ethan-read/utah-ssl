@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
@@ -119,15 +118,6 @@ class SessionInputAdapterBank(nn.Module):
             for row_idx, session_key in enumerate(session_ids)
         ]
         return torch.stack(adapted, dim=0)
-
-
-@dataclass(frozen=True)
-class WillettEncoderOutputs:
-    adapted_input: torch.Tensor
-    patched_inputs: torch.Tensor
-    token_lengths: torch.Tensor
-    hidden: torch.Tensor
-    logits: torch.Tensor
 
 
 class WillettPhonemeModel(nn.Module):

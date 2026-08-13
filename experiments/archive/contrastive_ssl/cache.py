@@ -14,21 +14,23 @@ try:
     from utah_ssl.cache import (
         CacheAccessConfig,
         CacheContext,
-        SegmentBatchSampler,
-        build_segment_sampler,
+        prepare_cache_context as _prepare_cache_context,
+    )
+    from utah_ssl.sampling import SegmentBatchSampler, build_segment_sampler
+    from utah_ssl.stats import (
         load_precomputed_session_feature_stats_into_cache_context,
         resolve_precomputed_session_stats_path,
-        prepare_cache_context as _prepare_cache_context,
     )
 except ModuleNotFoundError:  # pragma: no cover - repo-root unittest fallback
     from utah_ssl.cache import (
         CacheAccessConfig,
         CacheContext,
-        SegmentBatchSampler,
-        build_segment_sampler,
+        prepare_cache_context as _prepare_cache_context,
+    )
+    from utah_ssl.sampling import SegmentBatchSampler, build_segment_sampler
+    from utah_ssl.stats import (
         load_precomputed_session_feature_stats_into_cache_context,
         resolve_precomputed_session_stats_path,
-        prepare_cache_context as _prepare_cache_context,
     )
 
 

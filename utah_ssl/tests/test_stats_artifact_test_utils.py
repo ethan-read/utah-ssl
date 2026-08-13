@@ -14,7 +14,7 @@ from utah_ssl.experiment_contract import (
     DatasetPlan,
     SignalSpec,
 )
-from experiments.bit_style.config import GenericSSMSSLConfig
+from experiments.bit_style.config import BITStyleConfig
 from utah_ssl.stats import (
     build_recompute_session_feature_stats_command,
     build_recompute_split_feature_stats_command,
@@ -201,7 +201,7 @@ class StatsArtifactTestUtilsTests(unittest.TestCase):
             )
 
     def test_generic_ssl_config_allows_zero_sbp_dim_for_tx_only(self) -> None:
-        config = GenericSSMSSLConfig(
+        config = BITStyleConfig(
             signal_spec=SignalSpec.tx_only(tx_dim=256),
         )
         self.assertEqual(config.sbp_dim, 0)
@@ -209,7 +209,7 @@ class StatsArtifactTestUtilsTests(unittest.TestCase):
 
     def test_generic_ssl_config_requires_positive_sbp_dim_for_tx_sbp(self) -> None:
         with self.assertRaisesRegex(ValueError, "sbp_dim must be positive"):
-            GenericSSMSSLConfig(
+            BITStyleConfig(
                 signal_spec={
                     "mode": "tx_sbp",
                     "tx_dim": 256,

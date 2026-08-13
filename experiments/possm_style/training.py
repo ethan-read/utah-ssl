@@ -19,12 +19,12 @@ from utah_ssl.experiment_contract import SignalSpec
 
 from utah_ssl.cache import (
     CacheContext,
-    build_segment_sampler,
-    get_sampling_plan,
     load_cache_smoothing_provenance,
-    resolve_boundary_key,
-    stack_segment_batch,
 )
+from utah_ssl.sampling import build_segment_sampler, get_sampling_plan, stack_segment_batch
+from utah_ssl.runtime import seed_everything
+from utah_ssl.reporting import append_jsonl
+from utah_ssl.session_keys import resolve_boundary_key
 
 from .model import POSSMReconstructionModel, list_registered_temporal_backbones
 from .precision import (
@@ -343,14 +343,6 @@ def build_possm_segment_sampler(
     )
 
 
-def _seed_training_run(seed: int) -> None:
-    random.seed(int(seed))
-    np.random.seed(int(seed))
-    torch.manual_seed(int(seed))
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(int(seed))
-
-
 def _build_optimizer(
     model: POSSMReconstructionModel,
     *,
@@ -388,11 +380,6 @@ def _timestamp_utc() -> str:
 def _step_checkpoint_filename(step: int, *, timestamp_utc: str | None = None) -> str:
     ts = timestamp_utc or _timestamp_utc()
     return f"step_{int(step):06d}_{ts}.pt"
-
-
-def _final_checkpoint_filename(step: int, *, timestamp_utc: str | None = None) -> str:
-    ts = timestamp_utc or _timestamp_utc()
-    return f"checkpoint_final_step_{int(step):06d}_{ts}.pt"
 
 
 def _parse_step_from_checkpoint_name(name: str) -> int | None:
@@ -869,12 +856,6 @@ def evaluate_model(
     }
 
 
-def _emit_progress(progress_path: Path, payload: dict[str, Any]) -> None:
-    progress_path.parent.mkdir(parents=True, exist_ok=True)
-    with progress_path.open("a") as handle:
-        handle.write(json.dumps(payload) + "\n")
-
-
 def _build_model_from_config(config: dict[str, Any]) -> POSSMReconstructionModel:
     return POSSMReconstructionModel(
         input_dim=int(config["input_dim"]),
@@ -1104,7 +1085,7 @@ def _train_loop(
             )
         train_history.append(train_record)
         if should_log_step:
-            _emit_progress(progress_path, train_record)
+            append_jsonl(progress_path, train_record)
             print(
                 f"step={step:04d} train_loss={metrics['mse']:.6f} "
                 f"sample_s={sample_seconds:.2f} model_s={model_seconds:.2f}"
@@ -1151,7 +1132,7 @@ def _train_loop(
                 "optimizer_fused": optimizer_fused,
             }
             val_history.append(val_record)
-            _emit_progress(progress_path, val_record)
+            append_jsonl(progress_path, val_record)
             print(
                 f"step={step:04d} val_loss={val_result['loss']:.6f}"
                 + "".join(
@@ -1250,7 +1231,7 @@ def run_possm_training(
     device: torch.device,
     run_name: str | None = None,
 ) -> dict[str, Any]:
-    _seed_training_run(int(config.seed))
+    seed_everything(int(config.seed))
     precision_runtime = resolve_precision_runtime(config.precision, device=device)
     if config.signal_spec != cache_context.signal_spec:
         raise ValueError(

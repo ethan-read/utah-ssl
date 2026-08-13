@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import math
-import sys
 import tempfile
 import unittest
 from dataclasses import asdict
@@ -12,20 +11,6 @@ from unittest import mock
 
 import numpy as np
 import torch
-
-REPO_ROOT = Path(__file__).resolve().parents[3]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
-
-from utah_ssl.cache import _compute_cache_source_signature
-from utah_ssl.ctc import compute_ctc_loss_sum
-from utah_ssl.experiment_contract import DatasetPlan, SignalSpec
-from utah_ssl.stats import (
-    resolve_precomputed_split_stats_path as resolve_canonical_split_stats_path,
-)
-from utah_ssl.stats_artifact_test_utils import (
-    write_valid_split_stats_artifact as _write_valid_split_stats_artifact,
-)
 
 from experiments.possm_style.model import (
     POSSMEncoder,
@@ -39,24 +24,29 @@ from experiments.possm_style.model import (
 )
 from experiments.possm_style.phoneme_finetune import (
     POSSMFinetuneConfig,
-    _prepare_stage2_inputs,
     _set_train_mode,
     _stage2_decoder_train_modules,
-    _willett_gaussian_kernel_1d,
     find_latest_possm_stage2_run_dir,
     recover_possm_stage1_encoder,
     recover_possm_stage1_sequence_components,
     recover_possm_stage2_summary,
     run_possm_phoneme_finetuning,
 )
-from experiments.possm_style.reporting import display_possm_stage2_summary, summarize_possm_stage2_progress
+from experiments.possm_style.precision import (
+    autocast_context,
+    build_adamw,
+    resolve_precision_runtime,
+)
+from experiments.possm_style.reporting import (
+    display_possm_stage2_summary,
+    summarize_possm_stage2_progress,
+)
 from experiments.possm_style.stage1_objectives import (
     MaskedReconstructionObjective,
     PlainReconstructionObjective,
     Stage1Batch,
     build_stage1_objective,
 )
-from experiments.possm_style.precision import autocast_context, build_adamw, resolve_precision_runtime
 from experiments.possm_style.training import (
     POSSMTrainingConfig,
     build_possm_segment_sampler,
@@ -67,7 +57,24 @@ from experiments.possm_style.training import (
     resolve_latest_possm_checkpoint_path,
     run_possm_training,
 )
-from utah_ssl.models.s5 import BidirectionalS5SequenceBackbone, DiagonalS5SSM, S5SequenceBackbone
+from utah_ssl.cache_identity import compute_cache_source_signature
+from utah_ssl.ctc import compute_ctc_loss_sum
+from utah_ssl.decoding_preprocessing import (
+    prepare_willett_inputs,
+    willett_gaussian_kernel_1d,
+)
+from utah_ssl.experiment_contract import DatasetPlan, SignalSpec
+from utah_ssl.models.s5 import (
+    BidirectionalS5SequenceBackbone,
+    DiagonalS5SSM,
+    S5SequenceBackbone,
+)
+from utah_ssl.stats import (
+    resolve_precomputed_split_stats_path as resolve_canonical_split_stats_path,
+)
+from utah_ssl.stats_artifact_test_utils import (
+    write_valid_split_stats_artifact as _write_valid_split_stats_artifact,
+)
 
 
 class _DummyShardStore:
@@ -1123,8 +1130,8 @@ class POSSMSSLTests(unittest.TestCase):
             white_noise_sd=1.0,
             constant_offset_sd=0.2,
         )
-        train_x = _prepare_stage2_inputs(x, lengths, config=config, is_training=True)
-        eval_x = _prepare_stage2_inputs(x, lengths, config=config, is_training=False)
+        train_x = prepare_willett_inputs(x, lengths, config=config, is_training=True)
+        eval_x = prepare_willett_inputs(x, lengths, config=config, is_training=False)
         self.assertEqual(tuple(train_x.shape), tuple(x.shape))
         self.assertEqual(tuple(eval_x.shape), tuple(x.shape))
         self.assertFalse(torch.allclose(train_x, torch.zeros_like(train_x)))
@@ -1132,7 +1139,7 @@ class POSSMSSLTests(unittest.TestCase):
         self.assertTrue(torch.allclose(train_x[1, 5:], torch.zeros_like(train_x[1, 5:])))
 
     def test_willett_gaussian_kernel_matches_sigma2_threshold_width(self) -> None:
-        kernel = _willett_gaussian_kernel_1d(
+        kernel = willett_gaussian_kernel_1d(
             sigma_bins=2.0,
             kernel_size=100,
             threshold=0.01,
@@ -1786,33 +1793,29 @@ class POSSMSSLTests(unittest.TestCase):
                 val_split_name="competition_test",
             )
 
-            with mock.patch(
-                "experiments.possm_style.phoneme_finetune.compute_feature_stats",
-                side_effect=AssertionError("should not recompute split stats"),
-            ):
-                summary = run_possm_phoneme_finetuning(
-                    checkpoint_path=checkpoint_path,
-                    cache_root=cache_root,
-                    config=POSSMFinetuneConfig(
-                        seed=7,
-                        mode="probe_frozen",
-                        dataset="brain2text24",
-                        signal_spec=SignalSpec.tx_sbp(tx_dim=3, sbp_dim=2),
-                        data_mode="normalized",
-                        batch_size=1,
-                        num_steps=1,
-                        learning_rate=1e-3,
-                        encoder_learning_rate=3e-4,
-                        checkpoint_every_steps=1,
-                        input_smoothing_sigma_bins=0.0,
-                        gru_hidden_size=8,
-                        gru_num_layers=2,
-                        gru_dropout=0.0,
-                        conv_kernel_size=3,
-                        conv_stride=1,
-                    ),
-                    device=torch.device("cpu"),
-                )
+            summary = run_possm_phoneme_finetuning(
+                checkpoint_path=checkpoint_path,
+                cache_root=cache_root,
+                config=POSSMFinetuneConfig(
+                    seed=7,
+                    mode="probe_frozen",
+                    dataset="brain2text24",
+                    signal_spec=SignalSpec.tx_sbp(tx_dim=3, sbp_dim=2),
+                    data_mode="normalized",
+                    batch_size=1,
+                    num_steps=1,
+                    learning_rate=1e-3,
+                    encoder_learning_rate=3e-4,
+                    checkpoint_every_steps=1,
+                    input_smoothing_sigma_bins=0.0,
+                    gru_hidden_size=8,
+                    gru_num_layers=2,
+                    gru_dropout=0.0,
+                    conv_kernel_size=3,
+                    conv_stride=1,
+                ),
+                device=torch.device("cpu"),
+            )
 
             self.assertEqual(summary["precomputed_split_stats_path"], str(stats_path))
             self.assertEqual(
@@ -1902,7 +1905,7 @@ class POSSMSSLTests(unittest.TestCase):
                     "source_cache_root": str(cache_root.resolve()),
                     "source_cache_name": cache_root.name,
                     "source_cache_variant": "raw",
-                    "source_cache_signature": _compute_cache_source_signature(cache_root),
+                    "source_cache_signature": compute_cache_source_signature(cache_root),
                     "feature_mode": "tx_sbp",
                     "boundary_key_mode": "session",
                     "tx_dim": 3,

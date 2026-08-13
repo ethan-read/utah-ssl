@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from utah_ssl.datasets import CanonicalProbeManifestRow
+from utah_ssl.canonical_data import CanonicalProbeManifestRow
 from experiments.archive.timestep_flexible_ssm.data import (
     RebinnedSequenceDataset,
     make_length_aware_batch_sampler,

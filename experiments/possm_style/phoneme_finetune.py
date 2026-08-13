@@ -16,22 +16,25 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from utah_ssl.experiment_contract import SignalSpec
-
 from utah_ssl.cache import (
     load_cache_smoothing_provenance,
-    resolve_boundary_key,
 )
-from utah_ssl.ctc import compute_ctc_loss_sum
-from utah_ssl.datasets import (
-    CanonicalSequenceDataset,
-    LengthAwareBatchSampler,
+from utah_ssl.session_keys import resolve_boundary_key
+from utah_ssl.ctc import compute_ctc_loss_sum, ctc_greedy_decode, edit_counts
+from utah_ssl.dataset_splits import (
     build_competition_split_problem,
     build_source_split_problem,
+)
+from utah_ssl.sequence_data import (
+    CanonicalSequenceDataset,
+    LengthAwareBatchSampler,
     canonical_rows_padded_time_percentile,
     collate_sequence_batch,
-    compute_feature_stats,
 )
+from utah_ssl.decoding_preprocessing import prepare_willett_inputs
+from utah_ssl.experiment_contract import SignalSpec
+from utah_ssl.runtime import seed_torch
+from utah_ssl.reporting import append_optional_jsonl
 from utah_ssl.stats import (
     load_precomputed_split_feature_stats,
     resolve_precomputed_split_stats_path,
@@ -179,12 +182,6 @@ class POSSMFinetuneConfig:
     def feature_mode(self) -> str | None:
         return None if self.signal_spec is None else self.signal_spec.mode
 
-def _seed_all(seed: int) -> None:
-    torch.manual_seed(int(seed))
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(int(seed))
-
-
 def _capture_torch_rng_state() -> dict[str, Any]:
     state: dict[str, Any] = {"cpu": torch.get_rng_state()}
     if torch.cuda.is_available():
@@ -220,14 +217,6 @@ def _count_trainable_sequence_encoder_parameters(model: POSSMPhonemeModel) -> in
     return int(total)
 
 
-def _emit_progress(progress_log_path: Path | None, **payload: Any) -> None:
-    if progress_log_path is None:
-        return
-    progress_log_path.parent.mkdir(parents=True, exist_ok=True)
-    with progress_log_path.open("a") as handle:
-        handle.write(json.dumps(payload) + "\n")
-
-
 def _set_train_mode(
     model: POSSMPhonemeModel,
     *,
@@ -257,102 +246,6 @@ def _stage2_decoder_train_modules(
     return tuple(modules)
 
 
-def _willett_gaussian_kernel_1d(
-    *,
-    sigma_bins: float,
-    kernel_size: int,
-    threshold: float,
-    device: torch.device,
-    dtype: torch.dtype,
-) -> torch.Tensor:
-    sigma = float(sigma_bins)
-    if sigma <= 0.0:
-        return torch.ones((1,), device=device, dtype=dtype)
-    kernel_size = int(kernel_size)
-    if kernel_size <= 0:
-        raise ValueError("kernel_size must be positive")
-    center = int(kernel_size // 2)
-    positions = torch.arange(kernel_size, device=device, dtype=dtype) - float(center)
-    kernel = torch.exp(-0.5 * (positions / sigma).pow(2))
-    kernel = kernel / kernel.sum().clamp_min(1e-8)
-    keep = kernel > float(threshold)
-    if not bool(keep.any().item()):
-        keep[center] = True
-    kept_positions = torch.nonzero(keep, as_tuple=False).squeeze(1)
-    start = int(kept_positions.min().item())
-    stop = int(kept_positions.max().item()) + 1
-    kernel = kernel[start:stop]
-    if kernel.numel() % 2 == 0:
-        # Keep SAME-length convolution simple and centered if non-default settings create an even kernel.
-        kernel = torch.cat([kernel, kernel.new_zeros((1,))], dim=0)
-    return kernel / kernel.sum().clamp_min(1e-8)
-
-
-def _sequence_mask_from_lengths(
-    lengths: torch.Tensor,
-    max_time: int,
-) -> torch.Tensor:
-    return torch.arange(max_time, device=lengths.device).unsqueeze(0) < lengths.unsqueeze(1)
-
-
-def _smooth_batch_like_willett(
-    x: torch.Tensor,
-    input_lengths: torch.Tensor,
-    *,
-    sigma_bins: float,
-    kernel_size: int,
-    threshold: float,
-) -> torch.Tensor:
-    if float(sigma_bins) <= 0.0 or int(x.shape[1]) <= 1:
-        return x
-    kernel = _willett_gaussian_kernel_1d(
-        sigma_bins=float(sigma_bins),
-        kernel_size=int(kernel_size),
-        threshold=float(threshold),
-        device=x.device,
-        dtype=x.dtype,
-    )
-    channels = int(x.shape[-1])
-    weight = kernel.view(1, 1, -1).expand(channels, 1, -1)
-    smoothed = torch.nn.functional.conv1d(
-        x.transpose(1, 2),
-        weight,
-        padding=int(kernel.numel() // 2),
-        groups=channels,
-    ).transpose(1, 2)
-    valid = _sequence_mask_from_lengths(input_lengths.to(x.device), int(x.shape[1]))
-    return smoothed * valid.unsqueeze(-1).to(smoothed.dtype)
-
-
-def _prepare_stage2_inputs(
-    x: torch.Tensor,
-    input_lengths: torch.Tensor,
-    *,
-    config: POSSMFinetuneConfig,
-    is_training: bool,
-) -> torch.Tensor:
-    transformed = x
-    if is_training and float(config.white_noise_sd) > 0.0:
-        transformed = transformed + torch.randn(
-            transformed.shape,
-            device=transformed.device,
-            dtype=transformed.dtype,
-        ) * float(config.white_noise_sd)
-    if is_training and float(config.constant_offset_sd) > 0.0:
-        transformed = transformed + torch.randn(
-            (int(transformed.shape[0]), 1, int(transformed.shape[2])),
-            device=transformed.device,
-            dtype=transformed.dtype,
-        ) * float(config.constant_offset_sd)
-    return _smooth_batch_like_willett(
-        transformed,
-        input_lengths,
-        sigma_bins=float(config.input_smoothing_sigma_bins),
-        kernel_size=int(config.input_smoothing_kernel_size),
-        threshold=float(config.input_smoothing_threshold),
-    )
-
-
 def _empty_microbatch_range() -> dict[str, int | None]:
     return {"min": None, "max": None}
 
@@ -363,49 +256,6 @@ def _update_microbatch_range(range_payload: dict[str, int | None], value: int) -
     current_max = range_payload.get("max")
     range_payload["min"] = resolved if current_min is None else min(int(current_min), resolved)
     range_payload["max"] = resolved if current_max is None else max(int(current_max), resolved)
-
-
-def _ctc_greedy_decode(
-    logits: torch.Tensor,
-    token_lengths: torch.Tensor,
-    *,
-    blank_index: int,
-) -> list[list[int]]:
-    token_ids = logits.argmax(dim=-1)
-    decoded: list[list[int]] = []
-    for batch_idx, length in enumerate(token_lengths.tolist()):
-        sequence: list[int] = []
-        prev_token: int | None = None
-        for token in token_ids[batch_idx, :length].tolist():
-            if token == blank_index:
-                prev_token = None
-                continue
-            if token != prev_token:
-                sequence.append(int(token))
-            prev_token = int(token)
-        decoded.append(sequence)
-    return decoded
-
-
-def _edit_distance(reference: list[int], hypothesis: list[int]) -> int:
-    if not reference:
-        return len(hypothesis)
-    if not hypothesis:
-        return len(reference)
-    previous = list(range(len(hypothesis) + 1))
-    for ref_idx, ref_token in enumerate(reference, start=1):
-        current = [ref_idx]
-        for hyp_idx, hyp_token in enumerate(hypothesis, start=1):
-            substitution_cost = 0 if ref_token == hyp_token else 1
-            current.append(
-                min(
-                    previous[hyp_idx] + 1,
-                    current[hyp_idx - 1] + 1,
-                    previous[hyp_idx - 1] + substitution_cost,
-                )
-            )
-        previous = current
-    return previous[-1]
 
 
 def _top_counter_items(counter: Counter[int], *, top_k: int = 10) -> list[list[int]]:
@@ -452,7 +302,7 @@ def evaluate_possm_phoneme_metrics(
             label_lengths = label_lengths_cpu.to(device, non_blocking=non_blocking)
             with autocast_context(runtime):
                 if input_transform_config is not None:
-                    x = _prepare_stage2_inputs(
+                    x = prepare_willett_inputs(
                         x,
                         input_lengths,
                         config=input_transform_config,
@@ -471,7 +321,7 @@ def evaluate_possm_phoneme_metrics(
             )
             total_loss_sum += float(loss_sum.item())
             total_targets += int(target_count)
-            predictions = _ctc_greedy_decode(
+            predictions = ctc_greedy_decode(
                 logits_fp32,
                 outputs["token_lengths"],
                 blank_index=blank_index,
@@ -481,7 +331,7 @@ def evaluate_possm_phoneme_metrics(
                 reference_length = int(label_lengths_cpu[row_idx].item())
                 reference = labels[row_idx, :reference_length].tolist()
                 token_length = int(outputs["token_lengths"][row_idx].item())
-                total_edit_distance += _edit_distance(reference, prediction)
+                total_edit_distance += sum(edit_counts(reference, prediction))
                 total_reference_tokens += len(reference)
                 total_predicted_tokens += len(prediction)
                 total_frames += token_length
@@ -974,7 +824,7 @@ def run_possm_phoneme_finetuning(
     resume_from_latest: bool = False,
 ) -> dict[str, Any]:
     resolved_config = config or POSSMFinetuneConfig()
-    _seed_all(int(resolved_config.seed))
+    seed_torch(int(resolved_config.seed))
     resolved_checkpoint_path = Path(checkpoint_path)
     resolved_cache_root = Path(cache_root)
     resolved_device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1298,7 +1148,7 @@ def run_possm_phoneme_finetuning(
                     best_payload = best_payload_disk
                     best_metrics = dict(disk_metrics)
                     best_step = int(best_payload_disk.get("steps", best_step))
-            _emit_progress(
+            append_optional_jsonl(
                 progress_log_path,
                 event="phoneme_resume",
                 stage="possm_phoneme_finetune",
@@ -1350,7 +1200,7 @@ def run_possm_phoneme_finetuning(
         collapse = dict(metrics.get("collapse_diagnostics") or {})
         last_eval_step = steps
         latest_eval_metrics = dict(metrics)
-        _emit_progress(
+        append_optional_jsonl(
             progress_log_path,
             event="phoneme_val_report",
             stage="possm_phoneme_finetune",
@@ -1499,7 +1349,7 @@ def run_possm_phoneme_finetuning(
             benchmark_examples += int(accumulated_examples)
         if should_report:
             last_report_elapsed = elapsed
-            _emit_progress(
+            append_optional_jsonl(
                 progress_log_path,
                 event="phoneme_train_report",
                 stage="possm_phoneme_finetune",
@@ -1536,7 +1386,7 @@ def run_possm_phoneme_finetuning(
             )
         if benchmark_active and steps == benchmark_end_step:
             measured_seconds = float(sum(benchmark_step_seconds))
-            _emit_progress(
+            append_optional_jsonl(
                 progress_log_path,
                 event="phoneme_precision_benchmark",
                 stage="possm_phoneme_finetune",
@@ -1584,7 +1434,6 @@ def run_possm_phoneme_finetuning(
         train_batches_consumed = 0
 
     while True:
-        elapsed = time.time() - start_time
         if steps >= int(effective_config.num_steps):
             break
         made_progress = False
@@ -1615,7 +1464,6 @@ def run_possm_phoneme_finetuning(
                 break
             train_batches_consumed += 1
             accumulated_sample_seconds += time.perf_counter() - sample_start
-            elapsed = time.time() - start_time
             if steps >= int(effective_config.num_steps):
                 break
             if train_encoder:
@@ -1657,7 +1505,7 @@ def run_possm_phoneme_finetuning(
                 non_blocking=non_blocking,
             )
             with autocast_context(precision_runtime):
-                x = _prepare_stage2_inputs(
+                x = prepare_willett_inputs(
                     x,
                     input_lengths,
                     config=effective_config,

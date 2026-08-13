@@ -20,7 +20,7 @@ from experiments.archive.cross_trained_mamba.train import (
     compute_hierarchical_ctc_losses,
     run_cross_trained_mamba,
 )
-from utah_ssl.datasets import CanonicalProbeManifestRow
+from utah_ssl.canonical_data import CanonicalProbeManifestRow
 
 
 VOCAB = {

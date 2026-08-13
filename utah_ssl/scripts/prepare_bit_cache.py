@@ -25,10 +25,10 @@ from utah_ssl.bit_cache_contract import (
 )
 from utah_ssl.experiment_contract import DatasetPlan, SignalSpec
 from utah_ssl.scripts.build_smoothed_cache import build_smoothed_cache
-from utah_ssl.cache import (
+from utah_ssl.stats import (
+    recompute_session_feature_stats,
     resolve_precomputed_session_stats_path,
 )
-from utah_ssl.stats import recompute_session_feature_stats
 
 
 DEFAULT_SIGMA_BINS = BIT_STAGE1_SIGMA_BINS

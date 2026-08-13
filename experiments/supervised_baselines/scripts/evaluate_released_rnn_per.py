@@ -19,28 +19,26 @@ for path in (REPO_ROOT, EXPERIMENTS_DIR):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
+from experiments.supervised_baselines.checkpointing import (  # noqa: E402
+    config_from_checkpoint,
+    load_willett_model_from_checkpoint,
+)
 from experiments.supervised_baselines.data import (  # noqa: E402
     CanonicalSequenceDataset,
-    adapter_keys_from_rows,
     build_willett_problem,
     loader_kwargs,
     make_length_aware_batch_sampler,
 )
-from experiments.supervised_baselines.model import WillettPhonemeModel  # noqa: E402
-from experiments.supervised_baselines.released_tf_checkpoint import RELEASED_SESSIONS  # noqa: E402
-from experiments.supervised_baselines.reporting import evaluate_willett_phoneme_metrics  # noqa: E402
-from experiments.manifolds.representation_export import _build_config_from_checkpoint  # noqa: E402
-from experiments.supervised_baselines.train import _build_input_transform_config  # noqa: E402
-
-
-def _detect_device(requested: str | None) -> torch.device:
-    if requested:
-        return torch.device(requested)
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
+from experiments.supervised_baselines.released_tf_checkpoint import (
+    RELEASED_SESSIONS,  # noqa: E402
+)
+from experiments.supervised_baselines.reporting import (
+    evaluate_willett_phoneme_metrics,  # noqa: E402
+)
+from utah_ssl.decoding_preprocessing import (  # noqa: E402
+    willett_input_transform_config_from,
+)
+from utah_ssl.runtime import resolve_device  # noqa: E402
 
 
 def _selected_val_rows(problem: dict[str, Any], *, released_sessions_only: bool, max_examples: int | None) -> tuple[Any, ...]:
@@ -65,7 +63,7 @@ def evaluate_checkpoint(
     released_sessions_only: bool,
 ) -> dict[str, Any]:
     payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    config = _build_config_from_checkpoint(payload)
+    config = config_from_checkpoint(payload)
     if cache_root is not None:
         config = replace(config, cache_root=cache_root)
 
@@ -98,7 +96,7 @@ def evaluate_checkpoint(
         boundary_key_mode=str(problem["boundary_key_mode"]),
         dataset=str(problem["dataset"]),
     )
-    device = _detect_device(device_name)
+    device = resolve_device(device_name)
     loader = DataLoader(
         dataset,
         batch_sampler=make_length_aware_batch_sampler(
@@ -109,51 +107,21 @@ def evaluate_checkpoint(
         ),
         **loader_kwargs(device),
     )
-    train_adapter_keys = adapter_keys_from_rows(
-        problem["train_rows"],
-        dataset=str(problem["dataset"]),
-        boundary_key_mode=str(problem["boundary_key_mode"]),
-    )
-    val_adapter_keys = adapter_keys_from_rows(
-        problem["val_rows"],
-        dataset=str(problem["dataset"]),
-        boundary_key_mode=str(problem["boundary_key_mode"]),
-    )
-    session_adapter_keys = tuple(dict.fromkeys(train_adapter_keys + val_adapter_keys))
-    model = WillettPhonemeModel(
+    model, _, _ = load_willett_model_from_checkpoint(
+        payload,
+        config=config,
+        problem=problem,
         input_dim=256,
         vocab_size=int(problem["vocab"]["num_classes"]),
-        patch_size=int(config.patch_size),
-        patch_stride=int(config.patch_stride),
-        input_projection_size=int(config.input_projection_size),
-        input_projection_dropout=float(config.input_projection_dropout),
-        decoder_backbone_type=str(config.decoder_backbone_type),
-        gru_hidden_size=int(config.gru_hidden_size),
-        gru_num_layers=int(config.gru_num_layers),
-        gru_dropout=float(config.gru_dropout),
-        s5_hidden_size=int(config.s5_hidden_size),
-        s5_state_size=int(config.s5_state_size),
-        s5_num_layers=int(config.s5_num_layers),
-        s5_dropout=float(config.s5_dropout),
-        s5_direction=str(config.s5_direction),
-        s5_ffn_multiplier=float(config.s5_ffn_multiplier),
-        s4d_hidden_size=int(config.s4d_hidden_size),
-        s4d_state_size=int(config.s4d_state_size),
-        s4d_num_layers=int(config.s4d_num_layers),
-        s4d_dropout=float(config.s4d_dropout),
-        s4d_direction=str(config.s4d_direction),
-        s4d_ffn_multiplier=float(config.s4d_ffn_multiplier),
-        session_adapter_keys=session_adapter_keys,
-        session_adapter_enabled=bool(config.session_adapter_enabled),
-    ).to(device)
-    model.load_state_dict(payload["model_state"], strict=True)
+        device=device,
+    )
 
     metrics = evaluate_willett_phoneme_metrics(
         model=model,
         loader=loader,
         device=device,
         blank_index=int(problem["vocab"]["blank_index"]),
-        input_transform_config=_build_input_transform_config(config),
+        input_transform_config=willett_input_transform_config_from(config),
     )
     return {
         "checkpoint_path": str(checkpoint_path),

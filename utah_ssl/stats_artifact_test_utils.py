@@ -4,9 +4,9 @@ from pathlib import Path
 
 import torch
 
-from utah_ssl.cache import (
-    _cache_variant_name,
-    _compute_dataset_cache_source_signature,
+from utah_ssl.cache_identity import (
+    cache_variant_name,
+    compute_dataset_cache_source_signature,
 )
 from utah_ssl.experiment_contract import (
     DatasetPlan,
@@ -36,8 +36,8 @@ def write_valid_split_stats_artifact(
         "kind": "split_feature_stats",
         "source_cache_root": str(cache_root.resolve()),
         "source_cache_name": cache_root.name,
-        "source_cache_variant": _cache_variant_name(cache_root),
-        "source_cache_signature": _compute_dataset_cache_source_signature(
+        "source_cache_variant": cache_variant_name(cache_root),
+        "source_cache_signature": compute_dataset_cache_source_signature(
             {str(dataset): cache_root}
         ),
         "dataset": str(dataset),
@@ -80,8 +80,8 @@ def write_valid_session_stats_artifact(
         "kind": "session_featurewise_zscore_stats",
         "source_cache_root": str(cache_root.resolve()),
         "source_cache_name": cache_root.name,
-        "source_cache_variant": _cache_variant_name(cache_root),
-        "source_cache_signature": _compute_dataset_cache_source_signature(
+        "source_cache_variant": cache_variant_name(cache_root),
+        "source_cache_signature": compute_dataset_cache_source_signature(
             source_cache_roots
         ),
         "source_cache_roots": {

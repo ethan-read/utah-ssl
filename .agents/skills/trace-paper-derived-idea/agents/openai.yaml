@@ -1,0 +1,4 @@
+interface:
+  display_name: "Trace Paper-Derived Idea"
+  short_description: "Trace paper claims, adaptations, and provenance"
+  default_prompt: "Use $trace-paper-derived-idea to trace this published idea into the repository with explicit provenance."

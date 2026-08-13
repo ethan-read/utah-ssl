@@ -1,29 +1,33 @@
-"""Cache access, shard loading, and segment sampling for Utah-array experiments."""
+"""Cache discovery, copying, shard access, and context preparation."""
 
 from __future__ import annotations
 
-import hashlib
 import json
 import math
 import os
 import random
-import shlex
 import shutil
 import time
-from collections import Counter, OrderedDict, defaultdict
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 
 from utah_ssl.experiment_contract import (
     DatasetPlan,
     SignalSpec,
 )
-from utah_ssl.normalization_stats import extract_feature_stats_entries
+from utah_ssl.cache_identity import (
+    compute_dataset_cache_source_signature,
+    list_directory_with_retries,
+)
+from utah_ssl.stats import (
+    load_precomputed_session_feature_stats,
+    resolve_precomputed_session_stats_path,
+)
 
 try:
     import psutil
@@ -36,11 +40,6 @@ RUNTIME_SMOOTHING_MIGRATION_MESSAGE = (
     "Build or select a pre-smoothed cache root instead and keep "
     "gaussian_smoothing_sigma_bins=0.0 during training."
 )
-
-# Fixed stride for session-stat computation to match the normalized cache artifacts.
-SESSION_STATS_BIN_STRIDE = 2
-AREA6V_FEATURE_DIM = 128
-
 
 @dataclass
 class CacheAccessConfig:
@@ -120,19 +119,6 @@ class ExampleRow:
     n_sbp_features: int
 
 
-@dataclass(frozen=True)
-class SamplingPlan:
-    split_name: str
-    segment_bins: int
-    dataset_weight_alpha: float
-    dataset_names: tuple[str, ...]
-    dataset_probs: np.ndarray
-    shard_rows_by_dataset: dict[str, dict[str, list[ExampleRow]]]
-    shard_keys_by_dataset: dict[str, list[str]]
-    shard_probs_by_dataset: dict[str, np.ndarray]
-    row_probs_within_shard_by_dataset: dict[str, dict[str, np.ndarray]]
-
-
 @dataclass
 class CacheContext:
     config: CacheAccessConfig
@@ -150,7 +136,7 @@ class CacheContext:
     drive_dataset_cache_roots: dict[str, Path] = field(default_factory=dict)
     dataset_cache_roots: dict[str, Path] = field(default_factory=dict)
     session_feature_stats: dict[str, tuple[torch.Tensor, torch.Tensor]] = field(default_factory=dict)
-    sampling_plan_cache: dict[tuple[str, int, float], SamplingPlan] = field(default_factory=dict)
+    sampling_plan_cache: dict[tuple[str, int, float], Any] = field(default_factory=dict)
 
     @property
     def tx_dim(self) -> int:
@@ -234,195 +220,6 @@ def load_cache_smoothing_provenance(
     return None
 
 
-def _cache_variant_name(cache_root: str | Path) -> str:
-    name = Path(cache_root).name
-    if "smoothed_sigma2p0" in name:
-        return "smoothed_sigma2p0"
-    if name == "cache_v1":
-        return "raw"
-    return name.replace("cache_v1_", "").replace("/", "_")
-
-
-def _canonical_stats_root_for_cache(cache_root: str | Path) -> Path:
-    cache_root = Path(cache_root)
-    if cache_root.parent.name == "data":
-        return cache_root.parent / "stats"
-    local_stats_root = cache_root / "stats"
-    if local_stats_root.exists():
-        return local_stats_root
-    return cache_root.parent / "stats"
-
-
-def _canonical_session_stats_dir(
-    *,
-    cache_root: str | Path,
-    feature_mode: str,
-    boundary_key_mode: str,
-) -> Path:
-    return (
-        _canonical_stats_root_for_cache(cache_root)
-        / "session_feature_stats"
-        / _cache_variant_name(cache_root)
-        / str(feature_mode)
-        / str(boundary_key_mode)
-    )
-
-
-def _session_stats_plan_stem(dataset_plan: DatasetPlan) -> str:
-    dataset_names = "_".join(
-        name.replace("/", "_") for name in dataset_plan.dataset_names
-    )
-    plan_json = json.dumps(dataset_plan.to_dict(), sort_keys=True, separators=(",", ":"))
-    plan_hash = hashlib.sha256(plan_json.encode("utf-8")).hexdigest()[:10]
-    return f"ssl_pretrain_{dataset_names}_plan_{plan_hash}_v2"
-
-
-def resolve_precomputed_session_stats_path(
-    *,
-    cache_root: str | Path,
-    signal_spec: SignalSpec | Mapping[str, Any],
-    dataset_plan: DatasetPlan | Mapping[str, Sequence[str]],
-    boundary_key_mode: str,
-    dataset_cache_roots: Mapping[str, str | Path] | None = None,
-) -> Path:
-    resolved_signal_spec = SignalSpec.from_value(signal_spec)
-    resolved_dataset_plan = DatasetPlan.from_value(dataset_plan)
-    primary_root = Path(cache_root)
-    effective_roots = {
-        dataset: Path((dataset_cache_roots or {}).get(dataset, primary_root))
-        for dataset in resolved_dataset_plan.dataset_names
-    }
-    cache_variant = _cache_variant_name(primary_root)
-    if any(root.resolve() != primary_root.resolve() for root in effective_roots.values()):
-        source_signature = _compute_dataset_cache_source_signature(effective_roots)
-        cache_variant = f"{cache_variant}_mixed_{source_signature[:12]}"
-    stats_dir = (
-        _canonical_stats_root_for_cache(primary_root)
-        / "session_feature_stats"
-        / cache_variant
-        / resolved_signal_spec.mode
-        / str(boundary_key_mode)
-    )
-    return stats_dir / f"{_session_stats_plan_stem(resolved_dataset_plan)}.pt"
-
-
-def _load_artifact_payload_and_sidecar(
-    *,
-    path: str | Path,
-    canonical_path: str | Path,
-    recompute_cmd: str,
-    artifact_name: str,
-    expected_kind: str | None = None,
-) -> tuple[dict[str, Any], dict[str, Any], Path, Path]:
-    resolved_path = Path(path)
-    expected_path = Path(canonical_path)
-    if not resolved_path.exists():
-        raise FileNotFoundError(
-            f"Precomputed {artifact_name} file does not exist.\n"
-            f"expected_path: {expected_path}\n"
-            f"requested_path: {resolved_path}\n"
-            f"recompute_command: {recompute_cmd}"
-        )
-    metadata_path = resolved_path.with_suffix(".json")
-    if not metadata_path.exists():
-        raise FileNotFoundError(
-            f"Precomputed {artifact_name} sidecar is missing.\n"
-            f"expected_path: {expected_path}\n"
-            f"requested_path: {resolved_path}\n"
-            f"missing_sidecar: {metadata_path}\n"
-            f"recompute_command: {recompute_cmd}"
-        )
-
-    payload = torch.load(resolved_path, map_location="cpu", weights_only=False)
-    if not isinstance(payload, dict):
-        raise ValueError(f"Precomputed {artifact_name} payload must be a dict: {resolved_path}")
-
-    sidecar_metadata = json.loads(metadata_path.read_text())
-    if not isinstance(sidecar_metadata, dict):
-        raise ValueError(
-            f"Precomputed {artifact_name} sidecar must be a JSON object.\n"
-            f"requested_path: {resolved_path}\n"
-            f"metadata_path: {metadata_path}\n"
-            f"recompute_command: {recompute_cmd}"
-        )
-
-    metadata = dict(payload.get("metadata", {}))
-    if metadata != sidecar_metadata:
-        raise ValueError(
-            f"Precomputed {artifact_name} payload metadata does not match the JSON sidecar.\n"
-            f"expected_path: {expected_path}\n"
-            f"requested_path: {resolved_path}\n"
-            f"metadata_path: {metadata_path}\n"
-            f"recompute_command: {recompute_cmd}"
-        )
-    if expected_kind is not None and metadata.get("kind") != str(expected_kind):
-        raise ValueError(
-            f"Precomputed {artifact_name} artifact has the wrong kind.\n"
-            f"expected_path: {expected_path}\n"
-            f"requested_path: {resolved_path}\n"
-            f"reason: kind={metadata.get('kind')!r} expected {str(expected_kind)!r}\n"
-            f"recompute_command: {recompute_cmd}"
-        )
-    return payload, metadata, resolved_path, metadata_path
-
-
-def _validate_common_artifact_metadata(
-    *,
-    metadata: dict[str, Any],
-    expected_metadata: dict[str, Any],
-) -> list[str]:
-    return [
-        f"{key}={metadata.get(key)!r} expected {value!r}"
-        for key, value in expected_metadata.items()
-        if metadata.get(key) != value
-    ]
-
-
-def build_recompute_session_feature_stats_command(
-    *,
-    cache_root: str | Path,
-    output_path: str | Path,
-    signal_spec: SignalSpec | Mapping[str, Any],
-    dataset_plan: DatasetPlan | Mapping[str, Sequence[str]],
-    boundary_key_mode: str,
-    dataset_cache_roots: Mapping[str, str | Path] | None = None,
-) -> str:
-    resolved_signal_spec = SignalSpec.from_value(signal_spec)
-    resolved_dataset_plan = DatasetPlan.from_value(dataset_plan)
-    cmd = [
-        "python",
-        "utah_ssl/scripts/recompute_feature_stats.py",
-        "--scope",
-        "session",
-        "--cache-root",
-        str(Path(cache_root)),
-        "--output-path",
-        str(Path(output_path)),
-        "--feature-mode",
-        str(resolved_signal_spec.mode),
-        "--boundary-key-mode",
-        str(boundary_key_mode),
-        "--tx-dim",
-        str(int(resolved_signal_spec.tx_dim)),
-        "--sbp-dim",
-        str(int(resolved_signal_spec.sbp_dim)),
-        "--column-start",
-        str(int(resolved_signal_spec.column_start)),
-        "--missing-channel-policy",
-        str(resolved_signal_spec.missing_channel_policy),
-    ]
-    for selection in resolved_dataset_plan.datasets:
-        cmd.extend(["--dataset", selection.name])
-        for source_split in selection.source_splits:
-            cmd.extend(
-                ["--dataset-source-split", f"{selection.name}={source_split}"]
-            )
-    for dataset, dataset_cache_root in sorted((dataset_cache_roots or {}).items()):
-        cmd.extend(["--dataset-cache-root", f"{str(dataset)}={str(Path(dataset_cache_root))}"])
-    cmd.append("--overwrite")
-    return shlex.join(cmd)
-
-
 def _format_bytes(num_bytes: int) -> str:
     value = float(num_bytes)
     for unit in ["B", "KB", "MB", "GB", "TB"]:
@@ -432,79 +229,13 @@ def _format_bytes(num_bytes: int) -> str:
     return f"{value:.1f} TB"
 
 
-def _path_signature(path: Path) -> dict[str, int] | None:
-    if not path.exists():
-        return None
-    stat = path.stat()
-    return {
-        "size": int(stat.st_size),
-        "mtime_ns": int(stat.st_mtime_ns),
-    }
-
-
-def _list_dir_with_retries(path: Path, *, max_retries: int = 5) -> list[Path]:
-    last_error: OSError | None = None
-    for attempt in range(1, max_retries + 1):
-        try:
-            return sorted(path.iterdir(), key=lambda child: child.name)
-        except OSError as exc:  # pragma: no cover - exercised in Colab when Drive stalls
-            last_error = exc
-            if attempt == max_retries:
-                break
-            print(f"directory scan retry {attempt}/{max_retries} failed for {path}: {exc}")
-            time.sleep(min(10.0, float(attempt)))
-    assert last_error is not None
-    raise last_error
-
-
-def _dataset_signature_payload(dataset_root: Path) -> dict[str, Any]:
-    shard_root = dataset_root / "shards"
-    shard_names: list[str] = []
-    shard_scan_error: str | None = None
-    if shard_root.exists():
-        try:
-            shard_names = [path.name for path in _list_dir_with_retries(shard_root) if path.is_dir()]
-        except OSError as exc:  # pragma: no cover - exercised in Colab when Drive stalls
-            shard_scan_error = str(exc)
-            print(
-                f"warning: failed to enumerate shards for signature under {shard_root}; "
-                f"falling back to metadata-only signature fields: {exc}"
-            )
-    return {
-        "dataset": dataset_root.name,
-        "manifest": _path_signature(dataset_root / "manifest.jsonl"),
-        "metadata": _path_signature(dataset_root / "metadata.json"),
-        "shard_count": len(shard_names),
-        "first_shard": shard_names[0] if shard_names else None,
-        "last_shard": shard_names[-1] if shard_names else None,
-        "shard_scan_error": shard_scan_error,
-    }
-
-
-def _compute_cache_source_signature(src_root: Path) -> str:
-    datasets = [
-        _dataset_signature_payload(dataset_root)
-        for dataset_root in (
-            path
-            for path in _list_dir_with_retries(src_root)
-            if path.is_dir() and (path / "metadata.json").exists()
-        )
-    ]
-    payload = {
-        "root": str(src_root),
-        "datasets": datasets,
-        "repack_summary": _path_signature(src_root / "repack_summary.json"),
-    }
-    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
-
-
 def _resolve_drive_dataset_cache_roots(
     primary_root: Path,
     overrides: Mapping[str, str | Path] | None,
 ) -> dict[str, Path]:
     resolved = {
         path.name: primary_root
-        for path in _list_dir_with_retries(primary_root)
+        for path in list_directory_with_retries(primary_root)
         if path.is_dir() and (path / "metadata.json").exists()
     }
     for dataset, cache_root_value in sorted((overrides or {}).items()):
@@ -523,27 +254,6 @@ def _resolve_drive_dataset_cache_roots(
             )
         resolved[dataset_name] = cache_root
     return resolved
-
-
-def _compute_dataset_cache_source_signature(
-    dataset_cache_roots: Mapping[str, str | Path],
-) -> str:
-    normalized = {
-        str(dataset): Path(cache_root)
-        for dataset, cache_root in sorted(dataset_cache_roots.items())
-    }
-    payload = {
-        "kind": "dataset_cache_root_map_v1",
-        "dataset_roots": {
-            dataset: str(cache_root.resolve())
-            for dataset, cache_root in normalized.items()
-        },
-        "datasets": [
-            _dataset_signature_payload(cache_root / dataset)
-            for dataset, cache_root in normalized.items()
-        ],
-    }
-    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
 
 
 def _pretrain_source_splits_for_dataset(
@@ -829,628 +539,6 @@ class ShardStore:
         return shard
 
 
-def _normalize_segment(
-    x_seq: torch.Tensor,
-    feature_mask: torch.Tensor,
-    *,
-    session_feature_stats: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = None,
-    session_key: str | None = None,
-    min_scale_std: float = 0.1,
-    clip_value: float = 20.0,
-    use_normalization: bool = True,
-) -> torch.Tensor:
-    if not bool(use_normalization):
-        return x_seq
-    return _normalize_segment_session_featurewise(
-        x_seq,
-        feature_mask,
-        session_feature_stats=session_feature_stats,
-        session_key=session_key,
-        clip_value=clip_value,
-    )
-
-
-def _normalize_segment_session_featurewise(
-    x_seq: torch.Tensor,
-    feature_mask: torch.Tensor,
-    *,
-    session_feature_stats: dict[str, tuple[torch.Tensor, torch.Tensor]] | None,
-    session_key: str | None,
-    clip_value: float = 20.0,
-) -> torch.Tensor:
-    if session_feature_stats is None or session_key is None:
-        raise ValueError("Session feature stats are required when normalization is enabled.")
-    if session_key not in session_feature_stats:
-        raise KeyError(f"Missing session feature stats for {session_key}")
-
-    x_norm = x_seq.clone()
-    present_idx = torch.nonzero(feature_mask.bool(), as_tuple=False).squeeze(1)
-    if present_idx.numel() == 0:
-        return x_norm
-
-    mean, std = session_feature_stats[session_key]
-    mean = mean.to(device=x_norm.device, dtype=x_norm.dtype)
-    std = std.to(device=x_norm.device, dtype=x_norm.dtype).clamp_min(1e-6)
-    centered = x_norm[:, present_idx] - mean[present_idx]
-    x_norm[:, present_idx] = (centered / std[present_idx]).clamp(min=-clip_value, max=clip_value)
-    return x_norm
-
-
-def _gaussian_kernel_1d(
-    sigma_bins: float,
-    *,
-    device: torch.device,
-    dtype: torch.dtype,
-    radius: int | None = None,
-) -> torch.Tensor:
-    sigma = float(sigma_bins)
-    if sigma <= 0.0:
-        return torch.ones((1,), device=device, dtype=dtype)
-    effective_radius = (
-        int(radius)
-        if radius is not None
-        else max(1, int(math.ceil(4.0 * sigma)))
-    )
-    positions = torch.arange(
-        -effective_radius,
-        effective_radius + 1,
-        device=device,
-        dtype=dtype,
-    )
-    kernel = torch.exp(-0.5 * (positions / sigma).pow(2))
-    return kernel / kernel.sum().clamp_min(1e-8)
-
-
-def _apply_gaussian_smoothing(
-    x_seq: torch.Tensor,
-    feature_mask: torch.Tensor,
-    *,
-    sigma_bins: float,
-) -> torch.Tensor:
-    sigma = float(sigma_bins)
-    if sigma <= 0.0 or x_seq.shape[0] <= 1:
-        return x_seq
-    present_idx = torch.nonzero(feature_mask.bool(), as_tuple=False).squeeze(1)
-    if present_idx.numel() == 0:
-        return x_seq
-
-    max_reflect_radius = int(x_seq.shape[0] - 1)
-    if max_reflect_radius <= 0:
-        return x_seq
-    kernel_radius = min(max(1, int(math.ceil(4.0 * sigma))), max_reflect_radius)
-    kernel = _gaussian_kernel_1d(
-        sigma,
-        device=x_seq.device,
-        dtype=x_seq.dtype,
-        radius=kernel_radius,
-    )
-    kernel = kernel / kernel.sum().clamp_min(1e-8)
-
-    selected = x_seq[:, present_idx].transpose(0, 1).unsqueeze(0)  # (1, C, T)
-    padded = F.pad(selected, (kernel_radius, kernel_radius), mode="reflect")
-    weight = kernel.view(1, 1, -1).expand(selected.shape[1], 1, -1)
-    smoothed = F.conv1d(padded, weight, groups=selected.shape[1]).squeeze(0).transpose(0, 1)
-
-    out = x_seq.clone()
-    out[:, present_idx] = smoothed
-    return out
-
-
-def _session_stat_key(dataset: str, session_id: str) -> str:
-    return f"{dataset}:{session_id}"
-
-
-def resolve_boundary_key(
-    *,
-    dataset: str,
-    session_id: str,
-    subject_id: str | None,
-    boundary_key_mode: str,
-) -> str:
-    if boundary_key_mode == "session":
-        return f"{dataset}:{session_id}"
-    if boundary_key_mode == "subject_if_available":
-        if subject_id:
-            return f"{dataset}:{subject_id}"
-        return f"{dataset}:{session_id}"
-    raise ValueError(f"Unsupported boundary_key_mode: {boundary_key_mode}")
-
-
-def _compute_session_feature_stats(
-    shard_store: ShardStore,
-    rows_by_dataset: dict[str, list[ExampleRow]],
-    config: CacheAccessConfig,
-) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
-    assert isinstance(config.signal_spec, SignalSpec)
-    feature_contract = config.signal_spec.contract
-    print("computing SSL session-level featurewise z-scoring stats...")
-    session_rows: dict[str, list[ExampleRow]] = defaultdict(list)
-    for dataset, rows in rows_by_dataset.items():
-        for row in rows:
-            session_rows[
-                resolve_boundary_key(
-                    dataset=dataset,
-                    session_id=row.session_id,
-                    subject_id=row.subject_id,
-                    boundary_key_mode=config.boundary_key_mode,
-                )
-            ].append(row)
-
-    full_dim = int(config.full_dim)
-    session_stats: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
-    total_sessions = len(session_rows)
-    bin_stride = int(SESSION_STATS_BIN_STRIDE)
-
-    for session_idx, session_key in enumerate(sorted(session_rows), start=1):
-        rows = session_rows[session_key]
-        sum_x = np.zeros((full_dim,), dtype=np.float64)
-        sum_x2 = np.zeros((full_dim,), dtype=np.float64)
-        count_x = np.zeros((full_dim,), dtype=np.float64)
-
-        for row in rows:
-            shard = shard_store.get(row.shard_relpath)
-            time_offsets = shard["time_offsets"]
-            assert isinstance(time_offsets, np.ndarray)
-            start = int(time_offsets[row.example_index])
-            stop = int(time_offsets[row.example_index + 1])
-            raw_len = int(max(stop - start, 0))
-            if raw_len <= 0:
-                continue
-
-            tx = shard["tx"]
-            if feature_contract.uses_tx and isinstance(tx, np.ndarray):
-                tx_start, tx_stop = config.signal_spec.selected_columns_for_width(
-                    "tx", tx.shape[1]
-                )
-                tx_window = np.asarray(
-                    tx[start:stop:bin_stride, tx_start:tx_stop],
-                    dtype=np.float64,
-                )
-                tx_dim = min(tx_window.shape[1], int(config.tx_dim))
-                sum_x[:tx_dim] += tx_window[:, :tx_dim].sum(axis=0)
-                sum_x2[:tx_dim] += np.square(tx_window[:, :tx_dim]).sum(axis=0)
-                count_x[:tx_dim] += tx_window.shape[0]
-
-            sbp = shard["sbp"]
-            if feature_contract.uses_sbp and isinstance(sbp, np.ndarray):
-                sbp_column_start, sbp_column_stop = (
-                    config.signal_spec.selected_columns_for_width("sbp", sbp.shape[1])
-                )
-                sbp_window = np.asarray(
-                    sbp[
-                        start:stop:bin_stride,
-                        sbp_column_start:sbp_column_stop,
-                    ],
-                    dtype=np.float64,
-                )
-                sbp_dim = min(sbp_window.shape[1], int(config.sbp_dim))
-                sbp_start = feature_contract.feature_start(
-                    "sbp",
-                    tx_dim=int(config.tx_dim),
-                )
-                sbp_slice = slice(sbp_start, sbp_start + sbp_dim)
-                sum_x[sbp_slice] += sbp_window[:, :sbp_dim].sum(axis=0)
-                sum_x2[sbp_slice] += np.square(sbp_window[:, :sbp_dim]).sum(axis=0)
-                count_x[sbp_slice] += sbp_window.shape[0]
-
-        mean = np.zeros((full_dim,), dtype=np.float32)
-        std = np.ones((full_dim,), dtype=np.float32)
-        present_mask = count_x > 0
-        if present_mask.any():
-            mean64 = sum_x[present_mask] / count_x[present_mask]
-            var64 = np.maximum(sum_x2[present_mask] / count_x[present_mask] - np.square(mean64), 1e-6)
-            mean[present_mask] = mean64.astype(np.float32)
-            std[present_mask] = np.sqrt(var64).astype(np.float32)
-        session_stats[session_key] = (torch.from_numpy(mean), torch.from_numpy(std))
-
-        if session_idx == 1 or session_idx % 25 == 0 or session_idx == total_sessions:
-            print(f" session_stats={session_idx}/{total_sessions} current={session_key}")
-
-    return session_stats
-
-
-def load_precomputed_session_feature_stats_into_cache_context(
-    *,
-    cache_context: CacheContext,
-    stats_path: str | Path,
-) -> dict[str, Any]:
-    session_feature_stats, metadata, path = _load_precomputed_session_feature_stats(
-        stats_path=stats_path,
-        cache_root=cache_context.drive_cache_root,
-        signal_spec=cache_context.signal_spec,
-        dataset_plan=cache_context.config.dataset_plan,
-        boundary_key_mode=str(cache_context.boundary_key_mode),
-        dataset_cache_roots=cache_context.drive_dataset_cache_roots,
-    )
-    cache_context.session_feature_stats = dict(session_feature_stats)
-    return {
-        "stats_path": path,
-        "metadata": metadata,
-        "session_feature_stats": session_feature_stats,
-        "session_count": int(len(session_feature_stats)),
-        "use_normalization": cache_context.use_normalization,
-    }
-
-
-def _load_precomputed_session_feature_stats(
-    *,
-    stats_path: str | Path,
-    cache_root: str | Path,
-    signal_spec: SignalSpec | Mapping[str, Any],
-    dataset_plan: DatasetPlan | Mapping[str, Sequence[str]],
-    boundary_key_mode: str,
-    dataset_cache_roots: Mapping[str, str | Path] | None = None,
-) -> tuple[dict[str, tuple[torch.Tensor, torch.Tensor]], dict[str, Any], Path]:
-    resolved_signal_spec = SignalSpec.from_value(signal_spec)
-    resolved_dataset_plan = DatasetPlan.from_value(dataset_plan)
-    expected_dim = int(resolved_signal_spec.full_dim)
-    path = Path(stats_path)
-    canonical_path = resolve_precomputed_session_stats_path(
-        cache_root=cache_root,
-        signal_spec=resolved_signal_spec,
-        dataset_plan=resolved_dataset_plan,
-        boundary_key_mode=str(boundary_key_mode),
-        dataset_cache_roots=dataset_cache_roots,
-    )
-    recompute_cmd = build_recompute_session_feature_stats_command(
-        cache_root=cache_root,
-        output_path=canonical_path,
-        signal_spec=resolved_signal_spec,
-        dataset_plan=resolved_dataset_plan,
-        boundary_key_mode=str(boundary_key_mode),
-        dataset_cache_roots=dataset_cache_roots,
-    )
-    payload, metadata, path, _ = _load_artifact_payload_and_sidecar(
-        path=path,
-        canonical_path=canonical_path,
-        recompute_cmd=recompute_cmd,
-        artifact_name="session stats",
-        expected_kind="session_featurewise_zscore_stats",
-    )
-    try:
-        payload_scope, raw_stats = extract_feature_stats_entries(payload)
-    except ValueError as exc:
-        raise KeyError(
-            "Precomputed session stats payload is missing valid feature statistics."
-        ) from exc
-    if payload_scope != "session":
-        raise ValueError("Precomputed session stats payload has global scope.")
-
-    session_feature_stats: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
-    for key, value in raw_stats.items():
-        mean, std = value
-        mean_t = torch.as_tensor(mean).float().cpu()
-        std_t = torch.as_tensor(std).float().cpu()
-        if mean_t.numel() != expected_dim or std_t.numel() != expected_dim:
-            raise ValueError(
-                "Precomputed session stats artifact is stale or incompatible.\n"
-                f"expected_path: {canonical_path}\n"
-                f"requested_path: {path}\n"
-                f"reason: entry {key!r} has dim mean:{mean_t.numel()} std:{std_t.numel()} expected {expected_dim}\n"
-                f"recompute_command: {recompute_cmd}"
-            )
-        session_feature_stats[str(key)] = (mean_t, std_t)
-
-    expected_cache_root = str(Path(cache_root).resolve())
-    expected_cache_variant = _cache_variant_name(cache_root)
-    normalized_dataset_cache_roots = {
-        str(dataset): Path(root)
-        for dataset, root in sorted((dataset_cache_roots or {}).items())
-    }
-    expected_cache_signature = (
-        _compute_dataset_cache_source_signature(normalized_dataset_cache_roots)
-        if normalized_dataset_cache_roots
-        else _compute_cache_source_signature(Path(cache_root))
-    )
-    common_metadata = {
-        "source_cache_root": expected_cache_root,
-        "source_cache_variant": expected_cache_variant,
-        "source_cache_signature": expected_cache_signature,
-        "signal_spec": resolved_signal_spec.to_dict(),
-        "dataset_plan": resolved_dataset_plan.to_dict(),
-        "boundary_key_mode": str(boundary_key_mode),
-        "session_stats_bin_stride": SESSION_STATS_BIN_STRIDE,
-    }
-    if normalized_dataset_cache_roots:
-        common_metadata["source_cache_roots"] = {
-            dataset: str(root.resolve())
-            for dataset, root in normalized_dataset_cache_roots.items()
-        }
-    mismatches = _validate_common_artifact_metadata(
-        metadata=metadata,
-        expected_metadata=common_metadata,
-    )
-    if mismatches:
-        mismatch_text = "; ".join(mismatches)
-        raise ValueError(
-            "Precomputed session stats artifact is stale or incompatible.\n"
-            f"expected_path: {canonical_path}\n"
-            f"requested_path: {path}\n"
-            f"reason: {mismatch_text}\n"
-            f"recompute_command: {recompute_cmd}"
-        )
-    return session_feature_stats, metadata, path
-
-
-def sample_base_segment(
-    cache_context: CacheContext,
-    example: ExampleRow,
-    segment_bins: int,
-    py_rng: random.Random,
-) -> dict[str, Any]:
-    signal_spec = cache_context.config.signal_spec
-    assert isinstance(signal_spec, SignalSpec)
-    feature_contract = signal_spec.contract
-    boundary_key = resolve_boundary_key(
-        dataset=example.dataset,
-        session_id=example.session_id,
-        subject_id=example.subject_id,
-        boundary_key_mode=cache_context.boundary_key_mode,
-    )
-    session_key = boundary_key
-    shard = cache_context.shard_store.get(example.shard_relpath)
-    time_offsets = shard["time_offsets"]
-    assert isinstance(time_offsets, np.ndarray)
-    start = int(time_offsets[example.example_index])
-    stop = int(time_offsets[example.example_index + 1])
-    length = stop - start
-    total_needed = int(segment_bins)
-    max_start = length - total_needed
-    if max_start < 0:
-        raise ValueError(
-            f"Example {example.dataset}:{example.session_id} length={length} cannot support segment_bins={segment_bins}"
-        )
-
-    offset = py_rng.randrange(max_start + 1)
-    src_start = start + offset
-    src_stop = src_start + total_needed
-    x_seq = np.zeros((total_needed, cache_context.full_dim), dtype=np.float32)
-    feature_mask = np.zeros((cache_context.full_dim,), dtype=np.float32)
-
-    tx = shard["tx"]
-    if feature_contract.uses_tx and isinstance(tx, np.ndarray):
-        tx_column_start, tx_column_stop = signal_spec.selected_columns_for_width(
-            "tx", tx.shape[1]
-        )
-        tx_window = np.asarray(
-            tx[
-                src_start:src_stop,
-                tx_column_start:tx_column_stop,
-            ],
-            dtype=np.float32,
-        )
-        tx_dim = min(tx_window.shape[1], cache_context.tx_dim)
-        x_seq[:, :tx_dim] = tx_window[:, :tx_dim]
-        feature_mask[:tx_dim] = 1.0
-
-    sbp = shard["sbp"]
-    if feature_contract.uses_sbp and isinstance(sbp, np.ndarray):
-        sbp_column_start, sbp_column_stop = signal_spec.selected_columns_for_width(
-            "sbp", sbp.shape[1]
-        )
-        sbp_window = np.asarray(
-            sbp[
-                src_start:src_stop,
-                sbp_column_start:sbp_column_stop,
-            ],
-            dtype=np.float32,
-        )
-        sbp_dim = min(sbp_window.shape[1], cache_context.sbp_dim)
-        sbp_start = feature_contract.feature_start(
-            "sbp",
-            tx_dim=int(cache_context.tx_dim),
-        )
-        x_seq[:, sbp_start : sbp_start + sbp_dim] = sbp_window[:, :sbp_dim]
-        feature_mask[sbp_start : sbp_start + sbp_dim] = 1.0
-
-    x_seq_t = torch.from_numpy(x_seq)
-    feature_mask_t = torch.from_numpy(feature_mask)
-    x_norm = _normalize_segment(
-        x_seq_t,
-        feature_mask_t,
-        session_feature_stats=cache_context.session_feature_stats,
-        session_key=session_key,
-        use_normalization=cache_context.use_normalization,
-    )
-
-    return {
-        "x": x_norm,
-        "feature_mask": feature_mask_t,
-        "length": int(segment_bins),
-        "dataset": example.dataset,
-        "session_id": example.session_id,
-        "session_key": session_key,
-        "boundary_key": boundary_key,
-        "shard_relpath": example.shard_relpath,
-        "has_tx": example.has_tx,
-        "has_sbp": example.has_sbp,
-        "orig_len": length,
-    }
-
-
-def stack_segment_batch(samples: list[dict[str, Any]]) -> dict[str, Any]:
-    return {
-        "x": torch.stack([item["x"] for item in samples], dim=0),
-        "feature_mask": torch.stack([item["feature_mask"] for item in samples], dim=0),
-        "lengths": torch.tensor([item["length"] for item in samples], dtype=torch.long),
-        "datasets": [item["dataset"] for item in samples],
-        "session_keys": [item["boundary_key"] for item in samples],
-        "boundary_keys": [item["boundary_key"] for item in samples],
-        "sessions": [item["session_id"] for item in samples],
-        "shard_relpaths": [item["shard_relpath"] for item in samples],
-    }
-
-
-def _valid_row_weights(rows: list[ExampleRow], segment_bins: int) -> np.ndarray:
-    return np.array([max(0, row.n_time_bins - segment_bins + 1) for row in rows], dtype=np.float64)
-
-
-def get_sampling_plan(
-    cache_context: CacheContext,
-    split_name: str,
-    segment_bins: int,
-    dataset_weight_alpha: float,
-) -> SamplingPlan:
-    key = (split_name, int(segment_bins), float(dataset_weight_alpha))
-    cached = cache_context.sampling_plan_cache.get(key)
-    if cached is not None:
-        return cached
-
-    shard_rows_by_dataset = {}
-    shard_keys_by_dataset = {}
-    shard_probs_by_dataset = {}
-    row_probs_within_shard_by_dataset = {}
-    dataset_mass = {}
-
-    for dataset in cache_context.pretrain_datasets:
-        rows = cache_context.split_rows_by_dataset[split_name][dataset]
-        weights = _valid_row_weights(rows, segment_bins)
-        keep_mask = weights > 0
-        kept_rows = [row for row, keep in zip(rows, keep_mask) if keep]
-        kept_weights = weights[keep_mask]
-        if len(kept_rows) == 0:
-            continue
-
-        dataset_mass[dataset] = float(kept_weights.sum())
-        shard_rows = defaultdict(list)
-        shard_weights = defaultdict(list)
-        for row, weight in zip(kept_rows, kept_weights):
-            shard_rows[row.shard_relpath].append(row)
-            shard_weights[row.shard_relpath].append(float(weight))
-
-        shard_keys = list(shard_rows.keys())
-        shard_mass = np.array([sum(shard_weights[name]) for name in shard_keys], dtype=np.float64)
-        shard_probs = shard_mass / shard_mass.sum()
-
-        shard_rows_by_dataset[dataset] = dict(shard_rows)
-        shard_keys_by_dataset[dataset] = shard_keys
-        shard_probs_by_dataset[dataset] = shard_probs
-        row_probs_within_shard_by_dataset[dataset] = {
-            name: np.array(weight_list, dtype=np.float64) / np.sum(weight_list)
-            for name, weight_list in shard_weights.items()
-        }
-
-    dataset_names = tuple(dataset for dataset in cache_context.pretrain_datasets if dataset in dataset_mass)
-    if not dataset_names:
-        raise RuntimeError(f"Split {split_name} has no datasets with enough bins for segment_bins={segment_bins}")
-
-    dataset_probs = np.array(
-        [dataset_mass[dataset] ** dataset_weight_alpha for dataset in dataset_names],
-        dtype=np.float64,
-    )
-    dataset_probs = dataset_probs / dataset_probs.sum()
-
-    plan = SamplingPlan(
-        split_name=split_name,
-        segment_bins=int(segment_bins),
-        dataset_weight_alpha=float(dataset_weight_alpha),
-        dataset_names=dataset_names,
-        dataset_probs=dataset_probs,
-        shard_rows_by_dataset=shard_rows_by_dataset,
-        shard_keys_by_dataset=shard_keys_by_dataset,
-        shard_probs_by_dataset=shard_probs_by_dataset,
-        row_probs_within_shard_by_dataset=row_probs_within_shard_by_dataset,
-    )
-    cache_context.sampling_plan_cache[key] = plan
-    return plan
-
-
-class SegmentBatchSampler:
-    def __init__(
-        self,
-        cache_context: CacheContext,
-        split_name: str,
-        segment_bins: int,
-        batch_size: int,
-        seed: int,
-        dataset_weight_alpha: float,
-        examples_per_shard: int,
-    ):
-        self.cache_context = cache_context
-        self.split_name = split_name
-        self.segment_bins = int(segment_bins)
-        self.batch_size = int(batch_size)
-        self.examples_per_shard = max(1, int(examples_per_shard))
-        self.seed = int(seed)
-        self.plan = get_sampling_plan(cache_context, split_name, self.segment_bins, dataset_weight_alpha)
-        self.py_rng = random.Random(self.seed)
-        self.np_rng = np.random.default_rng(self.seed)
-
-    def sample_batch(self, batch_size: int | None = None) -> dict[str, Any]:
-        batch_size = self.batch_size if batch_size is None else int(batch_size)
-        requested_dataset_idx = self.np_rng.choice(
-            len(self.plan.dataset_names),
-            size=batch_size,
-            p=self.plan.dataset_probs,
-        )
-        dataset_counts = Counter(self.plan.dataset_names[int(idx)] for idx in requested_dataset_idx)
-
-        samples = []
-        for dataset, n_examples in dataset_counts.items():
-            shard_keys = self.plan.shard_keys_by_dataset[dataset]
-            shard_probs = self.plan.shard_probs_by_dataset[dataset]
-            n_shards = max(1, math.ceil(n_examples / self.examples_per_shard))
-            replace_shards = n_shards > len(shard_keys)
-            sampled_shard_idx = self.np_rng.choice(
-                len(shard_keys),
-                size=n_shards,
-                replace=replace_shards,
-                p=shard_probs,
-            )
-
-            remaining = int(n_examples)
-            for shard_choice_idx, shard_idx in enumerate(np.atleast_1d(sampled_shard_idx)):
-                take = min(self.examples_per_shard, remaining)
-                if shard_choice_idx == n_shards - 1:
-                    take = remaining
-
-                shard_key = shard_keys[int(shard_idx)]
-                shard_rows = self.plan.shard_rows_by_dataset[dataset][shard_key]
-                row_probs = self.plan.row_probs_within_shard_by_dataset[dataset][shard_key]
-                row_choices = self.np_rng.choice(len(shard_rows), size=take, replace=True, p=row_probs)
-                for row_idx in np.atleast_1d(row_choices):
-                    example = shard_rows[int(row_idx)]
-                    samples.append(
-                        sample_base_segment(
-                            self.cache_context,
-                            example,
-                            segment_bins=self.segment_bins,
-                            py_rng=self.py_rng,
-                        )
-                    )
-
-                remaining -= take
-                if remaining <= 0:
-                    break
-
-        order = self.np_rng.permutation(len(samples))
-        samples = [samples[int(idx)] for idx in order]
-        return stack_segment_batch(samples)
-
-
-def build_segment_sampler(
-    cache_context: CacheContext,
-    split_name: str,
-    batch_size: int,
-    *,
-    seed: int,
-    segment_bins: int,
-    dataset_weight_alpha: float,
-    examples_per_shard: int,
-) -> SegmentBatchSampler:
-    if split_name == "val" and not cache_context.has_val_datasets:
-        raise RuntimeError("No validation datasets are eligible for session-disjoint validation.")
-    return SegmentBatchSampler(
-        cache_context=cache_context,
-        split_name=split_name,
-        segment_bins=segment_bins,
-        batch_size=batch_size,
-        seed=seed,
-        dataset_weight_alpha=dataset_weight_alpha,
-        examples_per_shard=examples_per_shard,
-    )
-
-
 def _preflight_cache_inputs(
     *,
     dataset_cache_roots: Mapping[str, Path],
@@ -1536,7 +624,7 @@ def prepare_cache_context(
         dataset_cache_roots=drive_dataset_cache_roots,
         config=config,
     )
-    source_signature = _compute_dataset_cache_source_signature(
+    source_signature = compute_dataset_cache_source_signature(
         drive_dataset_cache_roots
     )
     local_cache_name = f"{drive_cache_root.name}_plan_{source_signature[:12]}"
@@ -1712,7 +800,7 @@ def prepare_cache_context(
                 dataset_cache_roots=drive_dataset_cache_roots,
             )
         )
-        session_feature_stats, _, stats_path = _load_precomputed_session_feature_stats(
+        session_feature_stats, _, stats_path = load_precomputed_session_feature_stats(
             stats_path=resolved_stats_path,
             cache_root=drive_cache_root,
             signal_spec=config.signal_spec,

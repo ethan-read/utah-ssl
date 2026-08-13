@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import json
-import math
 from pathlib import Path
 from typing import Any
 
@@ -11,18 +9,20 @@ import pandas as pd
 import torch
 from torch.utils.data import DataLoader
 
-from utah_ssl.datasets import CanonicalSequenceDataset, compute_feature_stats
+from utah_ssl.ctc import ctc_greedy_decode
+from utah_ssl.feature_stats import compute_feature_stats
+from utah_ssl.sequence_data import CanonicalSequenceDataset
+from utah_ssl.decoding_preprocessing import prepare_willett_inputs
 from utah_ssl.experiment_contract import SignalSpec
+from utah_ssl.reporting import load_jsonl
 
+from .model import POSSMPhonemeModel
 from .phoneme_finetune import (
     POSSMFinetuneConfig,
     _build_problem,
-    _ctc_greedy_decode,
     _loader_kwargs,
-    _prepare_stage2_inputs,
     recover_possm_stage1_sequence_components,
 )
-from .model import POSSMPhonemeModel
 
 
 def _maybe_display(value: Any) -> None:
@@ -30,15 +30,6 @@ def _maybe_display(value: Any) -> None:
         display(value)  # type: ignore[name-defined]
     except NameError:
         return
-
-
-def _read_jsonl(path: str | Path | None) -> list[dict[str, Any]]:
-    if path is None:
-        return []
-    resolved = Path(path)
-    if not resolved.exists():
-        return []
-    return [json.loads(line) for line in resolved.read_text().splitlines() if line.strip()]
 
 
 def display_possm_stage1_report(
@@ -51,7 +42,7 @@ def display_possm_stage1_report(
         print("No Stage-1 run state available.")
         return {"progress_df": pd.DataFrame(), "latest_train": None, "latest_val": None}
 
-    records = _read_jsonl(run_state.get("progress_path"))
+    records = load_jsonl(run_state.get("progress_path"))
     progress_df = pd.DataFrame(records)
     if progress_df.empty:
         print("No Stage-1 progress rows found.")
@@ -140,7 +131,7 @@ def display_possm_stage2_report(
         print("No Stage-2 summary available.")
         return {"progress_df": pd.DataFrame(), "latest_train": None, "latest_val": None}
 
-    records = _read_jsonl(summary.get("progress_log_path"))
+    records = load_jsonl(summary.get("progress_log_path"))
     progress_df = pd.DataFrame(records)
     if progress_df.empty:
         print("No Stage-2 progress rows found.")
@@ -371,9 +362,13 @@ def run_possm_stage2_prediction_diagnostics(
                 break
             x = batch["x"].to(device)
             input_lengths = batch["input_lengths"].to(device)
-            x = _prepare_stage2_inputs(x, input_lengths, config=config, is_training=False)
+            x = prepare_willett_inputs(x, input_lengths, config=config, is_training=False)
             outputs = model(x, input_lengths, session_ids=batch["boundary_keys"])
-            predictions = _ctc_greedy_decode(outputs["logits"], outputs["token_lengths"], blank_index=blank_index)
+            predictions = ctc_greedy_decode(
+                outputs["logits"],
+                outputs["token_lengths"],
+                blank_index=blank_index,
+            )
             labels = batch["labels"]
             label_lengths = batch["label_lengths"]
             for row_idx, prediction in enumerate(predictions):
@@ -395,12 +390,8 @@ def run_possm_stage2_prediction_diagnostics(
 def summarize_possm_stage2_progress(summary: dict[str, Any] | None) -> pd.DataFrame:
     if summary is None:
         return pd.DataFrame()
-    records = _read_jsonl(summary.get("progress_log_path"))
+    records = load_jsonl(summary.get("progress_log_path"))
     if not records:
         return pd.DataFrame()
     frame = pd.DataFrame(records)
     return frame.tail(1)
-
-
-def bits_to_nats(bits: float) -> float:
-    return float(bits) * math.log(2.0)

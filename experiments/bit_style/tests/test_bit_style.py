@@ -1,21 +1,16 @@
 from __future__ import annotations
 
-import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 import torch
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
-
-from experiments.bit_style.config import GenericSSMSSLConfig
+from experiments.bit_style.config import BITStyleConfig
 from experiments.bit_style.model import (
-    GenericMaskedSSMModel,
-    GenericSSMCTCModel,
-    GenericSSMEncoder,
+    BITStyleCTCModel,
+    BITStyleEncoder,
+    BITStylePretrainingModel,
 )
 from experiments.bit_style.objectives import masked_reconstruction_loss
 from experiments.bit_style.training import load_encoder_checkpoint
@@ -25,10 +20,9 @@ from utah_ssl.experiment_contract import (
 )
 
 
-class GenericSSMSSLTest(unittest.TestCase):
+class BITStyleTest(unittest.TestCase):
     def test_config_round_trip(self) -> None:
-        config = GenericSSMSSLConfig(
-            backbone_type="s5",
+        config = BITStyleConfig(
             input_mode="temporal_patch",
             hidden_size=8,
             state_size=4,
@@ -41,14 +35,13 @@ class GenericSSMSSLTest(unittest.TestCase):
             ),
             signal_spec=SignalSpec.tx_only(tx_dim=256),
         )
-        recovered = GenericSSMSSLConfig.from_dict(config.to_dict())
-        self.assertEqual(recovered.backbone_type, "s5")
+        recovered = BITStyleConfig.from_dict(config.to_dict())
         self.assertEqual(recovered.input_mode, "temporal_patch")
         self.assertEqual(recovered.dataset_plan, config.dataset_plan)
         self.assertEqual(recovered.signal_spec, config.signal_spec)
 
     def test_s5_encoder_forward(self) -> None:
-        encoder = GenericSSMEncoder(
+        encoder = BITStyleEncoder(
             input_dim=3,
             hidden_size=8,
             state_size=4,
@@ -64,27 +57,9 @@ class GenericSSMSSLTest(unittest.TestCase):
         self.assertEqual(tuple(outputs.hidden.shape), (2, 4, 8))
         self.assertEqual(outputs.token_lengths.tolist(), [4, 2])
 
-    def test_mamba_encoder_optional_forward(self) -> None:
-        try:
-            encoder = GenericSSMEncoder(
-                input_dim=3,
-                hidden_size=8,
-                state_size=4,
-                num_layers=1,
-                dropout=0.0,
-                backbone_type="mamba",
-                input_mode="raw_bin",
-            )
-        except ImportError as exc:
-            self.skipTest(str(exc))
-        x = torch.randn(2, 5, 3)
-        lengths = torch.tensor([5, 4], dtype=torch.long)
-        outputs = encoder.encode(x, lengths)
-        self.assertEqual(tuple(outputs.hidden.shape), (2, 5, 8))
-
     def test_masked_reconstruction_backward(self) -> None:
-        model = GenericMaskedSSMModel(
-            GenericSSMEncoder(
+        model = BITStylePretrainingModel(
+            BITStyleEncoder(
                 input_dim=3,
                 hidden_size=8,
                 state_size=4,
@@ -115,7 +90,7 @@ class GenericSSMSSLTest(unittest.TestCase):
         self.assertGreater(grad_norm, 0.0)
 
     def test_encoder_checkpoint_loads_into_ctc_model(self) -> None:
-        encoder = GenericSSMEncoder(
+        encoder = BITStyleEncoder(
             input_dim=3,
             hidden_size=8,
             state_size=4,
@@ -126,8 +101,8 @@ class GenericSSMSSLTest(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="ssm_ssl_checkpoint_test_") as tmp:
             path = Path(tmp) / "checkpoint.pt"
             torch.save({"encoder_state": encoder.state_dict()}, path)
-            ctc_model = GenericSSMCTCModel(
-                encoder=GenericSSMEncoder(
+            ctc_model = BITStyleCTCModel(
+                encoder=BITStyleEncoder(
                     input_dim=3,
                     hidden_size=8,
                     state_size=4,

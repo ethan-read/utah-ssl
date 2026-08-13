@@ -116,7 +116,6 @@ def _build_config(
 ) -> dict[str, object]:
     return {
         "seed": int(seed),
-        "backbone_type": "s5",
         "input_mode": "temporal_patch",
         "objective": "masked_time_channel_reconstruction",
         "dataset": "brain2text24",
@@ -217,7 +216,7 @@ def train_bit_s5_stage1(
 
     command = [
         sys.executable,
-        "experiments/bit_style/scripts/run_generic_ssm_ssl.py",
+        "experiments/bit_style/scripts/run_bit_style_experiment.py",
         "--config-json",
         str(config_json_path),
     ]

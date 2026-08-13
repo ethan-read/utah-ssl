@@ -18,28 +18,32 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from utah_ssl.ctc import CanonicalSequenceDataset, ctc_greedy_decode
-from utah_ssl.stats import (
-    load_precomputed_split_feature_stats,
-    resolve_precomputed_split_stats_path,
+from experiments.supervised_baselines.checkpointing import (
+    config_from_checkpoint,
+    load_willett_model_from_checkpoint,
 )
-
+from experiments.supervised_baselines.config import WillettReconstructionConfig
 from experiments.supervised_baselines.data import (
     ConcatenatedPredictedTxSequenceDataset,
     FuturePredictionExportAccessor,
-    WillettInputTransformConfig,
-    adapter_keys_from_rows,
     build_willett_problem,
     compute_predicted_tx_normalization_stats,
     compute_willett_normalization_stats,
     loader_kwargs,
     make_length_aware_batch_sampler,
     normalization_stats_missing_rows,
+)
+from utah_ssl.ctc import ctc_greedy_decode
+from utah_ssl.sequence_data import CanonicalSequenceDataset
+from utah_ssl.decoding_preprocessing import (
+    WillettInputTransformConfig,
     prepare_willett_inputs,
 )
-from experiments.supervised_baselines.model import WillettPhonemeModel
-from experiments.supervised_baselines.train import WillettReconstructionConfig
-
+from utah_ssl.stats import (
+    load_precomputed_split_feature_stats,
+    resolve_precomputed_split_stats_path,
+)
+from utah_ssl.runtime import resolve_device
 
 PHONEME_CATEGORY_BY_SYMBOL: dict[str, str] = {
     "BLANK": "blank",
@@ -120,16 +124,6 @@ class RepresentationExportConfig:
 
 def _timestamp_utc() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-
-
-def _detect_device(preferred: str | None = None) -> torch.device:
-    if preferred:
-        return torch.device(str(preferred))
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
 
 
 def _json_safe(value: Any) -> Any:
@@ -238,73 +232,11 @@ def patch_timing_for_token(
     }
 
 
-def _build_config_from_checkpoint(checkpoint_payload: dict[str, Any]) -> WillettReconstructionConfig:
-    config_payload = dict(checkpoint_payload.get("config", {}))
-    if not config_payload:
-        raise KeyError("Checkpoint is missing a Willett reconstruction 'config' payload.")
-    valid_keys = set(WillettReconstructionConfig.__dataclass_fields__)
-    return WillettReconstructionConfig(
-        **{
-            key: value
-            for key, value in config_payload.items()
-            if key in valid_keys
-        }
-    )
-
-
 def _feature_dim_from_problem(problem: dict[str, Any], feature_mode: str) -> int:
     row = problem["train_rows"][0]
     if str(feature_mode) == "tx_only":
         return int(row.n_tx_features)
     return int(row.n_tx_features + row.n_sbp_features)
-
-
-def _make_model_from_checkpoint(
-    *,
-    checkpoint_payload: dict[str, Any],
-    config: WillettReconstructionConfig,
-    problem: dict[str, Any],
-    sample_dim: int,
-) -> WillettPhonemeModel:
-    train_adapter_keys = adapter_keys_from_rows(
-        problem["train_rows"],
-        dataset=str(problem["dataset"]),
-        boundary_key_mode=str(problem["boundary_key_mode"]),
-    )
-    val_adapter_keys = adapter_keys_from_rows(
-        problem["val_rows"],
-        dataset=str(problem["dataset"]),
-        boundary_key_mode=str(problem["boundary_key_mode"]),
-    )
-    session_adapter_keys = tuple(dict.fromkeys(train_adapter_keys + val_adapter_keys))
-    model = WillettPhonemeModel(
-        input_dim=int(sample_dim),
-        vocab_size=int(problem["vocab"]["num_classes"]),
-        patch_size=int(config.patch_size),
-        patch_stride=int(config.patch_stride),
-        input_projection_size=int(config.input_projection_size),
-        input_projection_dropout=float(config.input_projection_dropout),
-        decoder_backbone_type=str(config.decoder_backbone_type),
-        gru_hidden_size=int(config.gru_hidden_size),
-        gru_num_layers=int(config.gru_num_layers),
-        gru_dropout=float(config.gru_dropout),
-        s5_hidden_size=int(config.s5_hidden_size),
-        s5_state_size=int(config.s5_state_size),
-        s5_num_layers=int(config.s5_num_layers),
-        s5_dropout=float(config.s5_dropout),
-        s5_direction=str(config.s5_direction),
-        s5_ffn_multiplier=float(config.s5_ffn_multiplier),
-        s4d_hidden_size=int(config.s4d_hidden_size),
-        s4d_state_size=int(config.s4d_state_size),
-        s4d_num_layers=int(config.s4d_num_layers),
-        s4d_dropout=float(config.s4d_dropout),
-        s4d_direction=str(config.s4d_direction),
-        s4d_ffn_multiplier=float(config.s4d_ffn_multiplier),
-        session_adapter_keys=session_adapter_keys,
-        session_adapter_enabled=bool(config.session_adapter_enabled),
-    )
-    model.load_state_dict(checkpoint_payload["model_state"])
-    return model
 
 
 def _load_train_stats(
@@ -461,7 +393,7 @@ def export_willett_representations(config: RepresentationExportConfig) -> dict[s
     export_dir.mkdir(parents=True, exist_ok=True)
 
     payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    model_config = _build_config_from_checkpoint(payload)
+    model_config = config_from_checkpoint(payload)
     if config.cache_root_override is not None or config.precomputed_split_stats_path_override is not None:
         model_config = dataclass_replace(
             model_config,
@@ -536,7 +468,7 @@ def export_willett_representations(config: RepresentationExportConfig) -> dict[s
             dataset=str(problem["dataset"]),
         )
     )
-    device = _detect_device(config.device)
+    device = resolve_device(config.device)
     loader = DataLoader(
         dataset,
         batch_sampler=make_length_aware_batch_sampler(
@@ -547,12 +479,14 @@ def export_willett_representations(config: RepresentationExportConfig) -> dict[s
         ),
         **loader_kwargs(device),
     )
-    model = _make_model_from_checkpoint(
-        checkpoint_payload=payload,
+    model, _, _ = load_willett_model_from_checkpoint(
+        payload,
         config=model_config,
         problem=problem,
-        sample_dim=sample_dim,
-    ).to(device)
+        input_dim=sample_dim,
+        vocab_size=int(problem["vocab"]["num_classes"]),
+        device=device,
+    )
     model.eval()
     transform_config = WillettInputTransformConfig(
         input_smoothing_sigma_bins=float(model_config.input_smoothing_sigma_bins),

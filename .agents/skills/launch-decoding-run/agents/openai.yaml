@@ -1,0 +1,4 @@
+interface:
+  display_name: "Launch Decoding Run"
+  short_description: "Preflight, launch, resume, and preserve runs"
+  default_prompt: "Use $launch-decoding-run to preflight and launch this decoding experiment reproducibly."

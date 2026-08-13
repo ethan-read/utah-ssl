@@ -8,33 +8,37 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from utah_ssl.stats import (
-    recompute_split_feature_stats,
-    resolve_precomputed_split_stats_path as resolve_canonical_split_stats_path,
-)
-from utah_ssl.stats_artifact_test_utils import (
-    write_valid_split_stats_artifact as _write_valid_split_stats_artifact,
-)
-from utah_ssl.experiment_contract import SignalSpec
+from experiments.supervised_baselines.config import WillettReconstructionConfig
 from experiments.supervised_baselines.data import (
     ConcatenatedPredictedTxSequenceDataset,
     FuturePredictionExportAccessor,
-    WillettInputTransformConfig,
     adapter_keys_from_rows,
     build_willett_problem,
     compute_predicted_tx_normalization_stats,
     compute_willett_normalization_stats,
     group_rows_by_adapter_key,
     normalization_stats_missing_rows,
-    prepare_willett_inputs,
 )
 from experiments.supervised_baselines.model import (
     WillettPhonemeModel,
     patched_length,
 )
 from experiments.supervised_baselines.train import (
-    WillettReconstructionConfig,
     run_willett_reconstruction,
+)
+from utah_ssl.decoding_preprocessing import (
+    WillettInputTransformConfig,
+    prepare_willett_inputs,
+)
+from utah_ssl.experiment_contract import SignalSpec
+from utah_ssl.stats import (
+    recompute_split_feature_stats,
+)
+from utah_ssl.stats import (
+    resolve_precomputed_split_stats_path as resolve_canonical_split_stats_path,
+)
+from utah_ssl.stats_artifact_test_utils import (
+    write_valid_split_stats_artifact as _write_valid_split_stats_artifact,
 )
 
 

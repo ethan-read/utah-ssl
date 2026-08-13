@@ -7,8 +7,6 @@ import argparse
 import json
 import sys
 import tarfile
-import tempfile
-from dataclasses import replace
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -22,12 +20,17 @@ for path in (REPO_ROOT, EXPERIMENTS_DIR):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-from experiments.supervised_baselines.data import prepare_willett_inputs  # noqa: E402
-from experiments.supervised_baselines.model import WillettPhonemeModel  # noqa: E402
-from experiments.supervised_baselines.released_tf_checkpoint import RELEASED_SESSIONS  # noqa: E402
-from experiments.manifolds.representation_export import _build_config_from_checkpoint  # noqa: E402
-from experiments.supervised_baselines.train import _build_input_transform_config  # noqa: E402
-
+from experiments.supervised_baselines.checkpointing import (  # noqa: E402
+    load_willett_model_from_checkpoint,
+)
+from experiments.supervised_baselines.released_tf_checkpoint import (
+    RELEASED_SESSIONS,  # noqa: E402
+)
+from utah_ssl.ctc import ctc_greedy_decode, edit_counts  # noqa: E402
+from utah_ssl.decoding_preprocessing import (  # noqa: E402
+    prepare_willett_inputs,
+    willett_input_transform_config_from,
+)
 
 TFRECORD_DESCRIPTION = {
     "inputFeatures": "float",
@@ -38,56 +41,6 @@ TFRECORD_DESCRIPTION = {
     "nSeqElements": "int",
     "transcription": "int",
 }
-
-
-def _edit_counts(reference: list[int], hypothesis: list[int]) -> tuple[int, int, int]:
-    rows = len(reference) + 1
-    cols = len(hypothesis) + 1
-    distances = [[0] * cols for _ in range(rows)]
-    ops = [[(0, 0, 0)] * cols for _ in range(rows)]
-    for row_idx in range(1, rows):
-        distances[row_idx][0] = row_idx
-        ops[row_idx][0] = (0, row_idx, 0)
-    for col_idx in range(1, cols):
-        distances[0][col_idx] = col_idx
-        ops[0][col_idx] = (col_idx, 0, 0)
-    for row_idx in range(1, rows):
-        for col_idx in range(1, cols):
-            if reference[row_idx - 1] == hypothesis[col_idx - 1]:
-                distances[row_idx][col_idx] = distances[row_idx - 1][col_idx - 1]
-                ops[row_idx][col_idx] = ops[row_idx - 1][col_idx - 1]
-                continue
-            candidates = (
-                (distances[row_idx - 1][col_idx - 1] + 1, ops[row_idx - 1][col_idx - 1], "sub"),
-                (distances[row_idx][col_idx - 1] + 1, ops[row_idx][col_idx - 1], "ins"),
-                (distances[row_idx - 1][col_idx] + 1, ops[row_idx - 1][col_idx], "del"),
-            )
-            _, prev_ops, kind = min(candidates, key=lambda item: item[0])
-            ins, dele, sub = prev_ops
-            if kind == "sub":
-                sub += 1
-            elif kind == "ins":
-                ins += 1
-            else:
-                dele += 1
-            distances[row_idx][col_idx] = min(item[0] for item in candidates)
-            ops[row_idx][col_idx] = (ins, dele, sub)
-    return ops[-1][-1]
-
-
-def _ctc_greedy_decode(logits: torch.Tensor, token_length: int, *, blank_index: int = 0) -> list[int]:
-    token_ids = logits[: int(token_length)].argmax(dim=-1).tolist()
-    sequence: list[int] = []
-    prev_token: int | None = None
-    for token in token_ids:
-        token = int(token)
-        if token == int(blank_index):
-            prev_token = None
-            continue
-        if token != prev_token:
-            sequence.append(token)
-        prev_token = token
-    return sequence
 
 
 def _iter_tfrecord_paths(root: Path, *, sessions: tuple[str, ...] | None) -> Iterable[tuple[str, Path]]:
@@ -117,38 +70,17 @@ def _extract_tfrecords_from_archive(archive_path: Path, output_root: Path) -> Pa
     return extracted
 
 
-def _build_model(payload: dict[str, Any], *, device: torch.device) -> tuple[WillettPhonemeModel, Any]:
-    config = _build_config_from_checkpoint(payload)
+def _build_model(payload: dict[str, Any], *, device: torch.device) -> tuple[torch.nn.Module, Any]:
     session_adapter_keys = tuple(payload.get("session_adapter_keys") or ())
     if not session_adapter_keys:
         session_adapter_keys = tuple(f"brain2text24:{session}" for session in RELEASED_SESSIONS)
-    model = WillettPhonemeModel(
+    model, config, _ = load_willett_model_from_checkpoint(
+        payload,
         input_dim=256,
         vocab_size=41,
-        patch_size=int(config.patch_size),
-        patch_stride=int(config.patch_stride),
-        input_projection_size=int(config.input_projection_size),
-        input_projection_dropout=float(config.input_projection_dropout),
-        decoder_backbone_type=str(config.decoder_backbone_type),
-        gru_hidden_size=int(config.gru_hidden_size),
-        gru_num_layers=int(config.gru_num_layers),
-        gru_dropout=float(config.gru_dropout),
-        s5_hidden_size=int(config.s5_hidden_size),
-        s5_state_size=int(config.s5_state_size),
-        s5_num_layers=int(config.s5_num_layers),
-        s5_dropout=float(config.s5_dropout),
-        s5_direction=str(config.s5_direction),
-        s5_ffn_multiplier=float(config.s5_ffn_multiplier),
-        s4d_hidden_size=int(config.s4d_hidden_size),
-        s4d_state_size=int(config.s4d_state_size),
-        s4d_num_layers=int(config.s4d_num_layers),
-        s4d_dropout=float(config.s4d_dropout),
-        s4d_direction=str(config.s4d_direction),
-        s4d_ffn_multiplier=float(config.s4d_ffn_multiplier),
         session_adapter_keys=session_adapter_keys,
-        session_adapter_enabled=bool(config.session_adapter_enabled),
-    ).to(device)
-    model.load_state_dict(payload["model_state"], strict=True)
+        device=device,
+    )
     model.eval()
     return model, config
 
@@ -165,7 +97,7 @@ def evaluate_tfrecords(
     device = torch.device(device_name)
     payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     model, config = _build_model(payload, device=device)
-    transform_config = _build_input_transform_config(config)
+    transform_config = willett_input_transform_config_from(config)
     sessions = RELEASED_SESSIONS if released_sessions_only else None
     total_examples = 0
     total_reference_tokens = 0
@@ -194,8 +126,12 @@ def evaluate_tfrecords(
                         is_training=False,
                     )
                 outputs = model(x, input_lengths, session_ids=[f"brain2text24:{session}"])
-                prediction = _ctc_greedy_decode(outputs["logits"].squeeze(0).cpu(), int(outputs["token_lengths"][0]), blank_index=0)
-                ins, dele, sub = _edit_counts(reference, prediction)
+                prediction = ctc_greedy_decode(
+                    outputs["logits"].cpu(),
+                    outputs["token_lengths"].cpu(),
+                    blank_index=0,
+                )[0]
+                ins, dele, sub = edit_counts(reference, prediction)
                 session_ref += len(reference)
                 session_pred += len(prediction)
                 session_ins += ins

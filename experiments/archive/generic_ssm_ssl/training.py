@@ -15,17 +15,20 @@ import torch
 from torch.utils.data import DataLoader
 
 try:
-    from utah_ssl.cache import CacheAccessConfig, build_segment_sampler, prepare_cache_context
+    from utah_ssl.cache import CacheAccessConfig, prepare_cache_context
+    from utah_ssl.sampling import build_segment_sampler
     from utah_ssl.ctc import (
-        CanonicalSequenceDataset,
-        LengthAwareBatchSampler,
-        build_competition_split_problem,
-        canonical_rows_padded_time_percentile,
-        collate_sequence_batch,
         compute_ctc_loss_sum,
         ctc_bits_per_target,
         ctc_greedy_decode,
         edit_counts,
+    )
+    from utah_ssl.dataset_splits import build_competition_split_problem
+    from utah_ssl.sequence_data import (
+        CanonicalSequenceDataset,
+        LengthAwareBatchSampler,
+        canonical_rows_padded_time_percentile,
+        collate_sequence_batch,
     )
     from utah_ssl.reporting import ProgressPrinter, append_jsonl, write_metrics_csv
     from utah_ssl.stats import (
@@ -35,19 +38,21 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - repo-root unittest fallback
     from utah_ssl.cache import (
         CacheAccessConfig,
-        build_segment_sampler,
         prepare_cache_context,
     )
+    from utah_ssl.sampling import build_segment_sampler
     from utah_ssl.ctc import (
-        CanonicalSequenceDataset,
-        LengthAwareBatchSampler,
-        build_competition_split_problem,
-        canonical_rows_padded_time_percentile,
-        collate_sequence_batch,
         compute_ctc_loss_sum,
         ctc_bits_per_target,
         ctc_greedy_decode,
         edit_counts,
+    )
+    from utah_ssl.dataset_splits import build_competition_split_problem
+    from utah_ssl.sequence_data import (
+        CanonicalSequenceDataset,
+        LengthAwareBatchSampler,
+        canonical_rows_padded_time_percentile,
+        collate_sequence_batch,
     )
     from utah_ssl.reporting import (
         ProgressPrinter,

@@ -16,8 +16,8 @@ specific experiment ideas rather than the order in which work was attempted.
 
 ## Layout
 
-- `utah_ssl/`: reusable cache, dataset, model, normalization, CTC, patching,
-  reporting, and data-maintenance code.
+- `utah_ssl/`: reusable cache, canonical data access, split construction,
+  sequence loading, models, normalization, CTC helpers, and maintenance tools.
 - `experiments/supervised_baselines/`: Willett-derived GRU and supervised S5/S4D
   comparisons.
 - `experiments/bit_style/`: active BIT-style pretraining and transfer work.

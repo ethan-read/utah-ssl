@@ -1,8 +1,8 @@
-"""Run generic S5/Mamba SSL plus downstream CTC controls.
+"""Run BIT-style S5 pretraining plus downstream CTC controls.
 
 Example Colab usage:
 
-python experiments/bit_style/scripts/run_generic_ssm_ssl.py \
+python -m experiments.bit_style.scripts.run_bit_style_experiment \
   --cache-root /content/drive/MyDrive/utah_ssl/data/cache_v1 \
   --output-root /content/drive/MyDrive/utah_ssl/outputs/ssl_experiments/ssm_ssl \
   --backbone-type s5 --input-mode temporal_patch --ssl-steps 8000 --ctc-steps 8000
@@ -19,8 +19,8 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from experiments.bit_style.config import GenericSSMSSLConfig
-from experiments.bit_style.training import run_generic_ssm_ssl
+from experiments.bit_style.config import BITStyleConfig
+from experiments.bit_style.training import run_bit_style_experiment
 
 
 def _parse_args() -> argparse.Namespace:
@@ -29,7 +29,6 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--cache-root", type=str, default=None)
     parser.add_argument("--output-root", type=str, default=None)
     parser.add_argument("--run-name", type=str, default=None)
-    parser.add_argument("--backbone-type", choices=("s5", "mamba"), default=None)
     parser.add_argument("--input-mode", choices=("raw_bin", "temporal_patch", "causal_conv_stem"), default=None)
     parser.add_argument("--ssl-steps", type=int, default=None)
     parser.add_argument("--ctc-steps", type=int, default=None)
@@ -45,7 +44,7 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _config_from_args(args: argparse.Namespace) -> GenericSSMSSLConfig:
+def _config_from_args(args: argparse.Namespace) -> BITStyleConfig:
     payload = {}
     if args.config_json is not None:
         payload.update(json.loads(Path(args.config_json).read_text()))
@@ -53,7 +52,6 @@ def _config_from_args(args: argparse.Namespace) -> GenericSSMSSLConfig:
         "cache_root": args.cache_root,
         "output_root": args.output_root,
         "run_name": args.run_name,
-        "backbone_type": args.backbone_type,
         "input_mode": args.input_mode,
         "ssl_steps": args.ssl_steps,
         "ctc_steps": args.ctc_steps,
@@ -69,12 +67,12 @@ def _config_from_args(args: argparse.Namespace) -> GenericSSMSSLConfig:
     payload.update({key: value for key, value in overrides.items() if value is not None})
     if args.no_downstream_ctc:
         payload["run_downstream_ctc"] = False
-    return GenericSSMSSLConfig.from_dict(payload)
+    return BITStyleConfig.from_dict(payload)
 
 
 def main() -> None:
     config = _config_from_args(_parse_args())
-    summary = run_generic_ssm_ssl(config)
+    summary = run_bit_style_experiment(config)
     print(json.dumps(summary, indent=2, sort_keys=True, default=str))
 
 

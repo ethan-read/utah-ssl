@@ -17,10 +17,10 @@ from typing import Any, Sequence
 import numpy as np
 import torch
 
-from utah_ssl.cache import _apply_gaussian_smoothing
+from utah_ssl.signal_processing import apply_gaussian_smoothing
 
 
-SMOOTHED_CACHE_IMPL = "utah_ssl.cache._apply_gaussian_smoothing"
+SMOOTHED_CACHE_IMPL = "utah_ssl.signal_processing.apply_gaussian_smoothing"
 
 
 def _timestamp_utc() -> str:
@@ -56,7 +56,11 @@ def smooth_feature_array(array: np.ndarray, *, sigma_bins: float) -> np.ndarray:
         return np.array(array, copy=True)
     tensor = torch.from_numpy(np.asarray(array, dtype=np.float32))
     feature_mask = torch.ones(int(tensor.shape[1]), dtype=torch.float32)
-    smoothed = _apply_gaussian_smoothing(tensor, feature_mask, sigma_bins=float(sigma_bins))
+    smoothed = apply_gaussian_smoothing(
+        tensor,
+        feature_mask,
+        sigma_bins=float(sigma_bins),
+    )
     return smoothed.cpu().numpy().astype(array.dtype, copy=False)
 
 

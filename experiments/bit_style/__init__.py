@@ -1,17 +1,17 @@
-"""Generic SSM SSL experiments for neural speech decoding."""
+"""BIT-style S5 pretraining and transfer experiments."""
 
-from .config import GenericSSMSSLConfig
-from .model import GenericMaskedSSMModel, GenericSSMCTCModel, GenericSSMEncoder
+from .config import BITStyleConfig
+from .model import BITStyleCTCModel, BITStyleEncoder, BITStylePretrainingModel
 from .objectives import build_time_channel_mask, masked_reconstruction_loss
-from .training import load_encoder_checkpoint, run_generic_ssm_ssl
+from .training import load_encoder_checkpoint, run_bit_style_experiment
 
 __all__ = [
-    "GenericMaskedSSMModel",
-    "GenericSSMCTCModel",
-    "GenericSSMEncoder",
-    "GenericSSMSSLConfig",
+    "BITStyleCTCModel",
+    "BITStyleConfig",
+    "BITStyleEncoder",
+    "BITStylePretrainingModel",
     "build_time_channel_mask",
     "load_encoder_checkpoint",
     "masked_reconstruction_loss",
-    "run_generic_ssm_ssl",
+    "run_bit_style_experiment",
 ]

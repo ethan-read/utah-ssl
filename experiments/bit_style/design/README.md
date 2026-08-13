@@ -28,7 +28,7 @@ The branch currently provides:
 
 - broad multi-dataset TX sampling with explicit dataset and signal contracts;
 - temporal patching, causal-convolution, and raw-bin input modes;
-- causal or bidirectional S5 backbones, plus a causal Mamba comparison;
+- causal or bidirectional S5 backbones;
 - masked time/channel reconstruction;
 - downstream CTC training and checkpoint transfer;
 - tests and Modal launchers for the current Stage-1/Stage-2 path.
@@ -40,7 +40,7 @@ backbone-substitution recipe remains in
 
 ## Known gap
 
-The current generic configuration carries one `SignalSpec` across Stage 1 and
+The current configuration carries one `SignalSpec` across Stage 1 and
 Stage 2. A canonical broad-TX-to-Brain-to-Text-SBP transfer experiment therefore
 still needs an explicit downstream signal handoff and matching normalization
 artifact validation. Until that is implemented, the branch should not be

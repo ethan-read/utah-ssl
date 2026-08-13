@@ -11,27 +11,28 @@ import numpy as np
 import torch
 
 try:
-    from utah_ssl.datasets import (
-        AREA6V_FEATURE_DIM,
-        CanonicalProbeManifestRow,
+    from utah_ssl.canonical_data import CanonicalProbeManifestRow
+    from utah_ssl.feature_stats import compute_feature_stats
+    from utah_ssl.sequence_data import (
         CanonicalSequenceDataset,
+        LengthAwareBatchSampler,
         canonical_rows_padded_time_percentile,
         collate_sequence_batch,
-        compute_feature_stats,
     )
-    from utah_ssl.ctc import LengthAwareBatchSampler
     from utah_ssl.experiment_contract import SignalSpec
 except ModuleNotFoundError:  # pragma: no cover - repo-root unittest fallback
-    from utah_ssl.datasets import (
-        AREA6V_FEATURE_DIM,
-        CanonicalProbeManifestRow,
+    from utah_ssl.canonical_data import CanonicalProbeManifestRow
+    from utah_ssl.feature_stats import compute_feature_stats
+    from utah_ssl.sequence_data import (
         CanonicalSequenceDataset,
+        LengthAwareBatchSampler,
         canonical_rows_padded_time_percentile,
         collate_sequence_batch,
-        compute_feature_stats,
     )
-    from utah_ssl.ctc import LengthAwareBatchSampler
     from utah_ssl.experiment_contract import SignalSpec
+
+
+AREA6V_FEATURE_DIM = 128
 
 
 DATASET_SPLITS: dict[str, tuple[str, str]] = {

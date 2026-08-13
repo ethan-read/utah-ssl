@@ -1,4 +1,4 @@
-"""Masked time/channel reconstruction objective for generic SSM SSL."""
+"""Masked time/channel reconstruction objective for BIT-style pretraining."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ import torch.nn.functional as F
 
 from utah_ssl.patching import patched_lengths
 
-from .model import GenericMaskedSSMModel
+from .model import BITStylePretrainingModel
 
 
 def _valid_token_mask(token_lengths: torch.Tensor, max_tokens: int) -> torch.Tensor:
@@ -71,7 +71,7 @@ def build_time_channel_mask(
 
 
 def masked_reconstruction_loss(
-    model: GenericMaskedSSMModel,
+    model: BITStylePretrainingModel,
     batch: dict[str, Any],
     *,
     device: torch.device,

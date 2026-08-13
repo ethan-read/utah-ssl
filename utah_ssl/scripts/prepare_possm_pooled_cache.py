@@ -26,7 +26,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from utah_ssl.cache import _compute_dataset_cache_source_signature  # noqa: E402
+from utah_ssl.cache_identity import compute_dataset_cache_source_signature  # noqa: E402
 from utah_ssl.scripts.repack_cache_shards import (  # noqa: E402
     AREA6V_FEATURES,
     TIME_OFFSETS_NAME,
@@ -78,7 +78,7 @@ def _source_inventory(root: Path) -> dict[str, Any]:
             )
     return {
         "root": str(root),
-        "source_signature": _compute_dataset_cache_source_signature(
+        "source_signature": compute_dataset_cache_source_signature(
             {"brain2text25": root}
         ),
         "files": files,

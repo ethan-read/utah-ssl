@@ -15,6 +15,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
+from typing import Sequence
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
@@ -22,15 +23,50 @@ if str(REPO_ROOT) not in sys.path:
 
 from utah_ssl.experiment_contract import DatasetPlan, SignalSpec
 from utah_ssl.feature_contract import SUPPORTED_FEATURE_MODES
-from utah_ssl.cache import resolve_precomputed_session_stats_path
-from utah_ssl.scripts.recompute_session_feature_stats import (
-    _parse_dataset_cache_root_args,
-    _parse_dataset_source_split_args,
+from utah_ssl.stats import (
     recompute_session_feature_stats,
-)
-from utah_ssl.scripts.recompute_split_feature_stats import (
     recompute_split_feature_stats,
+    resolve_precomputed_session_stats_path,
 )
+
+
+def _parse_dataset_source_split_args(
+    values: Sequence[str] | None,
+) -> dict[str, tuple[str, ...]] | None:
+    if not values:
+        return None
+    parsed: dict[str, set[str]] = {}
+    for value in values:
+        dataset, separator, source_split = str(value).partition("=")
+        dataset = dataset.strip()
+        source_split = source_split.strip().lower()
+        if not separator or not dataset or not source_split:
+            raise ValueError(
+                "--dataset-source-split values must have the form DATASET=SOURCE_SPLIT"
+            )
+        parsed.setdefault(dataset, set()).add(source_split)
+    return {
+        dataset: tuple(sorted(source_splits))
+        for dataset, source_splits in sorted(parsed.items())
+    }
+
+
+def _parse_dataset_cache_root_args(
+    values: Sequence[str] | None,
+) -> dict[str, Path] | None:
+    if not values:
+        return None
+    parsed: dict[str, Path] = {}
+    for value in values:
+        dataset, separator, cache_root = str(value).partition("=")
+        dataset = dataset.strip()
+        cache_root = cache_root.strip()
+        if not separator or not dataset or not cache_root:
+            raise ValueError(
+                "--dataset-cache-root values must have the form DATASET=CACHE_ROOT"
+            )
+        parsed[dataset] = Path(cache_root)
+    return dict(sorted(parsed.items()))
 
 
 def _dataset_feature_widths(

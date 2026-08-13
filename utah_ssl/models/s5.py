@@ -8,32 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
-def _sequence_mask(lengths: torch.Tensor, max_len: int) -> torch.Tensor:
-    positions = torch.arange(max_len, device=lengths.device).unsqueeze(0)
-    return positions < lengths.unsqueeze(1)
-
-
-def _apply_sequence_mask(x: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
-    mask = _sequence_mask(lengths, x.shape[1]).unsqueeze(-1)
-    return x * mask.to(x.dtype)
-
-
-def reverse_padded_sequence(x: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
-    """Reverse only the valid prefix of each sequence, leaving padding aligned."""
-
-    if x.ndim < 2:
-        raise ValueError("reverse_padded_sequence expects a tensor with shape (B, T, ...).")
-
-    seq_len = x.shape[1]
-    positions = torch.arange(seq_len, device=lengths.device).unsqueeze(0)
-    valid_mask = positions < lengths.unsqueeze(1)
-    reversed_positions = (lengths.unsqueeze(1) - 1 - positions).clamp_min(0)
-    gather_positions = torch.where(valid_mask, reversed_positions, positions)
-    view_shape = (*gather_positions.shape, *([1] * (x.ndim - 2)))
-    gather_index = gather_positions.view(view_shape).expand_as(x)
-    return x.gather(dim=1, index=gather_index)
-
+from .sequence import apply_sequence_mask, reverse_padded_sequence
 
 class DiagonalS5SSM(nn.Module):
     """Minimal diagonalized MIMO S5 layer with shared complex state."""
@@ -79,7 +54,7 @@ class DiagonalS5SSM(nn.Module):
         abar, bbar, c = self._discretized_params()
 
         input_terms = x.to(torch.complex64) @ bbar.transpose(0, 1)
-        input_terms = _apply_sequence_mask(input_terms, lengths)
+        input_terms = apply_sequence_mask(input_terms, lengths)
 
         powers = torch.arange(seq_len, device=x.device, dtype=torch.float32)
         kernel = abar.unsqueeze(0).pow(powers.unsqueeze(1))
@@ -90,7 +65,7 @@ class DiagonalS5SSM(nn.Module):
 
         response = states @ c.transpose(0, 1)
         y = response.real + self.D(x)
-        return _apply_sequence_mask(y, lengths)
+        return apply_sequence_mask(y, lengths)
 
 
 class S5Block(nn.Module):
@@ -121,9 +96,9 @@ class S5Block(nn.Module):
 
     def forward(self, x: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
         x = x + self.dropout1(self.ssm(self.norm1(x), lengths))
-        x = _apply_sequence_mask(x, lengths)
+        x = apply_sequence_mask(x, lengths)
         x = x + self.ffn(self.norm2(x))
-        return _apply_sequence_mask(x, lengths)
+        return apply_sequence_mask(x, lengths)
 
 
 class S5SequenceBackbone(nn.Module):
@@ -154,7 +129,7 @@ class S5SequenceBackbone(nn.Module):
     def forward(self, x: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
         for block in self.blocks:
             x = block(x, lengths)
-        return _apply_sequence_mask(x, lengths)
+        return apply_sequence_mask(x, lengths)
 
 
 class BidirectionalS5SequenceBackbone(nn.Module):
@@ -192,4 +167,4 @@ class BidirectionalS5SequenceBackbone(nn.Module):
         backward_hidden_reversed = self.backward_backbone(reversed_x, lengths)
         backward_hidden = reverse_padded_sequence(backward_hidden_reversed, lengths)
         fused = self.fusion(torch.cat([forward_hidden, backward_hidden], dim=-1))
-        return _apply_sequence_mask(fused, lengths)
+        return apply_sequence_mask(fused, lengths)

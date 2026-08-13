@@ -26,12 +26,6 @@ and 12,000-step budget as the Brain2Text24-only baseline.
 
 ## Where to work
 
-- `notebooks/brain2text24_masked_reconstruction_transfer.ipynb`: historical Brain2Text24-only
-  baseline record. It preserves the original comparison but is not maintained
-  as a current entry point after the explicit contract migration.
-- `notebooks/brain2text25_long_pretraining.ipynb`: older Brain2Text25-only
-  workflow. It contains strict 128-wide cache assertions and is not the clean
-  entry point for the pooled experiment.
 - `notebooks/pooled_brain2text24_brain2text25_pretraining.ipynb`: current Colab workflow.
   Edit its single configuration cell, then run the cells in order. It is
   designed for Drive-backed Colab runs; no local training smoke test is

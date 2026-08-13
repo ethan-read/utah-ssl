@@ -2,89 +2,20 @@
 
 from __future__ import annotations
 
-import json
 import math
 from collections import Counter
-from pathlib import Path
 from typing import Any
 
 import pandas as pd
 import torch
 from torch.utils.data import DataLoader
 
-from utah_ssl.ctc import compute_ctc_loss_sum
-
-from .data import WillettInputTransformConfig, prepare_willett_inputs
-
-
-def _read_jsonl(path: str | Path | None) -> list[dict[str, Any]]:
-    if path is None:
-        return []
-    resolved = Path(path)
-    if not resolved.exists():
-        return []
-    return [json.loads(line) for line in resolved.read_text().splitlines() if line.strip()]
-
-
-def _ctc_greedy_decode(
-    logits: torch.Tensor,
-    token_lengths: torch.Tensor,
-    *,
-    blank_index: int,
-) -> list[list[int]]:
-    token_ids = logits.argmax(dim=-1)
-    decoded: list[list[int]] = []
-    for batch_idx, length in enumerate(token_lengths.tolist()):
-        sequence: list[int] = []
-        prev_token: int | None = None
-        for token in token_ids[batch_idx, :length].tolist():
-            if token == blank_index:
-                prev_token = None
-                continue
-            if token != prev_token:
-                sequence.append(int(token))
-            prev_token = int(token)
-        decoded.append(sequence)
-    return decoded
-
-
-def _edit_counts(reference: list[int], hypothesis: list[int]) -> tuple[int, int, int]:
-    rows = len(reference) + 1
-    cols = len(hypothesis) + 1
-    distances = [[0] * cols for _ in range(rows)]
-    ops = [[(0, 0, 0)] * cols for _ in range(rows)]
-    for row_idx in range(1, rows):
-        distances[row_idx][0] = row_idx
-        ops[row_idx][0] = (0, row_idx, 0)
-    for col_idx in range(1, cols):
-        distances[0][col_idx] = col_idx
-        ops[0][col_idx] = (col_idx, 0, 0)
-    for row_idx in range(1, rows):
-        for col_idx in range(1, cols):
-            if reference[row_idx - 1] == hypothesis[col_idx - 1]:
-                best_distance = distances[row_idx - 1][col_idx - 1]
-                best_ops = ops[row_idx - 1][col_idx - 1]
-            else:
-                substitution = (distances[row_idx - 1][col_idx - 1] + 1, 0, 0, 1)
-                insertion = (distances[row_idx][col_idx - 1] + 1, 1, 0, 0)
-                deletion = (distances[row_idx - 1][col_idx] + 1, 0, 1, 0)
-                candidates = (substitution, insertion, deletion)
-                best = min(candidates, key=lambda item: item[0])
-                if best is substitution:
-                    prev_ops = ops[row_idx - 1][col_idx - 1]
-                    best_distance = best[0]
-                    best_ops = (prev_ops[0], prev_ops[1], prev_ops[2] + 1)
-                elif best is insertion:
-                    prev_ops = ops[row_idx][col_idx - 1]
-                    best_distance = best[0]
-                    best_ops = (prev_ops[0] + 1, prev_ops[1], prev_ops[2])
-                else:
-                    prev_ops = ops[row_idx - 1][col_idx]
-                    best_distance = best[0]
-                    best_ops = (prev_ops[0], prev_ops[1] + 1, prev_ops[2])
-            distances[row_idx][col_idx] = best_distance
-            ops[row_idx][col_idx] = best_ops
-    return ops[-1][-1]
+from utah_ssl.ctc import compute_ctc_loss_sum, ctc_greedy_decode, edit_counts
+from utah_ssl.decoding_preprocessing import (
+    WillettInputTransformConfig,
+    prepare_willett_inputs,
+)
+from utah_ssl.reporting import load_jsonl
 
 
 def _top_counter_items(counter: Counter[int], *, top_k: int = 10) -> list[list[int]]:
@@ -134,7 +65,7 @@ def evaluate_willett_phoneme_metrics(
             )
             total_loss_sum += float(loss_sum.item())
             total_targets += int(target_count)
-            predictions = _ctc_greedy_decode(
+            predictions = ctc_greedy_decode(
                 outputs["logits"],
                 outputs["token_lengths"],
                 blank_index=int(blank_index),
@@ -143,7 +74,7 @@ def evaluate_willett_phoneme_metrics(
             for row_idx, prediction in enumerate(predictions):
                 reference_length = int(label_lengths[row_idx].item())
                 reference = labels[row_idx, :reference_length].tolist()
-                insertions, deletions, substitutions = _edit_counts(reference, prediction)
+                insertions, deletions, substitutions = edit_counts(reference, prediction)
                 total_insertions += int(insertions)
                 total_deletions += int(deletions)
                 total_substitutions += int(substitutions)
@@ -182,7 +113,7 @@ def evaluate_willett_phoneme_metrics(
 def display_willett_report(summary: dict[str, Any] | None) -> dict[str, Any]:
     if summary is None:
         return {"progress_df": pd.DataFrame(), "summary_df": pd.DataFrame()}
-    records = _read_jsonl(summary.get("progress_log_path"))
+    records = load_jsonl(summary.get("progress_log_path"))
     progress_df = pd.DataFrame(records)
     train_df = progress_df[progress_df.get("event") == "willett_train_report"].copy()
     val_df = progress_df[progress_df.get("event") == "willett_val_report"].copy()

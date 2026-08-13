@@ -1,1 +1,1 @@
-"""Command-line entrypoints for generic SSM SSL experiments."""
+"""Command-line entrypoints for BIT-style experiments."""

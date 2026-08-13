@@ -7,7 +7,7 @@ import json
 import math
 import random
 import time
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -16,17 +16,25 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from utah_ssl.ctc import CanonicalSequenceDataset, compute_ctc_loss_sum
+from utah_ssl.ctc import compute_ctc_loss_sum
+from utah_ssl.sequence_data import CanonicalSequenceDataset
+from utah_ssl.decoding_preprocessing import (
+    prepare_willett_inputs,
+    willett_input_transform_config_from,
+)
 from utah_ssl.feature_contract import SUPPORTED_FEATURE_MODES
 from utah_ssl.stats import (
     load_precomputed_split_feature_stats,
     resolve_precomputed_split_stats_path,
 )
+from utah_ssl.runtime import resolve_device, seed_everything
+from utah_ssl.reporting import append_optional_jsonl
 
+from .checkpointing import build_willett_model
+from .config import WillettReconstructionConfig
 from .data import (
     ConcatenatedPredictedTxSequenceDataset,
     FuturePredictionExportAccessor,
-    WillettInputTransformConfig,
     adapter_keys_from_rows,
     build_willett_problem,
     compute_predicted_tx_normalization_stats,
@@ -35,160 +43,17 @@ from .data import (
     loader_kwargs,
     make_length_aware_batch_sampler,
     normalization_stats_missing_rows,
-    prepare_willett_inputs,
 )
 from .model import WillettPhonemeModel
 from .reporting import evaluate_willett_phoneme_metrics
-
-
-@dataclass
-class WillettReconstructionConfig:
-    seed: int = 7
-    dataset: str = "brain2text24"
-    feature_mode: str = "tx_only"
-    boundary_key_mode: str = "session"
-    split_policy: str = "competition_train_test"
-    cv_num_folds: int = 5
-    cv_fold_index: int = 0
-    normalization_mode: str = "global"
-    batch_size: int = 64
-    max_steps: int = 120000
-    learning_rate: float = 1e-2
-    min_learning_rate: float = 1e-4
-    warmup_steps: int = 1000
-    weight_decay: float = 1e-5
-    adam_epsilon: float = 1e-1
-    max_grad_norm: float = 10.0
-    val_every_steps: int = 100
-    checkpoint_every_steps: int = 500
-    checkpoint_keep_last: int | None = 2
-    progress_every_steps: int = 25
-    input_projection_size: int = 256
-    input_projection_dropout: float = 0.2
-    decoder_backbone_type: str = "gru"
-    gru_hidden_size: int = 512
-    gru_num_layers: int = 5
-    gru_dropout: float = 0.4
-    s5_hidden_size: int = 512
-    s5_state_size: int = 128
-    s5_num_layers: int = 5
-    s5_dropout: float = 0.2
-    s5_direction: str = "causal"
-    s5_ffn_multiplier: float = 2.0
-    s4d_hidden_size: int = 512
-    s4d_state_size: int = 128
-    s4d_num_layers: int = 5
-    s4d_dropout: float = 0.2
-    s4d_direction: str = "causal"
-    s4d_ffn_multiplier: float = 2.0
-    patch_size: int = 14
-    patch_stride: int = 4
-    session_adapter_enabled: bool = True
-    input_feature_source: str = "raw"
-    predicted_export_root: str | Path | None = None
-    input_smoothing_sigma_bins: float = 2.0
-    input_smoothing_kernel_size: int = 100
-    input_smoothing_threshold: float = 0.01
-    white_noise_sd: float = 1.0
-    constant_offset_sd: float = 0.2
-    precomputed_split_stats_path: str | Path | None = None
-    output_root: str | Path = "experiments/supervised_baselines_runs"
-    run_name: str | None = None
-    cache_root: str | Path = "/Users/home/thesis/data/cache_v1"
-    resume_checkpoint_path: str | Path | None = None
-    resume_latest: bool = False
-
-    def __post_init__(self) -> None:
-        if self.feature_mode not in SUPPORTED_FEATURE_MODES:
-            raise ValueError(f"feature_mode must be one of {SUPPORTED_FEATURE_MODES}")
-        if self.boundary_key_mode not in {"session", "subject_if_available"}:
-            raise ValueError("boundary_key_mode must be one of {'session', 'subject_if_available'}")
-        if self.split_policy not in {"competition_train_test", "competition_train_kfold", "source_train_val"}:
-            raise ValueError(
-                "split_policy must be one of "
-                "{'competition_train_test', 'competition_train_kfold', 'source_train_val'}"
-            )
-        if int(self.cv_num_folds) < 2:
-            raise ValueError("cv_num_folds must be at least 2")
-        if int(self.cv_fold_index) < 0 or int(self.cv_fold_index) >= int(self.cv_num_folds):
-            raise ValueError("cv_fold_index must satisfy 0 <= cv_fold_index < cv_num_folds")
-        if self.normalization_mode not in {"block", "global", "per_session", "none"}:
-            raise ValueError("normalization_mode must be one of {'block', 'global', 'per_session', 'none'}")
-        if int(self.batch_size) <= 0 or int(self.max_steps) <= 0:
-            raise ValueError("batch_size and max_steps must be positive")
-        if float(self.learning_rate) <= 0.0 or float(self.min_learning_rate) < 0.0:
-            raise ValueError("learning rates must be non-negative and max lr must be positive")
-        if int(self.warmup_steps) < 0:
-            raise ValueError("warmup_steps must be non-negative")
-        if int(self.patch_size) <= 0 or int(self.patch_stride) <= 0:
-            raise ValueError("patch_size and patch_stride must be positive")
-        if int(self.input_projection_size) <= 0:
-            raise ValueError("input_projection_size must be positive")
-        if self.decoder_backbone_type not in {"gru", "s5", "s4d"}:
-            raise ValueError("decoder_backbone_type must be one of {'gru', 's5', 's4d'}")
-        if self.input_feature_source not in {"raw", "raw_plus_predicted_tx"}:
-            raise ValueError("input_feature_source must be one of {'raw', 'raw_plus_predicted_tx'}")
-        if self.input_feature_source == "raw_plus_predicted_tx":
-            if self.predicted_export_root is None:
-                raise ValueError("predicted_export_root is required when input_feature_source='raw_plus_predicted_tx'")
-            if self.feature_mode != "tx_only":
-                raise ValueError("raw_plus_predicted_tx currently requires feature_mode='tx_only'")
-        if int(self.gru_hidden_size) <= 0 or int(self.gru_num_layers) <= 0:
-            raise ValueError("GRU sizes must be positive")
-        if int(self.s5_hidden_size) <= 0 or int(self.s5_state_size) <= 0 or int(self.s5_num_layers) <= 0:
-            raise ValueError("S5 sizes must be positive")
-        if self.s5_direction not in {"causal", "bidirectional"}:
-            raise ValueError("s5_direction must be one of {'causal', 'bidirectional'}")
-        if float(self.s5_ffn_multiplier) <= 0.0:
-            raise ValueError("s5_ffn_multiplier must be positive")
-        if int(self.s4d_hidden_size) <= 0 or int(self.s4d_state_size) <= 0 or int(self.s4d_num_layers) <= 0:
-            raise ValueError("S4D sizes must be positive")
-        if self.s4d_direction not in {"causal", "bidirectional"}:
-            raise ValueError("s4d_direction must be one of {'causal', 'bidirectional'}")
-        if float(self.s4d_ffn_multiplier) <= 0.0:
-            raise ValueError("s4d_ffn_multiplier must be positive")
 
 
 def _timestamp_utc() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
 
-def _seed_all(seed: int) -> None:
-    random.seed(int(seed))
-    np.random.seed(int(seed))
-    torch.manual_seed(int(seed))
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(int(seed))
-
-
-def _detect_device() -> torch.device:
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
-
-
-def _emit_progress(progress_log_path: Path | None, **payload: Any) -> None:
-    if progress_log_path is None:
-        return
-    progress_log_path.parent.mkdir(parents=True, exist_ok=True)
-    with progress_log_path.open("a") as handle:
-        handle.write(json.dumps(payload) + "\n")
-
-
 def _count_trainable_parameters(module: torch.nn.Module) -> int:
     return int(sum(param.numel() for param in module.parameters() if param.requires_grad))
-
-
-def _build_input_transform_config(config: WillettReconstructionConfig) -> WillettInputTransformConfig:
-    return WillettInputTransformConfig(
-        input_smoothing_sigma_bins=float(config.input_smoothing_sigma_bins),
-        input_smoothing_kernel_size=int(config.input_smoothing_kernel_size),
-        input_smoothing_threshold=float(config.input_smoothing_threshold),
-        white_noise_sd=float(config.white_noise_sd),
-        constant_offset_sd=float(config.constant_offset_sd),
-    )
 
 
 def _make_lr_lambda(
@@ -280,8 +145,8 @@ def _prune_step_checkpoints(checkpoints_dir: Path, keep_last: int | None) -> Non
 
 
 def run_willett_reconstruction(config: WillettReconstructionConfig) -> dict[str, Any]:
-    _seed_all(int(config.seed))
-    device = _detect_device()
+    seed_everything(int(config.seed))
+    device = resolve_device()
     problem = build_willett_problem(
         cache_root=Path(config.cache_root),
         dataset=str(config.dataset),
@@ -470,32 +335,13 @@ def run_willett_reconstruction(config: WillettReconstructionConfig) -> dict[str,
             ),
             **loader_kwargs(device),
         )
-    model = WillettPhonemeModel(
+    model = build_willett_model(
+        config=config,
         input_dim=sample_dim,
         vocab_size=int(problem["vocab"]["num_classes"]),
-        patch_size=int(config.patch_size),
-        patch_stride=int(config.patch_stride),
-        input_projection_size=int(config.input_projection_size),
-        input_projection_dropout=float(config.input_projection_dropout),
-        decoder_backbone_type=str(config.decoder_backbone_type),
-        gru_hidden_size=int(config.gru_hidden_size),
-        gru_num_layers=int(config.gru_num_layers),
-        gru_dropout=float(config.gru_dropout),
-        s5_hidden_size=int(config.s5_hidden_size),
-        s5_state_size=int(config.s5_state_size),
-        s5_num_layers=int(config.s5_num_layers),
-        s5_dropout=float(config.s5_dropout),
-        s5_direction=str(config.s5_direction),
-        s5_ffn_multiplier=float(config.s5_ffn_multiplier),
-        s4d_hidden_size=int(config.s4d_hidden_size),
-        s4d_state_size=int(config.s4d_state_size),
-        s4d_num_layers=int(config.s4d_num_layers),
-        s4d_dropout=float(config.s4d_dropout),
-        s4d_direction=str(config.s4d_direction),
-        s4d_ffn_multiplier=float(config.s4d_ffn_multiplier),
         session_adapter_keys=session_adapter_keys,
-        session_adapter_enabled=bool(config.session_adapter_enabled),
-    ).to(device)
+        device=device,
+    )
     optimizer = torch.optim.Adam(
         model.parameters(),
         lr=float(config.learning_rate),
@@ -511,7 +357,7 @@ def run_willett_reconstruction(config: WillettReconstructionConfig) -> dict[str,
             learning_rate=float(config.learning_rate),
         ),
     )
-    input_transform_config = _build_input_transform_config(config)
+    input_transform_config = willett_input_transform_config_from(config)
 
     start_time = time.time()
     step = 0
@@ -602,7 +448,7 @@ def run_willett_reconstruction(config: WillettReconstructionConfig) -> dict[str,
                 "learning_rate": float(optimizer.param_groups[0]["lr"]),
                 "elapsed_seconds": float(time.time() - start_time),
             }
-            _emit_progress(progress_log_path, **train_payload)
+            append_optional_jsonl(progress_log_path, **train_payload)
 
         if step % int(config.val_every_steps) == 0 or step == int(config.max_steps):
             metrics = evaluate_willett_phoneme_metrics(
@@ -628,7 +474,7 @@ def run_willett_reconstruction(config: WillettReconstructionConfig) -> dict[str,
                 **metrics,
                 "elapsed_seconds": float(time.time() - start_time),
             }
-            _emit_progress(progress_log_path, **val_payload)
+            append_optional_jsonl(progress_log_path, **val_payload)
             if best_metrics is None or float(metrics["val_phoneme_error_rate"]) < float(best_metrics["val_phoneme_error_rate"]):
                 best_metrics = dict(metrics)
                 best_payload = dict(val_payload)

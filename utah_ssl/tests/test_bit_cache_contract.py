@@ -1,17 +1,12 @@
 from __future__ import annotations
 
 import json
-import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 import numpy as np
 import torch
-
-REPO_ROOT = Path(__file__).resolve().parents[2]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
 
 from utah_ssl.bit_cache_contract import (
     BIT_STAGE1_DATASET_SPLITS,
@@ -22,8 +17,8 @@ from utah_ssl.experiment_contract import DatasetPlan, SignalSpec
 from utah_ssl.cache import (
     CacheAccessConfig,
     prepare_cache_context,
-    resolve_precomputed_session_stats_path,
 )
+from utah_ssl.stats import resolve_precomputed_session_stats_path
 from utah_ssl.scripts.prepare_bit_cache import prepare_bit_cache
 from utah_ssl.stats_artifact_test_utils import write_valid_session_stats_artifact
 
