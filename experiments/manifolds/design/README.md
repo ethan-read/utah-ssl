@@ -8,3 +8,7 @@ making claims about repeatable geometry.
 The current interpretation ladder and next controls are documented in the
 [branch README](../README.md); completed analyses are indexed under
 [`../results/`](../results/).
+
+Design notes:
+
+- [GRU-assisted phoneme timing for raw-bin analyses](gru_assisted_phoneme_timing.md)

@@ -2,6 +2,7 @@
 
 - [BIT](BIT_architecture_notes.md)
 - [POSSM](POSSM_architecture_notes.md)
+- [Spalding et al. shared latent speech alignment](spalding_shared_latent_speech_alignment_notes.md)
 - [Apple subject-aware contrastive learning](apple_subject_aware_contrastive_learning_notes.md)
 - [Cortical-SSM](cortical_ssm_architecture_notes.md)
 - [Tether/Evo Brain-to-Text](tether_evo_b2t_architecture_notes.md)
