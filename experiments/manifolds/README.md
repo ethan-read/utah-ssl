@@ -9,6 +9,16 @@ starts from the durable exports made by
 `notebooks/export_willett_representations.ipynb`
 and keeps full per-utterance time order, which the pooled PCA plots discard.
 
+## Raw-bin dimensionality diagnostics
+
+`notebooks/raw_20ms_sbp_pca.ipynb` measures global linear dimensionality from
+native 20 ms x 128-channel SBP vectors. Its companion
+`notebooks/raw_20ms_sbp_factor_analysis.ipynb` reuses the saved exact
+per-session sufficient statistics to ask whether shared covariance is
+low-dimensional after separating diagonal channel-private variance. The FA
+notebook selects factor count on four pre-holdout sessions before evaluating
+the four chronological future sessions.
+
 ## What the 14-bin GRU input does and does not mean
 
 The Willett model consumes a causal sequence of overlapping 280 ms patches
