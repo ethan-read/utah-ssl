@@ -18,6 +18,12 @@ from experiments.manifolds.representation_export import (
     export_willett_representations,
     patch_timing_for_token,
 )
+from experiments.manifolds.scripts.export_gru_layer_states import (
+    COMPLETION_MARKER_NAME,
+    _promote_validated_export,
+    build_parser as build_layerwise_export_parser,
+    validate_layerwise_export,
+)
 from experiments.supervised_baselines.config import WillettReconstructionConfig
 from experiments.supervised_baselines.data import (
     adapter_keys_from_rows,
@@ -87,6 +93,50 @@ class WillettRepresentationExportTest(unittest.TestCase):
         self.assertEqual(timing["patch_end_bin"], 26)
         self.assertEqual(timing["patch_start_ms"], 240)
         self.assertEqual(timing["patch_end_ms"], 520)
+
+    def test_layerwise_cli_uses_separate_smoke_mode_and_drive_defaults(self) -> None:
+        args = build_layerwise_export_parser().parse_args(["--smoke"])
+        self.assertTrue(args.smoke)
+        self.assertEqual(args.expected_checkpoint_step, 18_300)
+        self.assertEqual(args.layer_state_dtype, "float16")
+        self.assertIn("/content/drive/MyDrive/utah_ssl", str(args.export_root))
+
+    def test_layerwise_promotion_requires_marker_and_preserves_completed_tree(self) -> None:
+        root = self._tmp_dir()
+        staging_dir = root / ".staging" / "model"
+        export_dir = root / "model"
+        staging_dir.mkdir(parents=True)
+        (staging_dir / "payload.txt").write_text("complete")
+        with self.assertRaisesRegex(ValueError, "completion marker"):
+            _promote_validated_export(
+                staging_dir=staging_dir,
+                export_dir=export_dir,
+                overwrite=False,
+            )
+
+        (staging_dir / COMPLETION_MARKER_NAME).write_text('{"status": "complete"}')
+        _promote_validated_export(
+            staging_dir=staging_dir,
+            export_dir=export_dir,
+            overwrite=False,
+        )
+        self.assertEqual((export_dir / "payload.txt").read_text(), "complete")
+        self.assertTrue((export_dir / COMPLETION_MARKER_NAME).exists())
+        self.assertFalse(staging_dir.exists())
+
+        replacement_dir = root / ".replacement" / "model"
+        replacement_dir.mkdir(parents=True)
+        (replacement_dir / "payload.txt").write_text("replacement")
+        (replacement_dir / COMPLETION_MARKER_NAME).write_text(
+            '{"status": "complete"}'
+        )
+        _promote_validated_export(
+            staging_dir=replacement_dir,
+            export_dir=export_dir,
+            overwrite=True,
+        )
+        self.assertEqual((export_dir / "payload.txt").read_text(), "replacement")
+        self.assertFalse(any(root.glob(".model.backup-*")))
 
     def test_existing_export_without_input_windows_must_be_regenerated(self) -> None:
         checkpoint_path = self._tmp_dir() / "checkpoint_best.pt"
@@ -158,8 +208,8 @@ class WillettRepresentationExportTest(unittest.TestCase):
             patch_stride=1,
             input_projection_size=8,
             gru_hidden_size=16,
-            gru_num_layers=1,
-            gru_dropout=0.0,
+            gru_num_layers=3,
+            gru_dropout=0.2,
         )
         problem = build_willett_problem(
             cache_root=cache_root,
@@ -188,8 +238,8 @@ class WillettRepresentationExportTest(unittest.TestCase):
             patch_stride=1,
             input_projection_size=8,
             gru_hidden_size=16,
-            gru_num_layers=1,
-            gru_dropout=0.0,
+            gru_num_layers=3,
+            gru_dropout=0.2,
             session_adapter_keys=adapter_keys,
             session_adapter_enabled=True,
         )
@@ -217,6 +267,8 @@ class WillettRepresentationExportTest(unittest.TestCase):
                 shard_size_tokens=3,
                 overwrite=True,
                 save_input_windows=True,
+                save_gru_layer_states=True,
+                gru_layer_state_dtype="float16",
             )
         )
 
@@ -226,6 +278,10 @@ class WillettRepresentationExportTest(unittest.TestCase):
         self.assertTrue((export_dir / "examples.csv").exists())
         self.assertTrue((export_dir / "shards.json").exists())
         self.assertEqual(metadata["example_count"], 2)
+        self.assertEqual(metadata["signal_spec"]["mode"], "tx_only")
+        self.assertEqual(metadata["signal_spec"]["tx_dim"], 3)
+        self.assertEqual(metadata["selected_source_splits"], ["competition_test"])
+        self.assertEqual(len(metadata["selected_session_ids"]), 2)
         tokens = pd.read_csv(export_dir / "tokens.csv")
         examples = pd.read_csv(export_dir / "examples.csv")
         self.assertEqual(int(tokens.shape[0]), int(metadata["token_count"]))
@@ -233,6 +289,20 @@ class WillettRepresentationExportTest(unittest.TestCase):
         self.assertIn("hidden_dim", metadata)
         self.assertEqual(metadata["input_window_dim"], 6)
         self.assertEqual(metadata["adapted_input_window_dim"], 16)
+        self.assertEqual(metadata["gru_layer_count"], 3)
+        self.assertEqual(
+            metadata["gru_layer_state_keys"],
+            [
+                "gru_layer_0_hidden",
+                "gru_layer_1_hidden",
+                "gru_layer_2_hidden",
+            ],
+        )
+        self.assertEqual(metadata["gru_layer_state_dtype"], "float16")
+        self.assertLess(
+            float(metadata["layerwise_equivalence"]["top_hidden_max_abs_error"]),
+            2e-5,
+        )
         self.assertIn("transition_type", tokens.columns)
         shard_manifest = json.loads((export_dir / "shards.json").read_text())
         self.assertGreaterEqual(len(shard_manifest), 1)
@@ -244,8 +314,32 @@ class WillettRepresentationExportTest(unittest.TestCase):
             self.assertEqual(arrays["hidden"].shape[0], arrays["adapted_input_windows"].shape[0])
             self.assertEqual(arrays["input_windows"].shape[1], 6)
             self.assertEqual(arrays["adapted_input_windows"].shape[1], 16)
+            for layer_index in range(3):
+                layer_key = f"gru_layer_{layer_index}_hidden"
+                self.assertEqual(arrays[layer_key].shape, arrays["hidden"].shape)
+                self.assertEqual(arrays[layer_key].dtype, np.float16)
+                self.assertTrue(np.isfinite(arrays[layer_key]).all())
+            np.testing.assert_allclose(
+                arrays["gru_layer_2_hidden"].astype(np.float32),
+                arrays["hidden"],
+                atol=1e-3,
+                rtol=1e-3,
+            )
             shard_token_count += int(arrays["hidden"].shape[0])
         self.assertEqual(shard_token_count, int(metadata["token_count"]))
+        validation = validate_layerwise_export(export_dir)
+        self.assertEqual(validation["status"], "passed")
+        self.assertEqual(validation["gru_layer_count"], 3)
+        self.assertEqual(validation["gru_layer_state_dtype"], "float16")
+        self.assertEqual(validation["final_layer_storage_atol"], 1e-3)
+
+        first_shard_path = export_dir / "shards" / shard_manifest[0]["shard"]
+        with np.load(first_shard_path) as stored:
+            corrupted = {key: stored[key].copy() for key in stored.files}
+        corrupted["gru_layer_2_hidden"][0, 0] += np.float16(0.1)
+        np.savez_compressed(first_shard_path, **corrupted)
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            validate_layerwise_export(export_dir)
 
 
 if __name__ == "__main__":

@@ -24,6 +24,39 @@ and evaluate the final four; the frozen GRU itself is not session-held-out.
 These accessibility tests determine whether coarse-label retraining is
 warranted before the decoder-assisted raw-SBP analysis.
 
+## Layerwise GRU export
+
+`scripts/export_gru_layer_states.py` reruns the checkpoint used by the
+articulator probe and saves the complete 80 ms hidden-state sequence from every
+GRU layer. It clones the stored recurrent weights into an evaluation-only
+one-layer stack and checks the reconstructed top layer and logits against the
+ordinary model forward pass on every batch before saving. The default full
+artifact is written beneath:
+
+```text
+/content/drive/MyDrive/utah_ssl/data/representations/willett_manifolds/
+  gru_layerwise_b2t24_step18300_v1/gru_best_step18300_all_val_sessions
+```
+
+After mounting Drive in Colab, run a separate smoke export first:
+
+```bash
+python -m experiments.manifolds.scripts.export_gru_layer_states --smoke
+```
+
+Then run the complete 880-example validation export:
+
+```bash
+python -m experiments.manifolds.scripts.export_gru_layer_states
+```
+
+The script refuses to reuse an existing destination unless `--overwrite` is
+explicit. Intermediate states default to FP16 on disk, while numerical
+equivalence is checked in the model compute dtype before casting. It writes to
+a sibling staging directory, reopens and validates every shard (including the
+stored final-layer values), writes `validation.json` and `_SUCCESS.json`, and
+only then renames the completed artifact into the canonical destination.
+
 ## What the 14-bin GRU input does and does not mean
 
 The Willett model consumes a causal sequence of overlapping 280 ms patches

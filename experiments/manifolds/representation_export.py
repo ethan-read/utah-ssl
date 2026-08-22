@@ -18,6 +18,11 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
+from experiments.manifolds.gru_layerwise import (
+    clone_gru_as_single_layer_stack,
+    forward_gru_layer_stack,
+    layerwise_equivalence_errors,
+)
 from experiments.supervised_baselines.checkpointing import (
     config_from_checkpoint,
     load_willett_model_from_checkpoint,
@@ -120,6 +125,10 @@ class RepresentationExportConfig:
     cache_root_override: str | Path | None = None
     precomputed_split_stats_path_override: str | Path | None = None
     save_input_windows: bool = False
+    save_gru_layer_states: bool = False
+    gru_layer_state_dtype: str = "float32"
+    layerwise_equivalence_atol: float = 2e-5
+    layerwise_equivalence_rtol: float = 1e-5
 
 
 def _timestamp_utc() -> str:
@@ -334,6 +343,7 @@ def _flush_shard(
     shard_dir: Path,
     shard_index: int,
     arrays: dict[str, list[np.ndarray]],
+    gru_layer_state_dtype: str = "float32",
 ) -> dict[str, Any] | None:
     if not arrays["hidden"]:
         return None
@@ -368,6 +378,23 @@ def _flush_shard(
         adapted_input_windows = np.concatenate(arrays["adapted_input_windows"], axis=0).astype(np.float32, copy=False)
         shard_arrays["adapted_input_windows"] = adapted_input_windows
         shard_payload["adapted_input_window_dim"] = int(adapted_input_windows.shape[1])
+    layer_state_payload: dict[str, dict[str, Any]] = {}
+    layer_state_keys = sorted(
+        (key for key in arrays if key.startswith("gru_layer_") and key.endswith("_hidden")),
+        key=lambda value: int(value.split("_")[2]),
+    )
+    layer_dtype = np.dtype(str(gru_layer_state_dtype))
+    for key in layer_state_keys:
+        layer_state = np.concatenate(arrays[key], axis=0).astype(layer_dtype, copy=False)
+        if int(layer_state.shape[0]) != int(hidden.shape[0]):
+            raise ValueError(f"Layer-state row count differs for {key!r}.")
+        shard_arrays[key] = layer_state
+        layer_state_payload[key] = {
+            "hidden_dim": int(layer_state.shape[1]),
+            "dtype": str(layer_state.dtype),
+        }
+    if layer_state_payload:
+        shard_payload["gru_layer_states"] = layer_state_payload
     np.savez_compressed(shard_path, **shard_arrays)
     return shard_payload
 
@@ -376,6 +403,10 @@ def export_willett_representations(config: RepresentationExportConfig) -> dict[s
     checkpoint_path = Path(config.checkpoint_path)
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"Checkpoint does not exist: {checkpoint_path}")
+    if str(config.gru_layer_state_dtype) not in {"float16", "float32"}:
+        raise ValueError("gru_layer_state_dtype must be one of {'float16', 'float32'}")
+    if float(config.layerwise_equivalence_atol) < 0 or float(config.layerwise_equivalence_rtol) < 0:
+        raise ValueError("Layerwise equivalence tolerances must be nonnegative.")
     export_dir = Path(config.export_root) / str(config.model_key)
     if export_dir.exists():
         if not bool(config.overwrite):
@@ -385,6 +416,11 @@ def export_willett_representations(config: RepresentationExportConfig) -> dict[s
                 if bool(config.save_input_windows) and metadata.get("input_window_dim") is None:
                     raise FileExistsError(
                         "Existing representation export does not contain saved input windows. "
+                        f"Set overwrite=True to regenerate it: {export_dir}"
+                    )
+                if bool(config.save_gru_layer_states) and not metadata.get("gru_layer_state_keys"):
+                    raise FileExistsError(
+                        "Existing representation export does not contain GRU layer states. "
                         f"Set overwrite=True to regenerate it: {export_dir}"
                     )
                 return metadata
@@ -442,6 +478,12 @@ def export_willett_representations(config: RepresentationExportConfig) -> dict[s
         config.max_examples,
         config.allowed_session_ids,
     )
+    selected_session_ids = tuple(
+        dict.fromkeys(str(row.session_id) for row in selected_rows)
+    )
+    selected_source_splits = tuple(
+        sorted({str(getattr(row, "source_split", "")) for row in selected_rows})
+    )
     missing_rows = normalization_stats_missing_rows(train_stats, selected_rows)
     if missing_rows:
         raise ValueError(
@@ -488,6 +530,11 @@ def export_willett_representations(config: RepresentationExportConfig) -> dict[s
         device=device,
     )
     model.eval()
+    layerwise_gru = None
+    if bool(config.save_gru_layer_states):
+        if str(model_config.decoder_backbone_type) != "gru":
+            raise ValueError("save_gru_layer_states requires a GRU checkpoint.")
+        layerwise_gru = clone_gru_as_single_layer_stack(model.gru)
     transform_config = WillettInputTransformConfig(
         input_smoothing_sigma_bins=float(model_config.input_smoothing_sigma_bins),
         input_smoothing_kernel_size=int(model_config.input_smoothing_kernel_size),
@@ -515,11 +562,21 @@ def export_willett_representations(config: RepresentationExportConfig) -> dict[s
     if bool(config.save_input_windows):
         arrays["input_windows"] = []
         arrays["adapted_input_windows"] = []
+    gru_layer_state_keys: tuple[str, ...] = ()
+    if layerwise_gru is not None:
+        gru_layer_state_keys = tuple(
+            f"gru_layer_{layer_index}_hidden"
+            for layer_index in range(len(layerwise_gru))
+        )
+        for key in gru_layer_state_keys:
+            arrays[key] = []
     shard_index = 0
     buffered_tokens = 0
     total_tokens = 0
     total_examples = 0
     token_global_offset = 0
+    layerwise_top_hidden_max_abs_error = 0.0
+    layerwise_logits_max_abs_error = 0.0
 
     with torch.no_grad():
         for batch in loader:
@@ -535,6 +592,52 @@ def export_willett_representations(config: RepresentationExportConfig) -> dict[s
             if bool(config.save_input_windows):
                 input_windows = model._patch_batch(x, input_lengths)[0].detach().cpu().numpy()
             outputs = model(x, input_lengths, session_ids=batch["boundary_keys"])
+            layerwise_hidden = None
+            if layerwise_gru is not None:
+                layer_state_tensors = forward_gru_layer_stack(
+                    model,
+                    outputs["patched_inputs"],
+                    outputs["token_lengths"],
+                    layerwise_gru,
+                )
+                equivalence_errors = layerwise_equivalence_errors(
+                    standard_hidden=outputs["hidden"],
+                    standard_logits=outputs["logits"],
+                    layer_states=layer_state_tensors,
+                    classifier=model.classifier,
+                )
+                layerwise_top_hidden_max_abs_error = max(
+                    layerwise_top_hidden_max_abs_error,
+                    equivalence_errors["top_hidden_max_abs_error"],
+                )
+                layerwise_logits_max_abs_error = max(
+                    layerwise_logits_max_abs_error,
+                    equivalence_errors["logits_max_abs_error"],
+                )
+                if not torch.allclose(
+                    layer_state_tensors[-1],
+                    outputs["hidden"],
+                    atol=float(config.layerwise_equivalence_atol),
+                    rtol=float(config.layerwise_equivalence_rtol),
+                ):
+                    raise RuntimeError(
+                        "Layerwise GRU reconstruction does not match the standard top-layer hidden states: "
+                        f"max_abs_error={equivalence_errors['top_hidden_max_abs_error']:.8g}"
+                    )
+                reconstructed_logits = model.classifier(layer_state_tensors[-1])
+                if not torch.allclose(
+                    reconstructed_logits,
+                    outputs["logits"],
+                    atol=float(config.layerwise_equivalence_atol),
+                    rtol=float(config.layerwise_equivalence_rtol),
+                ):
+                    raise RuntimeError(
+                        "Layerwise GRU reconstruction does not match the standard logits: "
+                        f"max_abs_error={equivalence_errors['logits_max_abs_error']:.8g}"
+                    )
+                layerwise_hidden = tuple(
+                    state.detach().cpu().numpy() for state in layer_state_tensors
+                )
             hidden = outputs["hidden"].detach().cpu().numpy()
             logits = outputs["logits"].detach().cpu().numpy()
             adapted_input_windows = (
@@ -582,6 +685,9 @@ def export_willett_representations(config: RepresentationExportConfig) -> dict[s
 
                 arrays["hidden"].append(row_hidden)
                 arrays["logits"].append(row_logits)
+                if layerwise_hidden is not None:
+                    for layer_index, key in enumerate(gru_layer_state_keys):
+                        arrays[key].append(layerwise_hidden[layer_index][batch_idx, :length])
                 if row_input_windows is not None:
                     arrays["input_windows"].append(row_input_windows)
                 if row_adapted_input_windows is not None:
@@ -644,6 +750,7 @@ def export_willett_representations(config: RepresentationExportConfig) -> dict[s
                         shard_dir=export_dir / "shards",
                         shard_index=shard_index,
                         arrays=arrays,
+                        gru_layer_state_dtype=str(config.gru_layer_state_dtype),
                     )
                     if shard_payload is not None:
                         shard_rows.append(shard_payload)
@@ -655,6 +762,7 @@ def export_willett_representations(config: RepresentationExportConfig) -> dict[s
         shard_dir=export_dir / "shards",
         shard_index=shard_index,
         arrays=arrays,
+        gru_layer_state_dtype=str(config.gru_layer_state_dtype),
     )
     if shard_payload is not None:
         shard_rows.append(shard_payload)
@@ -673,11 +781,14 @@ def export_willett_representations(config: RepresentationExportConfig) -> dict[s
         "checkpoint_step": int(payload.get("step", payload.get("steps", -1))),
         "dataset": str(problem["dataset"]),
         "feature_mode": str(problem["feature_mode"]),
+        "signal_spec": _json_safe(problem["signal_spec"].to_dict()),
         "boundary_key_mode": str(problem["boundary_key_mode"]),
         "split_policy": str(problem["split_policy"]),
         "export_split": str(config.split),
         "train_split_name": str(problem["train_split_name"]),
         "val_split_name": str(problem["val_split_name"]),
+        "selected_session_ids": list(selected_session_ids),
+        "selected_source_splits": list(selected_source_splits),
         "cache_root": str(problem["cache_root"]),
         "precomputed_split_stats_path": loaded_stats_path,
         "input_feature_source": str(model_config.input_feature_source),
@@ -701,6 +812,22 @@ def export_willett_representations(config: RepresentationExportConfig) -> dict[s
             if bool(config.save_input_windows)
             else None
         ),
+        "gru_layer_count": len(gru_layer_state_keys),
+        "gru_layer_state_keys": list(gru_layer_state_keys),
+        "gru_layer_state_dtype": (
+            str(config.gru_layer_state_dtype) if gru_layer_state_keys else None
+        ),
+        "layerwise_equivalence": (
+            {
+                "atol": float(config.layerwise_equivalence_atol),
+                "rtol": float(config.layerwise_equivalence_rtol),
+                "top_hidden_max_abs_error": layerwise_top_hidden_max_abs_error,
+                "logits_max_abs_error": layerwise_logits_max_abs_error,
+                "checked_every_batch": True,
+            }
+            if gru_layer_state_keys
+            else None
+        ),
         "vocab": _json_safe(vocab),
         "category_order": list(PHONEME_CATEGORY_ORDER),
         "consonant_categories": sorted(CONSONANT_CATEGORIES),
@@ -711,6 +838,18 @@ def export_willett_representations(config: RepresentationExportConfig) -> dict[s
         "token_table_csv": str(export_dir / "tokens.csv"),
         "example_table_csv": str(export_dir / "examples.csv"),
         "shard_manifest_path": str(shard_manifest_path),
+        "provenance_note": (
+            "Local decoder is an LLM-assisted Willett-style adaptation with "
+            "unresolved exact upstream source and licensing; this is not an official "
+            "Stanford implementation."
+        ),
+        "ai_assistance": (
+            "Codex implemented the optional intermediate-GRU extraction, numerical "
+            "equivalence checks, sharded serialization, and validation workflow; "
+            "human review is required before scientific use."
+            if gru_layer_state_keys
+            else None
+        ),
     }
     metadata_path = export_dir / "metadata.json"
     metadata_path.write_text(json.dumps(_json_safe(metadata), indent=2))
