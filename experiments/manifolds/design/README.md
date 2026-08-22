@@ -11,4 +11,5 @@ The current interpretation ladder and next controls are documented in the
 
 Design notes:
 
+- [Canonical articulatory feature taxonomy, version 1](articulatory_feature_taxonomy.md)
 - [GRU-assisted phoneme timing for raw-bin analyses](gru_assisted_phoneme_timing.md)

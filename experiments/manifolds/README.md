@@ -5,19 +5,24 @@ trajectory analyses. Canonical interpretations live under `results/`; notebooks
 remain executable evidence and exploration surfaces.
 
 This folder tests whether phoneme-related population paths are repeatable. It
-starts from the durable exports made by
-`notebooks/export_willett_representations.ipynb`
-and keeps full per-utterance time order, which the pooled PCA plots discard.
+starts from the durable GRU representation export inspected by
+`notebooks/export_willett_representations.ipynb` and keeps full per-utterance
+time order, which the pooled PCA plots discard.
 
-## Raw-bin dimensionality diagnostics
+## Coarse articulatory activity
 
-`notebooks/raw_20ms_sbp_pca.ipynb` measures global linear dimensionality from
-native 20 ms x 128-channel SBP vectors. Its companion
-`notebooks/raw_20ms_sbp_factor_analysis.ipynb` reuses the saved exact
-per-session sufficient statistics to ask whether shared covariance is
-low-dimensional after separating diagonal channel-private variance. The FA
-notebook selects factor count on four pre-holdout sessions before evaluating
-the four chronological future sessions.
+The versioned [articulatory feature taxonomy](design/articulatory_feature_taxonomy.md)
+defines the canonical transcript-derived movement targets and their
+machine-readable 41-token record.
+
+`notebooks/coarse_articulatory_activity.ipynb` runs the best recorded local GRU
+on all 24 validation sessions. It measures on the final four how much native
+phoneme error remains after mapping predictions to broad and manner groups,
+then fits independent lips, tongue-front, and tongue-body linear probes of
+reference-aligned GRU hidden states. Probe heads train on the first 20 sessions
+and evaluate the final four; the frozen GRU itself is not session-held-out.
+These accessibility tests determine whether coarse-label retraining is
+warranted before the decoder-assisted raw-SBP analysis.
 
 ## What the 14-bin GRU input does and does not mean
 

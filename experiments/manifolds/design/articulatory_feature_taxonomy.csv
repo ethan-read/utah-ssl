@@ -1,0 +1,42 @@
+phoneme_id,symbol,ipa,segment_family,primary_articulators,constriction_gesture,consonant_place,vowel_dynamic,vowel_nucleus_height,vowel_nucleus_backness,vowel_nucleus_rounding,vowel_offglide_height,vowel_offglide_backness,vowel_offglide_rounding,rhotic,voicing,nasal,notes
+0,BLANK,not_applicable,ctc_blank,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,CTC alignment state; not a phoneme or silence.
+1,AA,ɑ,vowel,tongue_body,vowel,not_applicable,steady,low,back,unrounded,not_applicable,not_applicable,not_applicable,no,voiced,no,
+2,AE,æ,vowel,tongue_body,vowel,not_applicable,steady,low,front,unrounded,not_applicable,not_applicable,not_applicable,no,voiced,no,
+3,AH,ʌ~ə,vowel,tongue_body,vowel,not_applicable,steady,mid,central,unrounded,not_applicable,not_applicable,not_applicable,no,voiced,no,Stress is absent from the repository vocabulary; use one coarse mid-central target.
+4,AO,ɔ,vowel,lips|tongue_body,vowel,not_applicable,steady,mid,back,rounded,not_applicable,not_applicable,not_applicable,no,voiced,no,
+5,AW,aʊ,vowel,lips|tongue_body,vowel,not_applicable,diphthong,low,central,unrounded,high,back,rounded,no,voiced,no,
+6,AY,aɪ,vowel,tongue_body,vowel,not_applicable,diphthong,low,central,unrounded,high,front,unrounded,no,voiced,no,
+7,B,b,consonant,lips,closure,bilabial,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,voiced,no,
+8,CH,tʃ,consonant,tongue_front,closure_to_frication,postalveolar,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,voiceless,no,
+9,D,d,consonant,tongue_front,closure,alveolar,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,voiced,no,
+10,DH,ð,consonant,tongue_front,frication,dental,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,voiced,no,
+11,EH,ɛ,vowel,tongue_body,vowel,not_applicable,steady,mid,front,unrounded,not_applicable,not_applicable,not_applicable,no,voiced,no,
+12,ER,ɝ~ɚ,vowel,tongue_body,vowel,not_applicable,steady,mid,central,unrounded,not_applicable,not_applicable,not_applicable,yes,voiced,no,Stress is absent from the repository vocabulary; use one coarse rhotic mid-central target.
+13,EY,eɪ,vowel,tongue_body,vowel,not_applicable,diphthong,mid,front,unrounded,high,front,unrounded,no,voiced,no,
+14,F,f,consonant,lips,frication,labiodental,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,voiceless,no,The active lip is primarily the lower lip.
+15,G,ɡ,consonant,tongue_body,closure,velar,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,voiced,no,
+16,HH,h,consonant,larynx,frication,glottal,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,voiceless,no,Canonical glottal target; oral posture is strongly context dependent.
+17,IH,ɪ,vowel,tongue_body,vowel,not_applicable,steady,high,front,unrounded,not_applicable,not_applicable,not_applicable,no,voiced,no,
+18,IY,i,vowel,tongue_body,vowel,not_applicable,steady,high,front,unrounded,not_applicable,not_applicable,not_applicable,no,voiced,no,
+19,JH,dʒ,consonant,tongue_front,closure_to_frication,postalveolar,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,voiced,no,
+20,K,k,consonant,tongue_body,closure,velar,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,voiceless,no,
+21,L,l,consonant,tongue_front,lateral_approximant,alveolar,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,voiced,no,
+22,M,m,consonant,lips,closure,bilabial,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,voiced,yes,Oral closure is paired with velum lowering.
+23,N,n,consonant,tongue_front,closure,alveolar,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,voiced,yes,Oral closure is paired with velum lowering.
+24,NG,ŋ,consonant,tongue_body,closure,velar,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,voiced,yes,Oral closure is paired with velum lowering.
+25,OW,oʊ,vowel,lips|tongue_body,vowel,not_applicable,diphthong,mid,back,rounded,high,back,rounded,no,voiced,no,
+26,OY,ɔɪ,vowel,lips|tongue_body,vowel,not_applicable,diphthong,mid,back,rounded,high,front,unrounded,no,voiced,no,
+27,P,p,consonant,lips,closure,bilabial,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,voiceless,no,
+28,R,ɹ,consonant,tongue_front|tongue_body,approximant,postalveolar,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,voiced,no,Multi-articulator target accommodates retroflex and bunched rhotic strategies.
+29,S,s,consonant,tongue_front,frication,alveolar,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,voiceless,no,
+30,SH,ʃ,consonant,tongue_front,frication,postalveolar,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,voiceless,no,
+31,T,t,consonant,tongue_front,closure,alveolar,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,voiceless,no,
+32,TH,θ,consonant,tongue_front,frication,dental,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,voiceless,no,
+33,UH,ʊ,vowel,lips|tongue_body,vowel,not_applicable,steady,high,back,rounded,not_applicable,not_applicable,not_applicable,no,voiced,no,
+34,UW,u,vowel,lips|tongue_body,vowel,not_applicable,steady,high,back,rounded,not_applicable,not_applicable,not_applicable,no,voiced,no,
+35,V,v,consonant,lips,frication,labiodental,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,voiced,no,The active lip is primarily the lower lip.
+36,W,w,consonant,lips|tongue_body,approximant,labial_velar,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,voiced,no,Simultaneous lip rounding and tongue-body velar approximation.
+37,Y,j,consonant,tongue_body,approximant,palatal,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,voiced,no,
+38,Z,z,consonant,tongue_front,frication,alveolar,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,voiced,no,
+39,ZH,ʒ,consonant,tongue_front,frication,postalveolar,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,voiced,no,
+40,SIL,not_applicable,silence_boundary,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,Silence or word-boundary target; distinct from the CTC blank.
