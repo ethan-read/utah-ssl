@@ -77,6 +77,18 @@ The existing input-window control is a flattened overlapping 280 ms window. It
 is closer to the neural measurements than the hidden state, but it is still
 temporally mixed. Do not call it raw-bin dynamics.
 
+## Raw-SBP bigram transition trajectories
+
+`notebooks/raw_bigram_transition_pca.ipynb` uses the complete step-18,300 GRU
+logit export only for transcript-constrained CTC timing, then extracts native
+20 ms trajectories from the canonical clipped-FP16 128-channel SBP cache. It
+fits equal-bigram-weighted change and state PCA views for the 66 transcript
+bigrams occurring at least 50 times, ranks mean paths by top-six trajectory
+captured fraction, and reports session repeatability and +/-40 ms timing
+sensitivity. All 24 validation/model-selection sessions participate, so this
+is explicitly descriptive and transductive rather than a held-out-session
+result.
+
 ## First experiment
 
 The runner:
